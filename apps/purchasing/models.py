@@ -623,6 +623,38 @@ class SupplierInvoice(TenantScopedModel):
             raise ValidationError("El proveedor no pertenece a la misma organización.")
         if self.purchase_order_id and self.organization_id and self.purchase_order.organization_id != self.organization_id:
             raise ValidationError("La orden de compra no pertenece a la misma organización.")
+        if self.purchase_order_id and self.currency_code != self.purchase_order.currency_code:
+            raise ValidationError(
+                f"Incompatibilidad monetaria: La moneda de la factura del proveedor ({self.currency_code}) "
+                f"debe coincidir con la moneda de la orden de compra ({self.purchase_order.currency_code})."
+            )
+
+    def save(self, *args, **kwargs):
+        if self.purchase_order_id and self.currency_code != self.purchase_order.currency_code:
+            raise ValidationError(
+                f"Incompatibilidad monetaria: La moneda de la factura del proveedor ({self.currency_code}) "
+                f"debe coincidir con la moneda de la orden de compra ({self.purchase_order.currency_code})."
+            )
+        super().save(*args, **kwargs)
+
+    def recalculate_totals(self):
+        """
+        Recalcula el saldo pendiente y estado de pago de la factura del proveedor
+        en función de los comprobantes de egreso aplicados.
+        """
+        total_paid = self.payments.aggregate(t=models.Sum('amount_applied_to_order'))['t'] or Decimal('0.00')
+        self.amount_paid = total_paid
+        self.balance_due = max(Decimal('0.00'), self.net_payable - self.amount_paid)
+        if Decimal('0.00') < self.balance_due <= Decimal('0.05') and self.amount_paid > Decimal('0.00'):
+            self.balance_due = Decimal('0.00')
+
+        if self.status != self.Status.VOID:
+            if self.balance_due == Decimal('0.00') and self.amount_paid > Decimal('0.00'):
+                self.status = self.Status.PAID
+            elif Decimal('0.00') < self.amount_paid < self.net_payable:
+                self.status = self.Status.PARTIAL
+            else:
+                self.status = self.Status.PENDING
 
 
 class SupplierPayment(TenantScopedModel):
@@ -648,7 +680,23 @@ class SupplierPayment(TenantScopedModel):
         PurchaseOrder,
         on_delete=models.PROTECT,
         related_name='payments',
-        verbose_name="Orden de Compra / Factura Proveedor",
+        verbose_name="Orden de Compra",
+    )
+    supplier_invoice = models.ForeignKey(
+        SupplierInvoice,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='payments',
+        verbose_name="Factura de Proveedor",
+    )
+    bank_account = models.ForeignKey(
+        'finance.BankAccount',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='supplier_payments',
+        verbose_name="Cuenta Bancaria de Origen",
     )
     payment_date = models.DateField(
         default=timezone.now,
@@ -706,7 +754,12 @@ class SupplierPayment(TenantScopedModel):
             models.UniqueConstraint(
                 fields=['organization', 'number'],
                 name='unique_supplier_payment_number_per_tenant',
-            )
+            ),
+            models.UniqueConstraint(
+                fields=['organization', 'bank_account', 'reference_number'],
+                condition=models.Q(bank_account__isnull=False) & ~models.Q(reference_number=''),
+                name='unique_supplier_payment_reference_per_bank',
+            ),
         ]
 
     def __str__(self) -> str:
@@ -716,6 +769,29 @@ class SupplierPayment(TenantScopedModel):
         super().clean()
         if not self._state.adding and self.pk:
             raise ValidationError("Un Comprobante de Egreso (EGR) emitido es inmutable conforme a la normativa fiscal y no puede ser modificado.")
+        if self.bank_account_id and self.organization_id and self.bank_account.organization_id != self.organization_id:
+            raise ValidationError("La cuenta bancaria no pertenece a la misma organización.")
+        if self.supplier_invoice_id and self.organization_id and self.supplier_invoice.organization_id != self.organization_id:
+            raise ValidationError("La factura del proveedor no pertenece a la misma organización.")
+        if self.supplier_invoice_id and self.purchase_order_id and self.supplier_invoice.purchase_order_id != self.purchase_order_id:
+            raise ValidationError("La factura del proveedor no corresponde a la orden de compra especificada.")
+        if self.supplier_invoice_id and self.purchase_order_id and self.supplier_invoice.currency_code != self.purchase_order.currency_code:
+            raise ValidationError(
+                f"Incompatibilidad monetaria: La moneda de la factura ({self.supplier_invoice.currency_code}) "
+                f"no coincide con la moneda de la orden de compra ({self.purchase_order.currency_code})."
+            )
+        if (
+            self.purchase_order_id
+            and self.purchase_order.currency_code != 'NIO'
+            and self.exchange_rate_applied
+            and self.exchange_rate_applied != self.purchase_order.exchange_rate
+        ):
+            raise ValidationError(
+                f"Operación cambiaria no soportada: La orden de compra {self.purchase_order.number} está denominada en moneda extranjera "
+                f"({self.purchase_order.currency_code}) y fue reconocida contablemente a una tasa de {self.purchase_order.exchange_rate:.4f}. "
+                f"No se permite liquidar a una tasa diferente ({self.exchange_rate_applied:.4f}) porque no existe una política contable "
+                f"aprobada para el diferencial cambiario (ganancia/pérdida en cambio)."
+            )
 
     def save(self, *args, **kwargs):
         if not self._state.adding and self.pk:
@@ -723,6 +799,19 @@ class SupplierPayment(TenantScopedModel):
 
         if self.purchase_order_id and not self.organization_id:
             self.organization_id = self.purchase_order.organization_id
+
+        if (
+            self.purchase_order_id
+            and self.purchase_order.currency_code != 'NIO'
+            and self.exchange_rate_applied
+            and self.exchange_rate_applied != self.purchase_order.exchange_rate
+        ):
+            raise ValidationError(
+                f"Operación cambiaria no soportada: La orden de compra {self.purchase_order.number} está denominada en moneda extranjera "
+                f"({self.purchase_order.currency_code}) y fue reconocida contablemente a una tasa de {self.purchase_order.exchange_rate:.4f}. "
+                f"No se permite liquidar a una tasa diferente ({self.exchange_rate_applied:.4f}) porque no existe una política contable "
+                f"aprobada para el diferencial cambiario (ganancia/pérdida en cambio)."
+            )
 
         # Conversión bimonetaria
         if not self.amount_applied_to_order or self.amount_applied_to_order <= Decimal('0.00'):
@@ -752,16 +841,69 @@ class SupplierPayment(TenantScopedModel):
 
         super().save(*args, **kwargs)
 
-        # Sincronizar pago en la orden de compra
-        total_paid = self.purchase_order.payments.aggregate(t=models.Sum('amount_applied_to_order'))['t'] or Decimal('0.00')
-        self.purchase_order.amount_paid = total_paid
-        self.purchase_order.recalculate_totals()
-        PurchaseOrder.objects.filter(pk=self.purchase_order.pk).update(
-            amount_paid=self.purchase_order.amount_paid,
-            balance_due=self.purchase_order.balance_due,
-            status=self.purchase_order.status,
-            updated_at=timezone.now(),
-        )
-
     def delete(self, *args, **kwargs):
         raise ValidationError("Un Comprobante de Egreso (EGR) emitido no puede ser eliminado por razones de auditoría fiscal y control bancario.")
+
+
+class SupplierDisbursementIdempotencyRecord(TenantScopedModel):
+    """
+    Registro de Idempotencia Transaccional para Desembolsos y Pagos a Proveedores.
+    Garantiza que peticiones repetidas (doble clic, reintentos de red, timeouts)
+    no dupliquen comprobantes de egreso (EGR), débitos bancarios ni pólizas contables.
+    Distingue reintentos idénticos de abonos parciales legítimos consecutivos.
+    """
+    idempotency_key = models.CharField(
+        max_length=120,
+        db_index=True,
+        verbose_name="Clave de Idempotencia",
+        help_text="Token o UUID único asignado a la petición de desembolso",
+    )
+    purchase_order = models.ForeignKey(
+        PurchaseOrder,
+        on_delete=models.CASCADE,
+        related_name='disbursement_idempotency_records',
+        verbose_name="Orden de Compra",
+    )
+    supplier_invoice = models.ForeignKey(
+        SupplierInvoice,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='disbursement_idempotency_records',
+        verbose_name="Factura del Proveedor",
+    )
+    supplier_payment = models.ForeignKey(
+        SupplierPayment,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='idempotency_records',
+        verbose_name="Egreso Emitido",
+    )
+    request_hash = models.CharField(
+        max_length=64,
+        verbose_name="Firma Criptográfica SHA-256 de la Petición",
+    )
+    status = models.CharField(
+        max_length=20,
+        default='SUCCESS',
+        verbose_name="Estado de Operación",
+    )
+    response_payload = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="Payload de Respuesta Guardado",
+    )
+
+    class Meta(TenantScopedModel.Meta):
+        verbose_name = "Registro de Idempotencia de Desembolso"
+        verbose_name_plural = "Registros de Idempotencia de Desembolsos"
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'idempotency_key'],
+                name='unique_disbursement_idempotency_key_per_tenant',
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.idempotency_key} · OC {self.purchase_order.number} ({self.status})"

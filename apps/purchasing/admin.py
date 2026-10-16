@@ -1,5 +1,12 @@
 from django.contrib import admin
-from apps.purchasing.models import Supplier, PurchaseOrder, PurchaseOrderItem, SupplierInvoice, SupplierPayment
+from apps.purchasing.models import (
+    Supplier,
+    PurchaseOrder,
+    PurchaseOrderItem,
+    SupplierInvoice,
+    SupplierPayment,
+    SupplierDisbursementIdempotencyRecord,
+)
 
 
 class PurchaseOrderItemInline(admin.TabularInline):
@@ -12,8 +19,8 @@ class PurchaseOrderItemInline(admin.TabularInline):
 class SupplierPaymentInline(admin.TabularInline):
     model = SupplierPayment
     extra = 0
-    fields = ('number', 'payment_date', 'payment_method', 'currency_paid', 'amount_in_payment_currency', 'amount_applied_to_order')
-    readonly_fields = ('number', 'payment_date', 'payment_method', 'currency_paid', 'amount_in_payment_currency', 'amount_applied_to_order')
+    fields = ('number', 'payment_date', 'payment_method', 'bank_account', 'currency_paid', 'amount_in_payment_currency', 'amount_applied_to_order')
+    readonly_fields = ('number', 'payment_date', 'payment_method', 'bank_account', 'currency_paid', 'amount_in_payment_currency', 'amount_applied_to_order')
     can_delete = False
 
     def has_add_permission(self, request, obj=None):
@@ -61,9 +68,35 @@ class SupplierInvoiceAdmin(admin.ModelAdmin):
 
 @admin.register(SupplierPayment)
 class SupplierPaymentAdmin(admin.ModelAdmin):
-    list_display = ('number', 'purchase_order', 'payment_date', 'payment_method', 'currency_paid', 'amount_in_payment_currency', 'amount_applied_to_order')
-    search_fields = ('number', 'purchase_order__number', 'reference_number')
+    list_display = ('number', 'purchase_order', 'supplier_invoice', 'bank_account', 'payment_date', 'payment_method', 'currency_paid', 'amount_in_payment_currency', 'amount_applied_to_order')
+    search_fields = ('number', 'purchase_order__number', 'supplier_invoice__invoice_number', 'reference_number')
     list_filter = ('payment_method', 'currency_paid')
+    readonly_fields = (
+        'number', 'purchase_order', 'supplier_invoice', 'bank_account',
+        'payment_date', 'payment_method', 'reference_number', 'currency_paid',
+        'amount_in_payment_currency', 'exchange_rate_applied', 'amount_applied_to_order',
+        'paid_by', 'notes'
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(SupplierDisbursementIdempotencyRecord)
+class SupplierDisbursementIdempotencyRecordAdmin(admin.ModelAdmin):
+    list_display = ('idempotency_key', 'purchase_order', 'supplier_payment', 'status', 'created_at')
+    search_fields = ('idempotency_key', 'purchase_order__number', 'request_hash')
+    list_filter = ('status', 'created_at')
+    readonly_fields = (
+        'idempotency_key', 'purchase_order', 'supplier_invoice', 'supplier_payment',
+        'request_hash', 'status', 'response_payload', 'created_at', 'updated_at'
+    )
 
     def has_add_permission(self, request):
         return False

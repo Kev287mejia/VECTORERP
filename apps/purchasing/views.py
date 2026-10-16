@@ -1,3 +1,4 @@
+import uuid
 from decimal import Decimal
 from django.contrib import messages
 from django.db import models, transaction
@@ -5,10 +6,11 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.views import View
 
+from apps.finance.models import BankAccount
 from apps.inventory.models import InventoryItem, Warehouse
 from apps.inventory.services import record_stock_entry
 from apps.purchasing.models import PurchaseOrder, PurchaseOrderItem, Supplier, SupplierInvoice, SupplierPayment
-from apps.purchasing.services import receive_purchase_order_stock
+from apps.purchasing.services import receive_purchase_order_stock, record_supplier_disbursement
 from apps.tenancy.models import RoleLevel
 from apps.tenancy.permissions import ModuleAccessRequiredMixin
 
@@ -94,15 +96,20 @@ class PurchaseOrderDetailView(ModuleAccessRequiredMixin, View):
             pk=pk
         )
         items = list(po.items.all().select_related('inventory_item'))
-        payments = list(po.payments.all().select_related('paid_by'))
+        payments = list(po.payments.all().select_related('paid_by', 'bank_account'))
         inventory_items = list(InventoryItem.objects.for_org(request.organization).filter(is_active=True))
+        bank_accounts = list(BankAccount.objects.for_org(request.organization).filter(is_active=True))
+        supplier_invoices = list(po.supplier_invoices.all())
 
         return render(request, self.template_name, {
             'po': po,
             'items': items,
             'payments': payments,
             'inventory_items': inventory_items,
+            'bank_accounts': bank_accounts,
+            'supplier_invoices': supplier_invoices,
             'payment_methods': SupplierPayment.PaymentMethod.choices,
+            'default_idempotency_key': str(uuid.uuid4()),
             'can_pay_suppliers': request.role_level >= RoleLevel.COMMERCIAL_MGR,
             'can_receive_stock': request.role_level >= RoleLevel.OPERATIONS_COORD and not po.stock_received,
         })
@@ -247,32 +254,54 @@ class RegisterSupplierPaymentView(ModuleAccessRequiredMixin, View):
             amount = Decimal(request.POST.get('amount', '0.00'))
             currency_paid = request.POST.get('currency_paid', po.currency_code).strip().upper()
             payment_method = request.POST.get('payment_method', SupplierPayment.PaymentMethod.TRANSFER_BAC)
+            bank_account_id = request.POST.get('bank_account_id')
             reference_number = request.POST.get('reference_number', '').strip()
             notes = request.POST.get('notes', '').strip()
+            idempotency_key = request.POST.get('idempotency_key') or request.headers.get('X-Idempotency-Key')
 
             if amount <= Decimal('0.00'):
                 messages.error(request, "El monto a liquidar debe ser estrictamente mayor a 0.")
                 return redirect('purchasing:order_detail', pk=po.pk)
 
-            with transaction.atomic():
-                egr = SupplierPayment.objects.create(
+            bank_account = None
+            if bank_account_id:
+                bank_account = BankAccount.objects.for_org(request.organization).filter(pk=bank_account_id).first()
+            elif payment_method != SupplierPayment.PaymentMethod.CASH:
+                bank_account = BankAccount.objects.filter(
                     organization=request.organization,
-                    purchase_order=po,
-                    currency_paid=currency_paid,
-                    amount_in_payment_currency=amount,
-                    exchange_rate_applied=po.exchange_rate,
-                    payment_method=payment_method,
-                    reference_number=reference_number,
-                    paid_by=request.user,
-                    notes=notes,
-                )
+                    is_active=True,
+                    currency=currency_paid,
+                ).first()
 
-                messages.success(
-                    request,
-                    f"Comprobante de Egreso emitido: {egr.number} por {currency_paid} {amount:,.2f} "
-                    f"(Acreditado a orden: {po.currency_symbol} {egr.amount_applied_to_order:,.2f}). "
-                    f"Saldo pendiente: {po.currency_symbol} {po.balance_due:,.2f} [{po.get_status_display()}]."
-                )
+            supplier_invoice_id = request.POST.get('supplier_invoice_id')
+            supplier_invoice = None
+            if supplier_invoice_id:
+                supplier_invoice = SupplierInvoice.objects.for_org(request.organization).filter(pk=supplier_invoice_id).first()
+
+            egr, trx, pol = record_supplier_disbursement(
+                organization=request.organization,
+                purchase_order=po,
+                amount=amount,
+                user=request.user,
+                payment_method=payment_method,
+                bank_account=bank_account,
+                supplier_invoice=supplier_invoice,
+                reference_number=reference_number,
+                currency_paid=currency_paid,
+                notes=notes,
+                idempotency_key=idempotency_key,
+            )
+
+            po.refresh_from_db()
+            trx_msg = f" · Movimiento {trx.number}" if trx else ""
+            pol_msg = f" · Póliza {pol.number}" if pol else ""
+            messages.success(
+                request,
+                f"Comprobante de Egreso emitido: {egr.number} por {currency_paid} {amount:,.2f} "
+                f"(Acreditado a orden: {po.currency_symbol} {egr.amount_applied_to_order:,.2f}). "
+                f"Saldo pendiente: {po.currency_symbol} {po.balance_due:,.2f} [{po.get_status_display()}]."
+                f"{trx_msg}{pol_msg}"
+            )
 
         except Exception as e:
             messages.error(request, f"Error al emitir egreso bancario: {str(e)}")

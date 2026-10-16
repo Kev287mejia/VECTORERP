@@ -493,6 +493,100 @@ def record_purchase_order_journal_entry(organization, purchase_order, user, acco
         raise
 
 
+def record_supplier_payment_journal_entry(organization, supplier_payment, user, accounts=None):
+    """
+    Contabiliza la liquidación de un Comprobante de Egreso (EGR) en el Libro Diario (PAYMENTS).
+    Idempotente: si el pago ya posee póliza de egreso, retorna la existente sin duplicar.
+    Blindado contra condiciones de carrera concurrentes mediante manejo atómico de IntegrityError.
+    Convierte importes a Córdobas (NIO) si el pago fue aplicado a una orden en divisa extranjera (USD) a la tasa oficial.
+
+    Asiento Contable Cuadrado:
+    - DEBE: Proveedores Nacionales (CxP) (Cuenta '2101-01') por el monto aplicado en NIO.
+    - HABER: Bancos Institucionales ('1102-01') o Caja General ('1101-01') por el monto desembolsado en NIO.
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+    from django.db import IntegrityError, transaction
+    from apps.finance.models import JournalEntry, JournalEntryLine
+
+    existing = supplier_payment.journal_entries.filter(entry_type=JournalEntry.EntryType.PAYMENTS).first()
+    if existing:
+        return existing
+
+    if accounts is None:
+        accounts = ensure_default_chart_of_accounts(organization)
+
+    po = supplier_payment.purchase_order
+    if po.currency_code != 'NIO':
+        if supplier_payment.exchange_rate_applied != po.exchange_rate:
+            raise ValidationError(
+                f"Operación cambiaria no soportada: La orden {po.number} fue reconocida contablemente a una tasa de {po.exchange_rate:.4f}. "
+                f"El egreso {supplier_payment.number} posee una tasa diferente ({supplier_payment.exchange_rate_applied:.4f}), "
+                f"lo cual generaría un descuadre en Cuentas por Pagar sin política de diferencial cambiario."
+            )
+        rate = supplier_payment.exchange_rate_applied
+    else:
+        rate = Decimal('1.0')
+    applied_nio = (supplier_payment.amount_applied_to_order * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    # Determinar cuenta de tesorería contra la que se desembolsó
+    if supplier_payment.bank_account_id:
+        cash_or_bank_account = accounts.get('1102-01') or accounts.get('1101-01')
+        credit_concept = f"Desembolso {supplier_payment.bank_account.bank_name} {supplier_payment.bank_account.account_number}"
+    else:
+        cash_or_bank_account = accounts.get('1101-01') or accounts.get('1102-01')
+        credit_concept = "Desembolso Efectivo en Caja General"
+
+    try:
+        with transaction.atomic():
+            existing = supplier_payment.journal_entries.filter(entry_type=JournalEntry.EntryType.PAYMENTS).first()
+            if existing:
+                return existing
+
+            supplier_name = po.supplier.commercial_name if po.supplier else "Proveedor"
+            entry = JournalEntry.objects.create(
+                organization=organization,
+                date=supplier_payment.payment_date or timezone.now().date(),
+                entry_type=JournalEntry.EntryType.PAYMENTS,
+                concept=f"Pago {supplier_payment.number} a {supplier_name} - OC {po.number}",
+                reference=supplier_payment.number,
+                source_purchase_order=po,
+                source_supplier_invoice=supplier_payment.supplier_invoice,
+                source_supplier_payment=supplier_payment,
+                created_by=user,
+            )
+
+            # 1. DEBE: Proveedores Nacionales (CxP) (Disminución de pasivo)
+            JournalEntryLine.objects.create(
+                organization=organization,
+                entry=entry,
+                account=accounts['2101-01'],
+                concept=f"Amortización CxP {po.number} - {supplier_payment.number}",
+                debit=applied_nio,
+                credit=Decimal('0.00'),
+            )
+
+            # 2. HABER: Bancos Institucionales o Caja (Disminución de activo)
+            JournalEntryLine.objects.create(
+                organization=organization,
+                entry=entry,
+                account=cash_or_bank_account,
+                concept=credit_concept,
+                debit=Decimal('0.00'),
+                credit=applied_nio,
+            )
+
+            entry.verify_and_save_balance()
+            return entry
+    except IntegrityError:
+        existing = supplier_payment.journal_entries.filter(entry_type=JournalEntry.EntryType.PAYMENTS).first()
+        if existing:
+            return existing
+        raise
+
+
+
+
+
 @transaction.atomic
 def record_client_collection(
     organization,

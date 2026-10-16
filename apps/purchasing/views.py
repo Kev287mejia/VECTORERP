@@ -7,7 +7,8 @@ from django.views import View
 
 from apps.inventory.models import InventoryItem, Warehouse
 from apps.inventory.services import record_stock_entry
-from apps.purchasing.models import PurchaseOrder, PurchaseOrderItem, Supplier, SupplierPayment
+from apps.purchasing.models import PurchaseOrder, PurchaseOrderItem, Supplier, SupplierInvoice, SupplierPayment
+from apps.purchasing.services import receive_purchase_order_stock
 from apps.tenancy.models import RoleLevel
 from apps.tenancy.permissions import ModuleAccessRequiredMixin
 
@@ -188,8 +189,9 @@ class PurchaseOrderAddItemView(ModuleAccessRequiredMixin, View):
 
 class ReceivePurchaseOrderView(ModuleAccessRequiredMixin, View):
     """
-    Recepción Física de Mercadería en Almacén e Impacto Directo en Kardex.
-    Inyecta existencias y costo promedio ponderado mediante record_stock_entry().
+    Recepción Física de Mercadería en Almacén, Kardex e Integración Contable.
+    Inyecta existencias mediante receive_purchase_order_stock() con bloqueo pesimista
+    select_for_update(), separación de factura del proveedor y asiento contable cuadrado.
     Accesible para Coordinador de Operaciones (80+).
     """
     required_module = 'purchasing'
@@ -202,49 +204,24 @@ class ReceivePurchaseOrderView(ModuleAccessRequiredMixin, View):
             pk=pk
         )
 
-        if po.stock_received:
-            messages.warning(request, f"La orden {po.number} ya fue recepcionada previamente en bodega.")
-            return redirect('purchasing:order_detail', pk=po.pk)
-
-        items = list(po.items.select_related('inventory_item').all())
-        if not items:
-            messages.error(request, "La orden de compra no contiene partidas para ingresar a bodega.")
-            return redirect('purchasing:order_detail', pk=po.pk)
-
         supplier_invoice = request.POST.get('supplier_invoice_number', '').strip()
-        if supplier_invoice:
-            po.supplier_invoice_number = supplier_invoice
 
         try:
-            with transaction.atomic():
-                # 1. Alimentar el Kardex por cada partida
-                for line in items:
-                    ref_note = f"Recepción {po.number} · Factura Proveedor {po.supplier_invoice_number or 'S/F'}"
-                    record_stock_entry(
-                        organization=request.organization,
-                        warehouse=po.target_warehouse,
-                        item=line.inventory_item,
-                        quantity=line.quantity,
-                        unit_cost=line.unit_cost,
-                        reference_note=ref_note,
-                        user=request.user,
-                    )
-
-                # 2. Actualizar estado y trazabilidad de la orden
-                po.stock_received = True
-                po.status = PurchaseOrder.Status.RECEIVED
-                po.received_by = request.user
-                po.received_at = timezone.now()
-                po.recalculate_totals()
-                po.save()
-
-                messages.success(
-                    request,
-                    f"Recepción completada en {po.target_warehouse.name}. "
-                    f"Se ingresaron {len(items)} partida(s) al Kardex con actualización de costo promedio. "
-                    f"Cuenta por pagar generada por {po.currency_symbol} {po.net_payable:,.2f} "
-                    f"[Constancia Retención: {po.withholding_certificate_number or 'N/A'}]."
-                )
+            po, movements, inv, journal_entry = receive_purchase_order_stock(
+                organization=request.organization,
+                purchase_order=po,
+                user=request.user,
+                supplier_invoice_number=supplier_invoice,
+            )
+            inv_msg = f" · Factura #{inv.invoice_number}" if inv else ""
+            pol_msg = f" · Póliza {journal_entry.number}" if journal_entry else ""
+            messages.success(
+                request,
+                f"Recepción completada en {po.target_warehouse.name}. "
+                f"Se ingresaron {len(movements)} partida(s) al Kardex con actualización de costo promedio. "
+                f"Cuenta por pagar generada por {po.currency_symbol} {po.net_payable:,.2f}"
+                f"{inv_msg}{pol_msg}."
+            )
         except Exception as e:
             messages.error(request, f"Error durante la recepción en Kardex: {str(e)}")
 

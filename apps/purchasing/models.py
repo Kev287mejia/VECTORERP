@@ -444,6 +444,13 @@ class PurchaseOrderItem(TenantScopedModel):
         default=Decimal('1.00'),
         verbose_name="Cantidad Solicitada",
     )
+    quantity_received = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Cantidad Recibida en Bodega",
+        help_text="Cantidad física ingresada en bodega",
+    )
     unit_cost = models.DecimalField(
         max_digits=14,
         decimal_places=2,
@@ -474,6 +481,148 @@ class PurchaseOrderItem(TenantScopedModel):
 
         self.line_total = (self.quantity * self.unit_cost).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         super().save(*args, **kwargs)
+
+
+class SupplierInvoice(TenantScopedModel):
+    """
+    Documento Comercial / Fiscal del Proveedor (Factura de Compra / Cuenta por Pagar).
+    Representa formalmente la obligación exigible con el proveedor, separando la orden interna
+    de la factura legal recibida.
+    """
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', 'Pendiente de Pago'
+        PARTIAL = 'PARTIAL', 'Pago Parcial'
+        PAID = 'PAID', 'Pagada / Liquidada'
+        VOID = 'VOID', 'Anulada'
+
+    supplier = models.ForeignKey(
+        Supplier,
+        on_delete=models.PROTECT,
+        related_name='invoices',
+        verbose_name="Proveedor Emisor",
+    )
+    purchase_order = models.ForeignKey(
+        PurchaseOrder,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='supplier_invoices',
+        verbose_name="Orden de Compra Asociada",
+    )
+    invoice_number = models.CharField(
+        max_length=60,
+        db_index=True,
+        verbose_name="N° Factura del Proveedor",
+        help_text="Folio fiscal o comercial emitido por el proveedor",
+    )
+    issue_date = models.DateField(
+        default=timezone.now,
+        verbose_name="Fecha de Factura",
+    )
+    due_date = models.DateField(
+        null=True,
+        blank=True,
+        verbose_name="Fecha de Vencimiento",
+    )
+    currency_code = models.CharField(
+        max_length=3,
+        default='NIO',
+        verbose_name="Moneda de Facturación",
+    )
+    exchange_rate = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        default=Decimal('36.6243'),
+        verbose_name="Tipo de Cambio (BCN)",
+    )
+    subtotal = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Subtotal Gravado / Exento",
+    )
+    tax_total = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="IVA Crédito Fiscal",
+    )
+    gross_total = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Total Bruto Facturado",
+    )
+    ir_withheld_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Retención IR DGI",
+    )
+    imi_withheld_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Retención IMI Alcaldía",
+    )
+    net_payable = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Monto Neto a Pagar",
+    )
+    amount_paid = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Monto Liquidado",
+    )
+    balance_due = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Saldo Pendiente (CxP)",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+        verbose_name="Estado de Pago",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='created_supplier_invoices',
+        verbose_name="Registrado Por",
+    )
+    notes = models.TextField(
+        blank=True,
+        verbose_name="Notas / Observaciones",
+    )
+
+    class Meta(TenantScopedModel.Meta):
+        verbose_name = "Factura de Proveedor"
+        verbose_name_plural = "Facturas de Proveedores (CxP)"
+        ordering = ['-issue_date', '-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'supplier', 'invoice_number'],
+                name='unique_supplier_invoice_number_per_vendor',
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.supplier.commercial_name} · Factura #{self.invoice_number} ({self.currency_code} {self.net_payable:,.2f})"
+
+    def clean(self):
+        super().clean()
+        if self.supplier_id and self.organization_id and self.supplier.organization_id != self.organization_id:
+            raise ValidationError("El proveedor no pertenece a la misma organización.")
+        if self.purchase_order_id and self.organization_id and self.purchase_order.organization_id != self.organization_id:
+            raise ValidationError("La orden de compra no pertenece a la misma organización.")
 
 
 class SupplierPayment(TenantScopedModel):

@@ -258,6 +258,7 @@ def ensure_default_chart_of_accounts(organization):
         ('1104-01', 'IVA Crédito Fiscal Acreditable (15%)', AccountingAccount.AccountType.ASSET),
         ('1105-01', 'Anticipo Retención IR Sufrida (1% - 2%)', AccountingAccount.AccountType.ASSET),
         ('1105-02', 'Anticipo Retención IMI Municipal Sufrida (1%)', AccountingAccount.AccountType.ASSET),
+        ('1106-01', 'Inventarios de Mercancías y Materiales', AccountingAccount.AccountType.ASSET),
         ('2101-01', 'Proveedores Nacionales (CxP)', AccountingAccount.AccountType.LIABILITY),
         ('2102-01', 'IVA Débito Fiscal por Pagar (15%)', AccountingAccount.AccountType.LIABILITY),
         ('2103-01', 'Retenciones IR en la Fuente por Enterar DGI', AccountingAccount.AccountType.LIABILITY),
@@ -378,6 +379,115 @@ def record_invoice_sales_journal_entry(organization, invoice, user, accounts=Non
     except IntegrityError:
         # Carrera de concurrencia: otro hilo insertó la póliza respetando el constraint único
         existing = invoice.journal_entries.filter(entry_type=JournalEntry.EntryType.SALES).first()
+        if existing:
+            return existing
+        raise
+
+
+def record_purchase_order_journal_entry(organization, purchase_order, user, accounts=None, supplier_invoice=None):
+    """
+    Contabiliza la recepción física y devengo de una Orden de Compra en el Libro Diario (PURCHASES).
+    Idempotente: si la orden de compra ya posee póliza de compras, retorna la existente sin duplicar.
+    Blindado contra condiciones de carrera concurrentes mediante manejo atómico de IntegrityError.
+    Convierte importes a Córdobas (NIO) si la orden fue emitida en divisa extranjera (USD) a la tasa oficial BCN.
+    Debita la cuenta de Activo Circulante de Inventarios ('1106-01') bajo NIIF / IAS 2, con fallback a '5101-01' si no existe.
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+    from django.db import IntegrityError, transaction
+    from apps.finance.models import JournalEntry, JournalEntryLine
+
+    existing = purchase_order.journal_entries.filter(entry_type=JournalEntry.EntryType.PURCHASES).first()
+    if existing:
+        return existing
+
+    if accounts is None:
+        accounts = ensure_default_chart_of_accounts(organization)
+
+    rate = purchase_order.exchange_rate if purchase_order.currency_code == 'USD' else Decimal('1.0')
+    subtotal_nio = (purchase_order.subtotal * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    tax_total_nio = (purchase_order.tax_total * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    ir_retention_nio = (purchase_order.ir_withheld_amount * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    imi_retention_nio = (purchase_order.imi_withheld_amount * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    net_payable_nio = (purchase_order.net_payable * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    # Identificar cuenta de inventarios o costos
+    inventory_account = accounts.get('1106-01') or accounts.get('5101-01')
+
+    try:
+        with transaction.atomic():
+            existing = purchase_order.journal_entries.filter(entry_type=JournalEntry.EntryType.PURCHASES).first()
+            if existing:
+                return existing
+
+            entry = JournalEntry.objects.create(
+                organization=organization,
+                date=purchase_order.received_at.date() if purchase_order.received_at else (purchase_order.issue_date or timezone.now().date()),
+                entry_type=JournalEntry.EntryType.PURCHASES,
+                concept=f"Compra Recibida {purchase_order.number} - {purchase_order.supplier.commercial_name if purchase_order.supplier else 'Proveedor'}",
+                reference=purchase_order.number,
+                source_purchase_order=purchase_order,
+                source_supplier_invoice=supplier_invoice,
+                created_by=user,
+            )
+
+            # 1. DEBE: Inventario de Mercancías y Materiales (Subtotal en NIO)
+            JournalEntryLine.objects.create(
+                organization=organization,
+                entry=entry,
+                account=inventory_account,
+                concept=f"Inventario/Materiales OC {purchase_order.number}",
+                debit=subtotal_nio,
+                credit=Decimal('0.00'),
+            )
+
+            # 2. DEBE: IVA Crédito Fiscal Acreditable 15% (si aplica)
+            if tax_total_nio > Decimal('0.00'):
+                JournalEntryLine.objects.create(
+                    organization=organization,
+                    entry=entry,
+                    account=accounts['1104-01'],
+                    concept=f"IVA Crédito Fiscal 15% OC {purchase_order.number}",
+                    debit=tax_total_nio,
+                    credit=Decimal('0.00'),
+                )
+
+            # 3. HABER: Retención IR DGI por Enterar (si aplica)
+            if ir_retention_nio > Decimal('0.00'):
+                JournalEntryLine.objects.create(
+                    organization=organization,
+                    entry=entry,
+                    account=accounts['2103-01'],
+                    concept=f"Retención IR DGI {purchase_order.withholding_certificate_number or purchase_order.number}",
+                    debit=Decimal('0.00'),
+                    credit=ir_retention_nio,
+                )
+
+            # 4. HABER: Retención IMI Alcaldía por Enterar (si aplica)
+            if imi_retention_nio > Decimal('0.00'):
+                JournalEntryLine.objects.create(
+                    organization=organization,
+                    entry=entry,
+                    account=accounts['2103-02'],
+                    concept=f"Retención IMI Alcaldía {purchase_order.withholding_certificate_number or purchase_order.number}",
+                    debit=Decimal('0.00'),
+                    credit=imi_retention_nio,
+                )
+
+            # 5. HABER: Proveedores Nacionales (CxP) (Neto a Pagar en NIO)
+            JournalEntryLine.objects.create(
+                organization=organization,
+                entry=entry,
+                account=accounts['2101-01'],
+                concept=f"CxP Fact. Proveedor {purchase_order.supplier_invoice_number or purchase_order.number}",
+                debit=Decimal('0.00'),
+                credit=net_payable_nio,
+            )
+
+            entry.verify_and_save_balance()
+            return entry
+    except IntegrityError:
+        # Carrera de concurrencia: otro hilo insertó la póliza respetando el constraint único
+        existing = purchase_order.journal_entries.filter(entry_type=JournalEntry.EntryType.PURCHASES).first()
         if existing:
             return existing
         raise
@@ -669,73 +779,10 @@ def sync_commercial_and_purchasing_to_ledger(organization, user):
     purchases = PurchaseOrder.objects.filter(
         organization=organization,
         status__in=[PurchaseOrder.Status.RECEIVED, PurchaseOrder.Status.PARTIAL_PAID, PurchaseOrder.Status.PAID],
-    ).exclude(journal_entries__isnull=False)
+    ).exclude(journal_entries__entry_type=JournalEntry.EntryType.PURCHASES)
 
     for po in purchases:
-        entry = JournalEntry.objects.create(
-            organization=organization,
-            date=po.issue_date or timezone.now().date(),
-            entry_type=JournalEntry.EntryType.PURCHASES,
-            concept=f"Compra Recibida {po.number} - {po.supplier.commercial_name if po.supplier else 'Proveedor'}",
-            reference=po.number,
-            source_purchase_order=po,
-            created_by=user,
-        )
-
-        # DEBE: Compras / Inventarios (Subtotal)
-        JournalEntryLine.objects.create(
-            organization=organization,
-            entry=entry,
-            account=accounts['5101-01'],
-            concept=f"Inventario/Gasto OC {po.number}",
-            debit=po.subtotal,
-            credit=Decimal('0.00'),
-        )
-
-        # DEBE: IVA Crédito Fiscal Acreditable (si aplica)
-        if po.tax_total > Decimal('0.00'):
-            JournalEntryLine.objects.create(
-                organization=organization,
-                entry=entry,
-                account=accounts['1104-01'],
-                concept=f"IVA Crédito Fiscal 15% OC {po.number}",
-                debit=po.tax_total,
-                credit=Decimal('0.00'),
-            )
-
-        # HABER: Retención IR DGI por pagar (si aplica)
-        if po.ir_withheld_amount > Decimal('0.00'):
-            JournalEntryLine.objects.create(
-                organization=organization,
-                entry=entry,
-                account=accounts['2103-01'],
-                concept=f"Retención IR DGI {po.withholding_certificate_number or po.number}",
-                debit=Decimal('0.00'),
-                credit=po.ir_withheld_amount,
-            )
-
-        # HABER: Retención IMI Alcaldía por pagar (si aplica)
-        if po.imi_withheld_amount > Decimal('0.00'):
-            JournalEntryLine.objects.create(
-                organization=organization,
-                entry=entry,
-                account=accounts['2103-02'],
-                concept=f"Retención IMI Alcaldía {po.withholding_certificate_number or po.number}",
-                debit=Decimal('0.00'),
-                credit=po.imi_withheld_amount,
-            )
-
-        # HABER: Proveedores Nacionales CxP (Neto a Pagar)
-        JournalEntryLine.objects.create(
-            organization=organization,
-            entry=entry,
-            account=accounts['2101-01'],
-            concept=f"CxP Proveedor Fact. {po.supplier_invoice_number or po.number}",
-            debit=Decimal('0.00'),
-            credit=po.net_payable,
-        )
-
-        entry.verify_and_save_balance()
+        record_purchase_order_journal_entry(organization, po, user, accounts=accounts)
         synced_purchases += 1
 
     return {

@@ -442,6 +442,22 @@ class StockMovement(TenantScopedModel):
         related_name='stock_movements',
         verbose_name="Partida de la OT",
     )
+    purchase_order = models.ForeignKey(
+        'purchasing.PurchaseOrder',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='stock_movements',
+        verbose_name="Orden de Compra Vinculada",
+    )
+    purchase_order_item = models.ForeignKey(
+        'purchasing.PurchaseOrderItem',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='stock_movements',
+        verbose_name="Partida de la OC",
+    )
     quantity = models.DecimalField(
         max_digits=12,
         decimal_places=2,

@@ -7,10 +7,21 @@ from apps.inventory.models import Warehouse, InventoryItem, StockBalance, StockM
 
 
 @transaction.atomic
-def record_stock_entry(organization, warehouse, item, quantity, unit_cost, reference_note, user) -> StockMovement:
+def record_stock_entry(
+    organization,
+    warehouse,
+    item,
+    quantity,
+    unit_cost,
+    reference_note,
+    user,
+    purchase_order=None,
+    purchase_order_item=None,
+) -> StockMovement:
     """
     Registra entrada de material/insumo a bodega por compra o ajuste inicial.
     Bloquea el saldo con select_for_update() y actualiza el costo promedio ponderado.
+    Vincula el movimiento de Kardex a la Orden de Compra y Partida cuando aplica.
     """
     qty = Decimal(str(quantity))
     cost = Decimal(str(unit_cost)) if unit_cost is not None else Decimal('0.00')
@@ -49,6 +60,8 @@ def record_stock_entry(organization, warehouse, item, quantity, unit_cost, refer
         movement_type=movement_type,
         warehouse=warehouse,
         item=item,
+        purchase_order=purchase_order,
+        purchase_order_item=purchase_order_item,
         quantity=qty,
         unit_cost_snapshot=cost if cost > Decimal('0.00') else item.unit_cost,
         balance_after=balance.quantity,

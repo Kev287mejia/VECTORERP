@@ -614,6 +614,14 @@ class JournalEntry(TenantScopedModel):
         related_name='journal_entries',
         verbose_name="Recibo de Cobro Fuente",
     )
+    source_supplier_invoice = models.ForeignKey(
+        'purchasing.SupplierInvoice',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='journal_entries',
+        verbose_name="Factura de Proveedor Fuente",
+    )
     total_debit = models.DecimalField(
         max_digits=14,
         decimal_places=2,
@@ -656,6 +664,11 @@ class JournalEntry(TenantScopedModel):
                 fields=['organization', 'source_payment_receipt', 'entry_type'],
                 condition=models.Q(source_payment_receipt__isnull=False, entry_type='COLLECTIONS'),
                 name='unique_collection_journal_entry_per_receipt',
+            ),
+            models.UniqueConstraint(
+                fields=['organization', 'source_purchase_order', 'entry_type'],
+                condition=models.Q(source_purchase_order__isnull=False, entry_type='PURCHASES'),
+                name='unique_purchases_journal_entry_per_po',
             ),
         ]
 

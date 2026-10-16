@@ -444,6 +444,9 @@ class PointOfSaleTerminalView(ModuleAccessRequiredMixin, View):
             models.Q(cashier=request.user) | models.Q(cashier__isnull=False)
         ).order_by('-opened_at').first()
 
+        from apps.finance.models import BankAccount
+        bank_accounts = list(BankAccount.objects.for_org(org).filter(is_active=True).order_by('bank_name', 'account_number'))
+
         return render(request, self.template_name, {
             'items': items,
             'catalog_json': json.dumps(catalog_data),
@@ -451,6 +454,7 @@ class PointOfSaleTerminalView(ModuleAccessRequiredMixin, View):
             'accounts': accounts,
             'default_account': default_account,
             'payment_methods': PaymentReceipt.PaymentMethod.choices,
+            'bank_accounts': bank_accounts,
             'active_shift': active_shift,
         })
 
@@ -458,6 +462,7 @@ class PointOfSaleTerminalView(ModuleAccessRequiredMixin, View):
         import json
         from django.core.exceptions import ValidationError
         from apps.billing.services import execute_pos_sale
+        from apps.finance.models import BankAccount
 
         org = request.organization
         warehouse_id = request.POST.get('warehouse_id')
@@ -465,9 +470,14 @@ class PointOfSaleTerminalView(ModuleAccessRequiredMixin, View):
         payment_method = request.POST.get('payment_method') or PaymentReceipt.PaymentMethod.CASH
         price_tier = (request.POST.get('price_tier') or 'RETAIL').upper()
         notes = request.POST.get('notes', '')
+        bank_account_id = request.POST.get('bank_account_id')
+        reference_number = request.POST.get('reference_number', '')
+        idempotency_key = request.POST.get('idempotency_key') or request.headers.get('X-Idempotency-Key')
+        currency_paid = request.POST.get('currency_paid')
 
         warehouse = Warehouse.objects.for_org(org).filter(id=warehouse_id).first() if warehouse_id else Warehouse.objects.for_org(org).filter(is_active=True).first()
         account = Account.objects.for_org(org).filter(id=account_id).first() if account_id else None
+        bank_account = BankAccount.objects.for_org(org).filter(id=bank_account_id).first() if bank_account_id else None
 
         # Procesar items: payload JSON o entradas individuales
         items_payload = request.POST.get('items_payload') or request.POST.get('cart_items')
@@ -514,6 +524,10 @@ class PointOfSaleTerminalView(ModuleAccessRequiredMixin, View):
                 payment_method=payment_method,
                 price_tier=price_tier,
                 notes=notes,
+                bank_account=bank_account,
+                reference_number=reference_number,
+                currency_paid=currency_paid,
+                idempotency_key=idempotency_key,
             )
             messages.success(
                 request,

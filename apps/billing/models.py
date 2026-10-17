@@ -927,23 +927,73 @@ class CashRegisterSession(TenantScopedModel):
         super().delete(*args, **kwargs)
 
 
+def _remap_q_object(q, remap_fn):
+    if not isinstance(q, models.Q):
+        return q
+    new_children = []
+    for child in q.children:
+        if isinstance(child, models.Q):
+            new_children.append(_remap_q_object(child, remap_fn))
+        elif isinstance(child, tuple) and len(child) == 2:
+            k, v = child
+            new_children.append((remap_fn(k), v))
+        else:
+            new_children.append(child)
+    new_q = models.Q()
+    new_q.connector = q.connector
+    new_q.negated = q.negated
+    new_q.children = new_children
+    return new_q
+
+
 class PosRegisterShiftQuerySet(models.QuerySet):
-    def _remap_legacy_kwargs(self, kwargs):
-        remapped = {}
-        for k, v in kwargs.items():
-            if k == 'total_remittances_nio':
-                remapped['total_bank_deposits_nio'] = v
-            elif k.startswith('total_remittances_nio__'):
-                remapped['total_bank_deposits_nio__' + k[len('total_remittances_nio__'):]] = v
-            else:
-                remapped[k] = v
-        return remapped
+    @staticmethod
+    def _remap_key(k: str) -> str:
+        if k == 'total_remittances_nio':
+            return 'total_bank_deposits_nio'
+        if k.startswith('total_remittances_nio__'):
+            return 'total_bank_deposits_nio__' + k[len('total_remittances_nio__'):]
+        if k == 'remittances':
+            return 'bank_deposits'
+        if k.startswith('remittances__'):
+            return 'bank_deposits__' + k[len('remittances__'):]
+        return k
+
+    def _remap_args(self, args):
+        return tuple(_remap_q_object(a, self._remap_key) for a in args)
+
+    def _remap_kwargs(self, kwargs):
+        return {self._remap_key(k): v for k, v in kwargs.items()}
 
     def filter(self, *args, **kwargs):
-        return super().filter(*args, **self._remap_legacy_kwargs(kwargs))
+        return super().filter(*self._remap_args(args), **self._remap_kwargs(kwargs))
 
     def exclude(self, *args, **kwargs):
-        return super().exclude(*args, **self._remap_legacy_kwargs(kwargs))
+        return super().exclude(*self._remap_args(args), **self._remap_kwargs(kwargs))
+
+    def order_by(self, *field_names):
+        remapped = []
+        for f in field_names:
+            prefix = '-' if f.startswith('-') else ''
+            base = f[1:] if prefix else f
+            remapped.append(prefix + self._remap_key(base))
+        return super().order_by(*remapped)
+
+    def values(self, *fields, **expressions):
+        remapped_fields = [self._remap_key(f) for f in fields]
+        remapped_exprs = {self._remap_key(k): v for k, v in expressions.items()}
+        return super().values(*remapped_fields, **remapped_exprs)
+
+    def values_list(self, *fields, **kwargs):
+        remapped_fields = [self._remap_key(f) for f in fields]
+        return super().values_list(*remapped_fields, **kwargs)
+
+    def prefetch_related(self, *lookups):
+        remapped = [self._remap_key(l) if isinstance(l, str) else l for l in lookups]
+        return super().prefetch_related(*remapped)
+
+    def create(self, **kwargs):
+        return super().create(**self._remap_kwargs(kwargs))
 
 
 class PosRegisterShift(TenantScopedModel):
@@ -1161,24 +1211,51 @@ class PosRegisterShift(TenantScopedModel):
 
 
 class CashMovementQuerySet(models.QuerySet):
-    def _remap_legacy_kwargs(self, kwargs):
-        remapped = {}
-        for k, v in kwargs.items():
-            if k == 'remittance':
-                remapped['bank_deposit'] = v
-            elif k == 'remittance_id':
-                remapped['bank_deposit_id'] = v
-            elif k.startswith('remittance__'):
-                remapped['bank_deposit__' + k[len('remittance__'):]] = v
-            else:
-                remapped[k] = v
-        return remapped
+    @staticmethod
+    def _remap_key(k: str) -> str:
+        if k == 'remittance':
+            return 'bank_deposit'
+        if k == 'remittance_id':
+            return 'bank_deposit_id'
+        if k.startswith('remittance__'):
+            return 'bank_deposit__' + k[len('remittance__'):]
+        return k
+
+    def _remap_args(self, args):
+        return tuple(_remap_q_object(a, self._remap_key) for a in args)
+
+    def _remap_kwargs(self, kwargs):
+        return {self._remap_key(k): v for k, v in kwargs.items()}
 
     def filter(self, *args, **kwargs):
-        return super().filter(*args, **self._remap_legacy_kwargs(kwargs))
+        return super().filter(*self._remap_args(args), **self._remap_kwargs(kwargs))
 
     def exclude(self, *args, **kwargs):
-        return super().exclude(*args, **self._remap_legacy_kwargs(kwargs))
+        return super().exclude(*self._remap_args(args), **self._remap_kwargs(kwargs))
+
+    def order_by(self, *field_names):
+        remapped = []
+        for f in field_names:
+            prefix = '-' if f.startswith('-') else ''
+            base = f[1:] if prefix else f
+            remapped.append(prefix + self._remap_key(base))
+        return super().order_by(*remapped)
+
+    def values(self, *fields, **expressions):
+        remapped_fields = [self._remap_key(f) for f in fields]
+        remapped_exprs = {self._remap_key(k): v for k, v in expressions.items()}
+        return super().values(*remapped_fields, **remapped_exprs)
+
+    def values_list(self, *fields, **kwargs):
+        remapped_fields = [self._remap_key(f) for f in fields]
+        return super().values_list(*remapped_fields, **kwargs)
+
+    def select_related(self, *fields):
+        remapped = [self._remap_key(f) if isinstance(f, str) else f for f in fields]
+        return super().select_related(*remapped)
+
+    def create(self, **kwargs):
+        return super().create(**self._remap_kwargs(kwargs))
 
 
 class CashMovement(TenantScopedModel):
@@ -1315,22 +1392,45 @@ class CashMovement(TenantScopedModel):
 
 
 class CashBankDepositQuerySet(models.QuerySet):
-    def _remap_legacy_kwargs(self, kwargs):
-        remapped = {}
-        for k, v in kwargs.items():
-            if k == 'remittance_number':
-                remapped['deposit_number'] = v
-            elif k.startswith('remittance_number__'):
-                remapped['deposit_number__' + k[len('remittance_number__'):]] = v
-            else:
-                remapped[k] = v
-        return remapped
+    @staticmethod
+    def _remap_key(k: str) -> str:
+        if k == 'remittance_number':
+            return 'deposit_number'
+        if k.startswith('remittance_number__'):
+            return 'deposit_number__' + k[len('remittance_number__'):]
+        return k
+
+    def _remap_args(self, args):
+        return tuple(_remap_q_object(a, self._remap_key) for a in args)
+
+    def _remap_kwargs(self, kwargs):
+        return {self._remap_key(k): v for k, v in kwargs.items()}
 
     def filter(self, *args, **kwargs):
-        return super().filter(*args, **self._remap_legacy_kwargs(kwargs))
+        return super().filter(*self._remap_args(args), **self._remap_kwargs(kwargs))
 
     def exclude(self, *args, **kwargs):
-        return super().exclude(*args, **self._remap_legacy_kwargs(kwargs))
+        return super().exclude(*self._remap_args(args), **self._remap_kwargs(kwargs))
+
+    def order_by(self, *field_names):
+        remapped = []
+        for f in field_names:
+            prefix = '-' if f.startswith('-') else ''
+            base = f[1:] if prefix else f
+            remapped.append(prefix + self._remap_key(base))
+        return super().order_by(*remapped)
+
+    def values(self, *fields, **expressions):
+        remapped_fields = [self._remap_key(f) for f in fields]
+        remapped_exprs = {self._remap_key(k): v for k, v in expressions.items()}
+        return super().values(*remapped_fields, **remapped_exprs)
+
+    def values_list(self, *fields, **kwargs):
+        remapped_fields = [self._remap_key(f) for f in fields]
+        return super().values_list(*remapped_fields, **kwargs)
+
+    def create(self, **kwargs):
+        return super().create(**self._remap_kwargs(kwargs))
 
 
 class CashBankDeposit(TenantScopedModel):

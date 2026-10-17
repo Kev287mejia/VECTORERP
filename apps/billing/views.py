@@ -722,11 +722,11 @@ class PosShiftConsoleView(ModuleAccessRequiredMixin, View):
 
         x_metrics = None
         active_movements = []
-        active_remittances = []
+        active_deposits = []
         if active_shift:
             x_metrics = compute_shift_x_cut_metrics(active_shift)
             active_movements = list(active_shift.cash_movements.all().select_related('performed_by').order_by('-created_at')[:25])
-            active_remittances = list(active_shift.remittances.all().select_related('destination_bank_account', 'prepared_by', 'confirmed_by').order_by('-prepared_at'))
+            active_deposits = list(active_shift.bank_deposits.all().select_related('destination_bank_account', 'prepared_by', 'confirmed_by').order_by('-prepared_at'))
 
         from apps.finance.models import BankAccount
         bank_accounts = list(BankAccount.objects.filter(organization=org, is_active=True).order_by('bank_name'))
@@ -740,7 +740,8 @@ class PosShiftConsoleView(ModuleAccessRequiredMixin, View):
             'active_shift': active_shift,
             'x_metrics': x_metrics,
             'active_movements': active_movements,
-            'active_remittances': active_remittances,
+            'active_deposits': active_deposits,
+            'active_remittances': active_deposits,
             'bank_accounts': bank_accounts,
             'closed_shifts': closed_shifts,
             'now': timezone.now(),
@@ -816,9 +817,9 @@ class PosShiftConsoleView(ModuleAccessRequiredMixin, View):
 
             return redirect('billing:pos_shifts')
 
-        elif action == 'prepare_remittance':
+        elif action in ['prepare_deposit', 'prepare_cash_bank_deposit', 'prepare_remittance']:
             if not active_shift:
-                messages.error(request, "No hay ningún turno abierto para preparar remesas.")
+                messages.error(request, "No hay ningún turno abierto para preparar depósitos bancarios.")
                 return redirect('billing:pos_shifts')
 
             bank_id = request.POST.get('bank_account_id')
@@ -827,9 +828,9 @@ class PosShiftConsoleView(ModuleAccessRequiredMixin, View):
 
             from apps.finance.models import BankAccount
             bank = get_object_or_404(BankAccount.objects.filter(organization=org), pk=bank_id)
-            from apps.billing.services_cash import prepare_cash_remittance
+            from apps.billing.services_cash import prepare_cash_bank_deposit
             try:
-                rem = prepare_cash_remittance(
+                dep = prepare_cash_bank_deposit(
                     shift=active_shift,
                     destination_bank_account=bank,
                     amount=Decimal(str(amount)),
@@ -838,114 +839,114 @@ class PosShiftConsoleView(ModuleAccessRequiredMixin, View):
                 )
                 messages.success(
                     request,
-                    f"Remesa {rem.remittance_number} por C$ {rem.amount:,.2f} preparada hacia {bank.bank_name}. Dinero aún en gaveta."
+                    f"Depósito bancario {dep.deposit_number} por C$ {dep.amount:,.2f} preparado hacia {bank.bank_name}. Dinero aún en gaveta."
                 )
             except ValidationError as e:
                 messages.error(request, e.message if hasattr(e, 'message') else str(e))
             except Exception as e:
-                messages.error(request, f"Error al preparar remesa: {str(e)}")
+                messages.error(request, f"Error al preparar depósito bancario: {str(e)}")
 
             return redirect('billing:pos_shifts')
 
-        elif action == 'dispatch_remittance':
-            rem_id = request.POST.get('remittance_id')
+        elif action in ['dispatch_deposit', 'dispatch_cash_for_deposit', 'dispatch_remittance']:
+            dep_id = request.POST.get('deposit_id') or request.POST.get('remittance_id')
             carrier_name = request.POST.get('carrier_name', '')
             carrier_id = request.POST.get('carrier_id', '')
 
-            from apps.billing.models import CashRemittance
-            from apps.billing.services_cash import dispatch_cash_remittance
-            rem = get_object_or_404(CashRemittance.objects.filter(organization=org), pk=rem_id)
+            from apps.billing.models import CashBankDeposit
+            from apps.billing.services_cash import dispatch_cash_for_deposit
+            dep = get_object_or_404(CashBankDeposit.objects.filter(organization=org), pk=dep_id)
             try:
-                dispatched_rem = dispatch_cash_remittance(
-                    remittance=rem,
+                dispatched_dep = dispatch_cash_for_deposit(
+                    deposit=dep,
                     user=request.user,
                     carrier_name=carrier_name,
                     carrier_id=carrier_id,
                 )
                 messages.success(
                     request,
-                    f"Remesa {dispatched_rem.remittance_number} entregada a {dispatched_rem.carrier_name or 'custodio'}. Efectivo descontado de gaveta y reconocido en tránsito."
+                    f"Efectivo para depósito {dispatched_dep.deposit_number} entregado a {dispatched_dep.carrier_name or 'custodio'}. Efectivo descontado de gaveta y reconocido en tránsito."
                 )
             except ValidationError as e:
                 messages.error(request, e.message if hasattr(e, 'message') else str(e))
             except Exception as e:
-                messages.error(request, f"Error al despachar remesa: {str(e)}")
+                messages.error(request, f"Error al despachar efectivo para depósito: {str(e)}")
 
             return redirect('billing:pos_shifts')
 
-        elif action == 'deposit_remittance':
-            rem_id = request.POST.get('remittance_id')
+        elif action in ['record_deposit_slip', 'record_bank_deposit_slip', 'deposit_remittance']:
+            dep_id = request.POST.get('deposit_id') or request.POST.get('remittance_id')
             deposit_slip = request.POST.get('deposit_slip_number', '')
             deposit_date = request.POST.get('deposit_date')
 
-            from apps.billing.models import CashRemittance
-            from apps.billing.services_cash import record_remittance_bank_deposit
-            rem = get_object_or_404(CashRemittance.objects.filter(organization=org), pk=rem_id)
+            from apps.billing.models import CashBankDeposit
+            from apps.billing.services_cash import record_bank_deposit_slip
+            dep = get_object_or_404(CashBankDeposit.objects.filter(organization=org), pk=dep_id)
             try:
-                dep_rem = record_remittance_bank_deposit(
-                    remittance=rem,
+                dep_record = record_bank_deposit_slip(
+                    deposit=dep,
                     deposit_slip_number=deposit_slip,
                     deposit_date=deposit_date,
                     user=request.user,
                 )
                 messages.success(
                     request,
-                    f"Boleta de depósito {dep_rem.deposit_slip_number} registrada para la remesa {dep_rem.remittance_number}. Pendiente de acreditación bancaria."
+                    f"Boleta de depósito bancario {dep_record.deposit_slip_number} registrada para el depósito {dep_record.deposit_number}. Pendiente de confirmación de acreditación bancaria."
                 )
             except ValidationError as e:
                 messages.error(request, e.message if hasattr(e, 'message') else str(e))
             except Exception as e:
-                messages.error(request, f"Error al registrar depósito: {str(e)}")
+                messages.error(request, f"Error al registrar boleta bancaria: {str(e)}")
 
             return redirect('billing:pos_shifts')
 
-        elif action == 'confirm_remittance':
-            rem_id = request.POST.get('remittance_id')
+        elif action in ['confirm_deposit', 'confirm_bank_deposit', 'confirm_remittance']:
+            dep_id = request.POST.get('deposit_id') or request.POST.get('remittance_id')
             deposit_slip = request.POST.get('deposit_slip_number', '')
             deposit_date = request.POST.get('deposit_date')
 
-            from apps.billing.models import CashRemittance
-            from apps.billing.services_cash import confirm_remittance_deposit
-            rem = get_object_or_404(CashRemittance.objects.filter(organization=org), pk=rem_id)
+            from apps.billing.models import CashBankDeposit
+            from apps.billing.services_cash import confirm_bank_deposit
+            dep = get_object_or_404(CashBankDeposit.objects.filter(organization=org), pk=dep_id)
             try:
-                conf_rem = confirm_remittance_deposit(
-                    remittance=rem,
+                conf_dep = confirm_bank_deposit(
+                    deposit=dep,
                     user=request.user,
                     deposit_slip_number=deposit_slip,
                     deposit_date=deposit_date,
                 )
                 messages.success(
                     request,
-                    f"Remesa {conf_rem.remittance_number} confirmada y acreditada en banco exitosamente (+C$ {conf_rem.amount:,.2f}). Transacción TRX registrada para conciliación."
+                    f"Depósito bancario {conf_dep.deposit_number} confirmado y acreditado en banco exitosamente (+C$ {conf_dep.amount:,.2f}). Transacción TRX registrada para conciliación."
                 )
             except ValidationError as e:
                 messages.error(request, e.message if hasattr(e, 'message') else str(e))
             except Exception as e:
-                messages.error(request, f"Error al confirmar remesa: {str(e)}")
+                messages.error(request, f"Error al confirmar acreditación bancaria: {str(e)}")
 
             return redirect('billing:pos_shifts')
 
-        elif action == 'reject_remittance':
-            rem_id = request.POST.get('remittance_id')
+        elif action in ['reject_deposit', 'reject_bank_deposit', 'reject_remittance']:
+            dep_id = request.POST.get('deposit_id') or request.POST.get('remittance_id')
             reason = request.POST.get('rejection_reason', '')
 
-            from apps.billing.models import CashRemittance
-            from apps.billing.services_cash import reject_cash_remittance
-            rem = get_object_or_404(CashRemittance.objects.filter(organization=org), pk=rem_id)
+            from apps.billing.models import CashBankDeposit
+            from apps.billing.services_cash import reject_bank_deposit
+            dep = get_object_or_404(CashBankDeposit.objects.filter(organization=org), pk=dep_id)
             try:
-                rej_rem = reject_cash_remittance(
-                    remittance=rem,
+                rej_dep = reject_bank_deposit(
+                    deposit=dep,
                     user=request.user,
                     rejection_reason=reason,
                 )
                 messages.warning(
                     request,
-                    f"Remesa {rej_rem.remittance_number} rechazada. Póliza compensatoria aplicada y fondos reintegrados."
+                    f"Depósito bancario {rej_dep.deposit_number} rechazado. Póliza compensatoria aplicada y fondos reintegrados."
                 )
             except ValidationError as e:
                 messages.error(request, e.message if hasattr(e, 'message') else str(e))
             except Exception as e:
-                messages.error(request, f"Error al rechazar remesa: {str(e)}")
+                messages.error(request, f"Error al rechazar depósito bancario: {str(e)}")
 
             return redirect('billing:pos_shifts')
 
@@ -1021,13 +1022,14 @@ class PosShiftZReportPrintView(ModuleAccessRequiredMixin, View):
             shift.shift_invoices.all().select_related('account').prefetch_related('payments').order_by('issue_date', 'number')
         )
         movements = list(shift.cash_movements.all().select_related('performed_by').order_by('created_at'))
-        remittances = list(shift.remittances.all().select_related('destination_bank_account', 'prepared_by', 'confirmed_by').order_by('prepared_at'))
+        bank_deposits = list(shift.bank_deposits.all().select_related('destination_bank_account', 'prepared_by', 'confirmed_by').order_by('prepared_at'))
 
         return render(request, self.template_name, {
             'shift': shift,
             'invoices': invoices,
             'movements': movements,
-            'remittances': remittances,
+            'bank_deposits': bank_deposits,
+            'remittances': bank_deposits,
             'current_org': org,
             'now': timezone.now(),
         })

@@ -5,7 +5,14 @@ from django.core.exceptions import ValidationError
 from django.db import transaction, models
 from django.utils import timezone
 
-from apps.billing.models import PosRegisterShift, CashMovement, CashRemittance, Invoice, PaymentReceipt
+from apps.billing.models import (
+    PosRegisterShift,
+    CashMovement,
+    CashBankDeposit,
+    CashRemittance,
+    Invoice,
+    PaymentReceipt,
+)
 from apps.finance.models import (
     AccountingAccount,
     BankAccount,
@@ -69,6 +76,7 @@ def record_cash_movement(
     invoice=None,
     payment_receipt=None,
     supplier_payment=None,
+    bank_deposit=None,
     remittance=None,
 ) -> CashMovement:
     """
@@ -99,6 +107,7 @@ def record_cash_movement(
         CashMovement.MovementType.CASH_OUT,
         CashMovement.MovementType.CUSTOMER_REFUND,
         CashMovement.MovementType.SUPPLIER_PAYMENT,
+        CashMovement.MovementType.CASH_DEPOSIT_DISPATCH,
         CashMovement.MovementType.REMITTANCE_DISPATCH,
     ]
     if movement_type in outflow_types:
@@ -108,6 +117,7 @@ def record_cash_movement(
                 f"Fondos insuficientes en gaveta: Se intentan retirar C$ {amt:,.2f} pero el saldo actual esperado es C$ {current_expected:,.2f}."
             )
 
+    deposit_rel = bank_deposit or remittance
     movement = CashMovement.objects.create(
         organization=locked_shift.organization,
         shift=locked_shift,
@@ -120,7 +130,7 @@ def record_cash_movement(
         invoice=invoice,
         payment_receipt=payment_receipt,
         supplier_payment=supplier_payment,
-        remittance=remittance,
+        bank_deposit=deposit_rel,
     )
 
     recalculate_shift_cash_metrics(locked_shift)
@@ -136,7 +146,7 @@ def recalculate_shift_cash_metrics(shift: PosRegisterShift) -> dict:
                       - Salidas Menores (CASH_OUT)
                       - Devoluciones en Efectivo (CUSTOMER_REFUND)
                       - Pagos a Proveedores en Efectivo (SUPPLIER_PAYMENT)
-                      - Remesas Despachadas para Depósito (REMITTANCE_DISPATCH)
+                      - Depósitos Bancarios Despachados (CASH_DEPOSIT_DISPATCH / REMITTANCE_DISPATCH)
     """
     invoices = list(
         shift.shift_invoices.filter(
@@ -173,7 +183,7 @@ def recalculate_shift_cash_metrics(shift: PosRegisterShift) -> dict:
     total_outflow = Decimal('0.00')
     total_refunds = Decimal('0.00')
     total_supplier_payments = Decimal('0.00')
-    total_remittances = Decimal('0.00')
+    total_bank_deposits = Decimal('0.00')
 
     for m in movements:
         if m.movement_type in [CashMovement.MovementType.CASH_IN, CashMovement.MovementType.CUSTOMER_COLLECTION]:
@@ -184,8 +194,8 @@ def recalculate_shift_cash_metrics(shift: PosRegisterShift) -> dict:
             total_refunds += m.amount
         elif m.movement_type == CashMovement.MovementType.SUPPLIER_PAYMENT:
             total_supplier_payments += m.amount
-        elif m.movement_type == CashMovement.MovementType.REMITTANCE_DISPATCH:
-            total_remittances += m.amount
+        elif m.movement_type in [CashMovement.MovementType.CASH_DEPOSIT_DISPATCH, CashMovement.MovementType.REMITTANCE_DISPATCH]:
+            total_bank_deposits += m.amount
 
     expected_cash = (
         shift.opening_cash_nio
@@ -194,7 +204,7 @@ def recalculate_shift_cash_metrics(shift: PosRegisterShift) -> dict:
         - total_outflow
         - total_refunds
         - total_supplier_payments
-        - total_remittances
+        - total_bank_deposits
     ).quantize(Decimal('0.01'))
 
     if shift.status == PosRegisterShift.Status.OPEN:
@@ -204,7 +214,7 @@ def recalculate_shift_cash_metrics(shift: PosRegisterShift) -> dict:
         shift.total_cash_outflow_nio = total_outflow
         shift.total_refunds_nio = total_refunds
         shift.total_supplier_payments_nio = total_supplier_payments
-        shift.total_remittances_nio = total_remittances
+        shift.total_bank_deposits_nio = total_bank_deposits
         shift.expected_cash_in_drawer_nio = expected_cash
         shift.transactions_count = transactions_count
         super(PosRegisterShift, shift).save(update_fields=[
@@ -214,7 +224,7 @@ def recalculate_shift_cash_metrics(shift: PosRegisterShift) -> dict:
             'total_cash_outflow_nio',
             'total_refunds_nio',
             'total_supplier_payments_nio',
-            'total_remittances_nio',
+            'total_bank_deposits_nio',
             'expected_cash_in_drawer_nio',
             'transactions_count',
         ])
@@ -234,98 +244,103 @@ def recalculate_shift_cash_metrics(shift: PosRegisterShift) -> dict:
         'total_outflow_nio': total_outflow,
         'total_refunds_nio': total_refunds,
         'total_supplier_payments_nio': total_supplier_payments,
-        'total_remittances_nio': total_remittances,
+        'total_bank_deposits_nio': total_bank_deposits,
+        'total_remittances_nio': total_bank_deposits,
         'expected_cash_in_drawer_nio': expected_cash,
     }
 
 
 # ==============================================================================
-# CICLO DE REMESAS DE EFECTIVO PARA DEPÓSITO BANCARIO
+# CICLO DE DEPÓSITOS BANCARIOS DE EFECTIVO
 # ==============================================================================
 
 @transaction.atomic
-def prepare_cash_remittance(
+def prepare_cash_bank_deposit(
     shift: PosRegisterShift,
     destination_bank_account: BankAccount,
     amount: Decimal,
     user,
     notes: str = '',
-) -> CashRemittance:
+) -> CashBankDeposit:
     """
-    Fase 1: Preparación de la remesa en gaveta.
+    Fase 1: Preparación del depósito bancario de efectivo en gaveta.
     El dinero sigue físicamente dentro de la gaveta de caja POS.
     No genera asiento contable ni altera el saldo bancario ni el saldo esperado aún.
     """
     locked_shift = PosRegisterShift.objects.select_for_update().get(pk=shift.pk)
 
     if locked_shift.status != PosRegisterShift.Status.OPEN:
-        raise ValidationError("Solo se pueden preparar remesas a partir de un turno de caja abierto.")
+        raise ValidationError("Solo se pueden preparar depósitos a partir de un turno de caja abierto.")
 
     if destination_bank_account.organization_id != locked_shift.organization_id:
         raise ValidationError("La cuenta bancaria destino no pertenece a la misma organización que el turno.")
 
     amt = Decimal(str(amount or '0.00')).quantize(Decimal('0.01'))
     if amt <= Decimal('0.00'):
-        raise ValidationError("El monto a remesar debe ser mayor a cero.")
+        raise ValidationError("El monto a depositar debe ser mayor a cero.")
 
     if amt > locked_shift.expected_cash_in_drawer_nio:
         raise ValidationError(
-            f"El monto a remesar (C$ {amt:,.2f}) excede el efectivo disponible en gaveta (C$ {locked_shift.expected_cash_in_drawer_nio:,.2f})."
+            f"El monto a depositar (C$ {amt:,.2f}) excede el efectivo disponible en gaveta (C$ {locked_shift.expected_cash_in_drawer_nio:,.2f})."
         )
 
-    remittance = CashRemittance.objects.create(
+    deposit = CashBankDeposit.objects.create(
         organization=locked_shift.organization,
         shift=locked_shift,
         destination_bank_account=destination_bank_account,
         amount=amt,
-        status=CashRemittance.Status.PREPARED,
+        status=CashBankDeposit.Status.PREPARED,
         prepared_by=user,
         notes=(notes or '').strip(),
     )
-    return remittance
+    return deposit
 
 
 @transaction.atomic
-def dispatch_cash_remittance(
-    remittance: CashRemittance,
-    user,
+def dispatch_cash_for_deposit(
+    deposit: CashBankDeposit = None,
+    user=None,
     carrier_name: str = '',
     carrier_id: str = '',
-) -> CashRemittance:
+    remittance: CashBankDeposit = None,
+) -> CashBankDeposit:
     """
-    Fase 2: Despacho y entrega física del efectivo al custodio/mensajero.
+    Fase 2: Despacho y entrega física del efectivo al custodio/mensajero para depósito bancario.
     El efectivo SALE de la gaveta física:
-    1. Se asienta un CashMovement(REMITTANCE_DISPATCH) en el turno reduciendo su efectivo esperado.
+    1. Se asienta un CashMovement(CASH_DEPOSIT_DISPATCH) en el turno reduciendo su efectivo esperado.
     2. Se genera póliza contable de Efectivo en Tránsito:
        DÉBITO:  1101-04 Efectivo y Remesas en Tránsito para Depósito (C$ amt)
        CRÉDITO: 1101-01 Caja General y Mostrador (C$ amt)
     3. El saldo de la cuenta bancaria NO se incrementa aún (dinero en tránsito físico).
     """
-    locked_remittance = CashRemittance.objects.select_for_update().get(pk=remittance.pk)
+    target = deposit if deposit is not None else remittance
+    if target is None:
+        raise ValidationError("Se requiere especificar el depósito bancario de efectivo a despachar.")
+    locked_deposit = CashBankDeposit.objects.select_for_update().get(pk=target.pk)
 
-    if locked_remittance.status != CashRemittance.Status.PREPARED:
-        raise ValidationError(f"Solo se pueden despachar remesas en estado PREPARED. Estado actual: {locked_remittance.status}.")
+    if locked_deposit.status != CashBankDeposit.Status.PREPARED:
+        raise ValidationError(f"Solo se pueden despachar depósitos en estado PREPARED. Estado actual: {locked_deposit.status}.")
 
-    shift = PosRegisterShift.objects.select_for_update().get(pk=locked_remittance.shift_id)
+    shift = PosRegisterShift.objects.select_for_update().get(pk=locked_deposit.shift_id)
     if shift.status != PosRegisterShift.Status.OPEN:
-        raise ValidationError("No se puede despachar una remesa si el turno de origen ya fue cerrado con Corte Z.")
+        raise ValidationError("No se puede despachar efectivo si el turno de origen ya fue cerrado con Corte Z.")
 
-    if locked_remittance.amount > shift.expected_cash_in_drawer_nio:
+    if locked_deposit.amount > shift.expected_cash_in_drawer_nio:
         raise ValidationError(
-            f"El monto a despachar (C$ {locked_remittance.amount:,.2f}) supera el efectivo en gaveta (C$ {shift.expected_cash_in_drawer_nio:,.2f})."
+            f"El monto a despachar (C$ {locked_deposit.amount:,.2f}) supera el efectivo en gaveta (C$ {shift.expected_cash_in_drawer_nio:,.2f})."
         )
 
-    org = locked_remittance.organization
+    org = locked_deposit.organization
 
     # 1. Movimiento físico de salida de gaveta
     record_cash_movement(
         shift=shift,
-        movement_type=CashMovement.MovementType.REMITTANCE_DISPATCH,
-        amount=locked_remittance.amount,
-        concept=f"Despacho de Remesa {locked_remittance.remittance_number} hacia {locked_remittance.destination_bank_account.bank_name}",
+        movement_type=CashMovement.MovementType.CASH_DEPOSIT_DISPATCH,
+        amount=locked_deposit.amount,
+        concept=f"Despacho de Efectivo para Depósito Bancario {locked_deposit.deposit_number} hacia {locked_deposit.destination_bank_account.bank_name}",
         performed_by=user,
-        reference=locked_remittance.remittance_number,
-        remittance=locked_remittance,
+        reference=locked_deposit.deposit_number,
+        bank_deposit=locked_deposit,
     )
 
     # 2. Póliza contable de Efectivo en Tránsito
@@ -337,8 +352,8 @@ def dispatch_cash_remittance(
         organization=org,
         date=timezone.now().date(),
         entry_type=JournalEntry.EntryType.ADJUSTMENT,
-        concept=f"Remesa en Tránsito {locked_remittance.remittance_number} a {locked_remittance.destination_bank_account.bank_name}",
-        reference=locked_remittance.remittance_number,
+        concept=f"Efectivo en Tránsito para Depósito {locked_deposit.deposit_number} a {locked_deposit.destination_bank_account.bank_name}",
+        reference=locked_deposit.deposit_number,
         created_by=user,
     )
 
@@ -346,8 +361,8 @@ def dispatch_cash_remittance(
         organization=org,
         entry=journal_entry,
         account=acc_transit,
-        concept=f"Efectivo en Tránsito Remesa {locked_remittance.remittance_number}",
-        debit=locked_remittance.amount,
+        concept=f"Efectivo en Tránsito Depósito Bancario {locked_deposit.deposit_number}",
+        debit=locked_deposit.amount,
         credit=Decimal('0.00'),
     )
 
@@ -355,136 +370,144 @@ def dispatch_cash_remittance(
         organization=org,
         entry=journal_entry,
         account=acc_cash,
-        concept=f"Salida de Gaveta POS {shift.register_name} Remesa {locked_remittance.remittance_number}",
+        concept=f"Salida de Gaveta POS {shift.register_name} Depósito {locked_deposit.deposit_number}",
         debit=Decimal('0.00'),
-        credit=locked_remittance.amount,
+        credit=locked_deposit.amount,
     )
 
     journal_entry.verify_and_save_balance()
 
     # 3. Transición de estado a IN_TRANSIT
-    locked_remittance.status = CashRemittance.Status.IN_TRANSIT
-    locked_remittance.dispatched_by = user
-    locked_remittance.dispatched_at = timezone.now()
-    locked_remittance.carrier_name = (carrier_name or '').strip()
-    locked_remittance.carrier_id = (carrier_id or '').strip()
-    locked_remittance.transit_journal_entry = journal_entry
-    locked_remittance.save(update_fields=[
+    locked_deposit.status = CashBankDeposit.Status.IN_TRANSIT
+    locked_deposit.dispatched_by = user
+    locked_deposit.dispatched_at = timezone.now()
+    locked_deposit.carrier_name = (carrier_name or '').strip()
+    locked_deposit.carrier_id = (carrier_id or '').strip()
+    locked_deposit.transit_journal_entry = journal_entry
+    locked_deposit.save(update_fields=[
         'status', 'dispatched_by', 'dispatched_at',
         'carrier_name', 'carrier_id', 'transit_journal_entry', 'updated_at'
     ])
 
-    return locked_remittance
+    return locked_deposit
 
 
 @transaction.atomic
-def record_remittance_bank_deposit(
-    remittance: CashRemittance,
-    deposit_slip_number: str,
-    deposit_date,
-    user,
+def record_bank_deposit_slip(
+    deposit: CashBankDeposit = None,
+    deposit_slip_number: str = '',
+    deposit_date=None,
+    user=None,
     notes: str = '',
-) -> CashRemittance:
+    remittance: CashBankDeposit = None,
+) -> CashBankDeposit:
     """
-    Fase 3: Asentamiento de la Minuta o Boleta de Depósito Bancario entregada en ventanilla.
+    Fase 3: Asentamiento de la Boleta de Depósito Bancario entregada en ventanilla.
     Verifica que la boleta no haya sido registrada previamente en la misma cuenta bancaria (prevención de doble depósito).
-    La remesa queda en estado DEPOSITED, pendiente de confirmación/acreditación final.
+    El depósito queda en estado BANK_DEPOSIT_RECORDED, pendiente de confirmación/acreditación final.
     """
-    locked_remittance = CashRemittance.objects.select_for_update().get(pk=remittance.pk)
+    target = deposit if deposit is not None else remittance
+    if target is None:
+        raise ValidationError("Se requiere especificar el depósito bancario de efectivo.")
+    locked_deposit = CashBankDeposit.objects.select_for_update().get(pk=target.pk)
 
-    if locked_remittance.status != CashRemittance.Status.IN_TRANSIT:
-        raise ValidationError(f"Solo se puede asentar el depósito de una remesa en estado IN_TRANSIT. Estado actual: {locked_remittance.status}.")
+    if locked_deposit.status != CashBankDeposit.Status.IN_TRANSIT:
+        raise ValidationError(f"Solo se puede asentar la boleta de un depósito en estado IN_TRANSIT. Estado actual: {locked_deposit.status}.")
 
     clean_slip = (deposit_slip_number or '').strip()
     if not clean_slip:
-        raise ValidationError("El número de boleta o minuta de depósito bancario es obligatorio.")
+        raise ValidationError("El número de boleta de depósito bancario es obligatorio.")
 
-    # Prevención estricta de doble depósito con la misma minuta en la cuenta bancaria
-    existing_duplicate = CashRemittance.objects.filter(
-        organization=locked_remittance.organization,
-        destination_bank_account=locked_remittance.destination_bank_account,
+    # Prevención estricta de doble depósito con la misma boleta en la cuenta bancaria
+    existing_duplicate = CashBankDeposit.objects.filter(
+        organization=locked_deposit.organization,
+        destination_bank_account=locked_deposit.destination_bank_account,
         deposit_slip_number__iexact=clean_slip,
-    ).exclude(pk=locked_remittance.pk).exists()
+    ).exclude(pk=locked_deposit.pk).exists()
 
     if existing_duplicate:
         raise ValidationError(
-            f"La boleta de depósito '{clean_slip}' ya fue registrada previamente en la cuenta {locked_remittance.destination_bank_account.bank_name}."
+            f"La boleta de depósito '{clean_slip}' ya fue registrada previamente en la cuenta {locked_deposit.destination_bank_account.bank_name}."
         )
 
     dep_date = deposit_date or timezone.now().date()
-    locked_remittance.deposit_slip_number = clean_slip
-    locked_remittance.deposit_date = dep_date
-    locked_remittance.deposited_by = user
-    locked_remittance.status = CashRemittance.Status.DEPOSITED
+    locked_deposit.deposit_slip_number = clean_slip
+    locked_deposit.deposit_date = dep_date
+    locked_deposit.deposited_by = user
+    locked_deposit.status = CashBankDeposit.Status.BANK_DEPOSIT_RECORDED
     if notes:
-        locked_remittance.notes = f"{locked_remittance.notes}\n[Depósito] {notes}".strip()
+        locked_deposit.notes = f"{locked_deposit.notes}\n[Depósito] {notes}".strip()
 
-    locked_remittance.save(update_fields=[
+    locked_deposit.save(update_fields=[
         'deposit_slip_number', 'deposit_date', 'deposited_by',
         'status', 'notes', 'updated_at'
     ])
-    return locked_remittance
+    return locked_deposit
 
 
 @transaction.atomic
-def confirm_remittance_deposit(
-    remittance: CashRemittance,
-    user,
+def confirm_bank_deposit(
+    deposit: CashBankDeposit = None,
+    user=None,
     deposit_slip_number: str = '',
     deposit_date=None,
     notes: str = '',
-) -> CashRemittance:
+    remittance: CashBankDeposit = None,
+) -> CashBankDeposit:
     """
     Fase 4: Acreditación Bancaria Confirmada (Banco y Contabilidad).
-    1. Verifica que la remesa esté en DEPOSITED o IN_TRANSIT con minuta válida.
+    1. Verifica que el depósito esté en BANK_DEPOSIT_RECORDED o IN_TRANSIT con boleta válida.
     2. Acredita de forma atómica e inmutable el saldo de la cuenta bancaria destino.
-    3. Genera el registro de FinancialTransaction(CASH_REMITTANCE_DEPOSIT).
+    3. Genera el registro de FinancialTransaction(CASH_BANK_DEPOSIT).
     4. Genera el asiento contable definitivo:
        DÉBITO:  1102-01 Bancos Institucionales (C$ amt)
        CRÉDITO: 1101-04 Efectivo y Remesas en Tránsito para Depósito (C$ amt)
     5. La FinancialTransaction queda lista para conciliación con extractos bancarios sin duplicación.
     """
-    locked_remittance = CashRemittance.objects.select_for_update().get(pk=remittance.pk)
+    target = deposit if deposit is not None else remittance
+    if target is None:
+        raise ValidationError("Se requiere especificar el depósito bancario de efectivo.")
+    locked_deposit = CashBankDeposit.objects.select_for_update().get(pk=target.pk)
 
-    if locked_remittance.status == CashRemittance.Status.CONFIRMED:
-        raise ValidationError("Esta remesa ya fue confirmada y acreditada previamente en la cuenta bancaria.")
+    if locked_deposit.status == CashBankDeposit.Status.CONFIRMED:
+        raise ValidationError("Este depósito ya fue confirmado y acreditado previamente en la cuenta bancaria.")
 
-    if locked_remittance.status not in [CashRemittance.Status.DEPOSITED, CashRemittance.Status.IN_TRANSIT]:
-        raise ValidationError(f"No se puede confirmar una remesa en estado {locked_remittance.status}.")
+    if locked_deposit.status not in [CashBankDeposit.Status.BANK_DEPOSIT_RECORDED, CashBankDeposit.Status.DEPOSITED, CashBankDeposit.Status.IN_TRANSIT]:
+        raise ValidationError(f"No se puede confirmar un depósito en estado {locked_deposit.status}.")
 
-    slip = deposit_slip_number or locked_remittance.deposit_slip_number
+    slip = deposit_slip_number or locked_deposit.deposit_slip_number
     if not (slip and slip.strip()):
-        raise ValidationError("Se requiere el número de boleta/minuta bancaria para confirmar la acreditación.")
+        raise ValidationError("Se requiere el número de boleta bancaria para confirmar la acreditación.")
     clean_slip = slip.strip()
 
     # Detección de doble depósito
-    existing_duplicate = CashRemittance.objects.filter(
-        organization=locked_remittance.organization,
-        destination_bank_account=locked_remittance.destination_bank_account,
+    existing_duplicate = CashBankDeposit.objects.filter(
+        organization=locked_deposit.organization,
+        destination_bank_account=locked_deposit.destination_bank_account,
         deposit_slip_number__iexact=clean_slip,
-        status=CashRemittance.Status.CONFIRMED,
-    ).exclude(pk=locked_remittance.pk).exists()
+        status=CashBankDeposit.Status.CONFIRMED,
+    ).exclude(pk=locked_deposit.pk).exists()
 
     if existing_duplicate:
         raise ValidationError(
-            f"Conflicto de duplicidad: La boleta bancaria '{clean_slip}' ya fue acreditada en otra remesa."
+            f"Conflicto de duplicidad: La boleta bancaria '{clean_slip}' ya fue acreditada en otro depósito."
         )
 
-    org = locked_remittance.organization
-    bank = BankAccount.objects.select_for_update().get(pk=locked_remittance.destination_bank_account_id)
+    org = locked_deposit.organization
+    bank = BankAccount.objects.select_for_update().get(pk=locked_deposit.destination_bank_account_id)
 
     # 1. Incrementar saldo bancario
-    bank.current_balance += locked_remittance.amount
+    bank.current_balance += locked_deposit.amount
     bank.save(update_fields=['current_balance', 'updated_at'])
 
     # 2. Generar FinancialTransaction inmutable en Libro Mayor de Bancos
     trx = FinancialTransaction.objects.create(
         organization=org,
-        transaction_type=FinancialTransaction.TransactionType.CASH_REMITTANCE_DEPOSIT,
+        transaction_type=FinancialTransaction.TransactionType.CASH_BANK_DEPOSIT,
         bank_account=bank,
-        amount=locked_remittance.amount,
+        amount=locked_deposit.amount,
         balance_after=bank.current_balance,
-        concept=f"Depósito de Remesa de Efectivo {locked_remittance.remittance_number} - Minuta {clean_slip}",
+        concept=f"Depósito Bancario de Efectivo {locked_deposit.deposit_number} - Boleta {clean_slip}",
         reference_code=clean_slip,
         performed_by=user,
     )
@@ -496,9 +519,9 @@ def confirm_remittance_deposit(
 
     confirmation_entry = JournalEntry.objects.create(
         organization=org,
-        date=deposit_date or locked_remittance.deposit_date or timezone.now().date(),
+        date=deposit_date or locked_deposit.deposit_date or timezone.now().date(),
         entry_type=JournalEntry.EntryType.COLLECTIONS,
-        concept=f"Acreditación Bancaria Remesa {locked_remittance.remittance_number} en {bank.bank_name}",
+        concept=f"Acreditación Bancaria Depósito {locked_deposit.deposit_number} en {bank.bank_name}",
         reference=clean_slip,
         created_by=user,
     )
@@ -507,8 +530,8 @@ def confirm_remittance_deposit(
         organization=org,
         entry=confirmation_entry,
         account=acc_bank,
-        concept=f"Depósito Bancario Remesa {locked_remittance.remittance_number} Minuta {clean_slip}",
-        debit=locked_remittance.amount,
+        concept=f"Depósito Bancario {locked_deposit.deposit_number} Boleta {clean_slip}",
+        debit=locked_deposit.amount,
         credit=Decimal('0.00'),
     )
 
@@ -516,65 +539,69 @@ def confirm_remittance_deposit(
         organization=org,
         entry=confirmation_entry,
         account=acc_transit,
-        concept=f"Cancelación Efectivo en Tránsito Remesa {locked_remittance.remittance_number}",
+        concept=f"Cancelación Efectivo en Tránsito Depósito {locked_deposit.deposit_number}",
         debit=Decimal('0.00'),
-        credit=locked_remittance.amount,
+        credit=locked_deposit.amount,
     )
 
     confirmation_entry.verify_and_save_balance()
 
-    # 4. Actualizar remesa
+    # 4. Actualizar depósito
     now = timezone.now()
-    locked_remittance.status = CashRemittance.Status.CONFIRMED
-    locked_remittance.deposit_slip_number = clean_slip
+    locked_deposit.status = CashBankDeposit.Status.CONFIRMED
+    locked_deposit.deposit_slip_number = clean_slip
     if deposit_date:
-        locked_remittance.deposit_date = deposit_date
-    locked_remittance.confirmed_by = user
-    locked_remittance.confirmed_at = now
-    locked_remittance.financial_transaction = trx
-    locked_remittance.confirmation_journal_entry = confirmation_entry
+        locked_deposit.deposit_date = deposit_date
+    locked_deposit.confirmed_by = user
+    locked_deposit.confirmed_at = now
+    locked_deposit.financial_transaction = trx
+    locked_deposit.confirmation_journal_entry = confirmation_entry
     if notes:
-        locked_remittance.notes = f"{locked_remittance.notes}\n[Confirmación] {notes}".strip()
+        locked_deposit.notes = f"{locked_deposit.notes}\n[Confirmación] {notes}".strip()
 
-    locked_remittance.save(update_fields=[
+    locked_deposit.save(update_fields=[
         'status', 'deposit_slip_number', 'deposit_date', 'confirmed_by',
         'confirmed_at', 'financial_transaction', 'confirmation_journal_entry',
         'notes', 'updated_at'
     ])
 
-    return locked_remittance
+    return locked_deposit
 
 
 @transaction.atomic
-def reject_cash_remittance(
-    remittance: CashRemittance,
-    user,
+def reject_bank_deposit(
+    deposit: CashBankDeposit = None,
+    user=None,
     rejection_reason: str = '',
-) -> CashRemittance:
+    remittance: CashBankDeposit = None,
+) -> CashBankDeposit:
     """
-    Rechaza o anula una remesa que no pudo ser acreditada por el banco.
-    Si la remesa ya había salido de caja (IN_TRANSIT / DEPOSITED):
+    Rechaza o anula un depósito bancario que no pudo ser acreditado por el banco.
+    Si el efectivo ya había salido de caja (IN_TRANSIT / BANK_DEPOSIT_RECORDED):
     1. Revierte la póliza contable de Efectivo en Tránsito:
        DÉBITO:  1101-01 Caja General
        CRÉDITO: 1101-04 Efectivo en Tránsito
     2. Si el turno sigue abierto, reingresa el efectivo físicamente como CASH_IN.
     """
-    locked_remittance = CashRemittance.objects.select_for_update().get(pk=remittance.pk)
+    target = deposit if deposit is not None else remittance
+    if target is None:
+        raise ValidationError("Se requiere especificar el depósito bancario de efectivo.")
+    locked_deposit = CashBankDeposit.objects.select_for_update().get(pk=target.pk)
 
-    if locked_remittance.status == CashRemittance.Status.CONFIRMED:
-        raise ValidationError("No se puede rechazar una remesa cuyo depósito ya fue acreditado en banco.")
+    if locked_deposit.status == CashBankDeposit.Status.CONFIRMED:
+        raise ValidationError("No se puede rechazar un depósito bancario cuyo abono ya fue acreditado en banco.")
 
-    if locked_remittance.status == CashRemittance.Status.REJECTED:
-        raise ValidationError("Esta remesa ya se encuentra rechazada.")
+    if locked_deposit.status == CashBankDeposit.Status.REJECTED:
+        raise ValidationError("Este depósito bancario ya se encuentra rechazado.")
 
     reason = (rejection_reason or '').strip()
     if not reason:
-        raise ValidationError("Debe especificar un motivo formal para el rechazo de la remesa.")
+        raise ValidationError("Debe especificar un motivo formal para el rechazo del depósito bancario.")
 
-    org = locked_remittance.organization
+    org = locked_deposit.organization
 
     # Si había póliza de tránsito, generar reversión contable
-    if locked_remittance.transit_journal_entry:
+    if locked_deposit.transit_journal_entry:
         accounts = ensure_default_chart_of_accounts(org)
         acc_cash = get_required_accounting_account(accounts, '1101-01', org)
         acc_transit = get_required_accounting_account(accounts, '1101-04', org)
@@ -583,8 +610,8 @@ def reject_cash_remittance(
             organization=org,
             date=timezone.now().date(),
             entry_type=JournalEntry.EntryType.ADJUSTMENT,
-            concept=f"Reversión de Tránsito por Rechazo de Remesa {locked_remittance.remittance_number}: {reason}",
-            reference=locked_remittance.remittance_number,
+            concept=f"Reversión de Tránsito por Rechazo de Depósito {locked_deposit.deposit_number}: {reason}",
+            reference=locked_deposit.deposit_number,
             created_by=user,
         )
 
@@ -592,8 +619,8 @@ def reject_cash_remittance(
             organization=org,
             entry=reversal_entry,
             account=acc_cash,
-            concept=f"Reintegro a Caja por Rechazo Remesa {locked_remittance.remittance_number}",
-            debit=locked_remittance.amount,
+            concept=f"Reintegro a Caja por Rechazo Depósito {locked_deposit.deposit_number}",
+            debit=locked_deposit.amount,
             credit=Decimal('0.00'),
         )
 
@@ -601,29 +628,41 @@ def reject_cash_remittance(
             organization=org,
             entry=reversal_entry,
             account=acc_transit,
-            concept=f"Baja de Efectivo en Tránsito Rechazado Remesa {locked_remittance.remittance_number}",
+            concept=f"Baja de Efectivo en Tránsito Rechazado Depósito {locked_deposit.deposit_number}",
             debit=Decimal('0.00'),
-            credit=locked_remittance.amount,
+            credit=locked_deposit.amount,
         )
 
         reversal_entry.verify_and_save_balance()
 
         # Reingresar efectivo si el turno sigue abierto
-        shift = locked_remittance.shift
+        shift = locked_deposit.shift
         if shift.status == PosRegisterShift.Status.OPEN:
             record_cash_movement(
                 shift=shift,
                 movement_type=CashMovement.MovementType.CASH_IN,
-                amount=locked_remittance.amount,
-                concept=f"Reintegro físico de efectivo por remesa rechazada {locked_remittance.remittance_number}",
+                amount=locked_deposit.amount,
+                concept=f"Reintegro físico de efectivo por depósito bancario rechazado {locked_deposit.deposit_number}",
                 performed_by=user,
-                reference=locked_remittance.remittance_number,
+                reference=locked_deposit.deposit_number,
             )
 
-    locked_remittance.status = CashRemittance.Status.REJECTED
-    locked_remittance.rejection_reason = reason
-    locked_remittance.save(update_fields=['status', 'rejection_reason', 'updated_at'])
-    return locked_remittance
+    locked_deposit.status = CashBankDeposit.Status.REJECTED
+    locked_deposit.rejection_reason = reason
+    locked_deposit.save(update_fields=['status', 'rejection_reason', 'updated_at'])
+    return locked_deposit
+
+
+# ==============================================================================
+# ALIASES DE RETROCOMPATIBILIDAD CON LA NOMENCLATURA ANTERIOR DE REMESAS
+# (Permiten migración gradual sin romper consumidores existentes)
+# ==============================================================================
+
+prepare_cash_remittance = prepare_cash_bank_deposit
+dispatch_cash_remittance = dispatch_cash_for_deposit
+record_remittance_bank_deposit = record_bank_deposit_slip
+confirm_remittance_deposit = confirm_bank_deposit
+reject_cash_remittance = reject_bank_deposit
 
 
 # ==============================================================================
@@ -696,7 +735,7 @@ def close_pos_shift_z_cut(
         f"{shift.organization_id}|{shift.shift_number}|{shift.opened_at.isoformat()}|"
         f"{now.isoformat()}|{shift.opening_cash_nio}|{shift.system_cash_sales_nio}|"
         f"{shift.system_card_transfer_sales_nio}|{shift.total_cash_inflow_nio}|"
-        f"{shift.total_cash_outflow_nio}|{shift.total_remittances_nio}|"
+        f"{shift.total_cash_outflow_nio}|{shift.total_bank_deposits_nio}|"
         f"{shift.total_refunds_nio}|{shift.total_supplier_payments_nio}|"
         f"{expected}|{declared}|{diff}|{user.id}|{supervisor.id if supervisor else ''}"
     )

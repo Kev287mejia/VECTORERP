@@ -72,8 +72,8 @@
                     <span class="font-mono font-semibold text-rose-700 tabular-nums">C$ {{ shift.total_cash_outflow_nio|floatformat:2 }}</span>
                 </div>
                 <div class="flex justify-between py-1 border-b border-zinc-100">
-                    <span class="text-zinc-600 font-mono">(-) Remesas Despachadas para Depósito:</span>
-                    <span class="font-mono font-semibold text-rose-700 tabular-nums">C$ {{ shift.total_remittances_nio|floatformat:2 }}</span>
+                    <span class="text-zinc-600 font-mono">(-) Depósitos Bancarios Despachados:</span>
+                    <span class="font-mono font-semibold text-rose-700 tabular-nums">C$ {{ shift.total_bank_deposits_nio|default:shift.total_remittances_nio|floatformat:2 }}</span>
                 </div>
                 <div class="flex justify-between py-1 border-b border-zinc-100">
                     <span class="text-zinc-600 font-mono">(-) Devoluciones en Efectivo:</span>
@@ -141,26 +141,27 @@
         </div>
     </div>
 
-    <!-- Tira de Remesas del Turno -->
-    {% if remittances %}
+    <!-- Tira de Depósitos Bancarios del Turno -->
+    {% with deposits=bank_deposits|default:remittances %}
+    {% if deposits %}
     <div class="border border-zinc-200 rounded-[4px] overflow-hidden">
         <div class="bg-zinc-100 px-3.5 py-2 border-b border-zinc-200 flex justify-between items-center">
-            <h3 class="text-xs font-bold uppercase tracking-wider text-zinc-800">Remesas de Efectivo para Depósito Bancario ({{ remittances|length }})</h3>
+            <h3 class="text-xs font-bold uppercase tracking-wider text-zinc-800">Depósitos Bancarios de Efectivo ({{ deposits|length }})</h3>
         </div>
         <table class="w-full text-left text-xs font-mono">
             <thead class="bg-zinc-50 border-b border-zinc-200 text-[11px] text-zinc-600">
                 <tr>
-                    <th class="py-1.5 px-3">Folio Remesa</th>
+                    <th class="py-1.5 px-3">Folio Depósito</th>
                     <th class="py-1.5 px-3">Banco Destino</th>
-                    <th class="py-1.5 px-3">Boleta Minuta</th>
+                    <th class="py-1.5 px-3">Boleta Bancaria</th>
                     <th class="py-1.5 px-3">Estado</th>
                     <th class="py-1.5 px-3 text-right">Monto C$</th>
                 </tr>
             </thead>
             <tbody class="divide-y divide-zinc-100 text-[11px]">
-                {% for r in remittances %}
+                {% for r in deposits %}
                 <tr>
-                    <td class="py-1.5 px-3 font-semibold text-zinc-900">{{ r.remittance_number }}</td>
+                    <td class="py-1.5 px-3 font-semibold text-zinc-900">{{ r.deposit_number|default:r.remittance_number }}</td>
                     <td class="py-1.5 px-3 text-zinc-700">{{ r.destination_bank_account.bank_name }} ({{ r.destination_bank_account.account_number }})</td>
                     <td class="py-1.5 px-3 text-zinc-600">{{ r.deposit_slip_number|default:"EN TRÁNSITO" }}</td>
                     <td class="py-1.5 px-3 font-semibold">{{ r.get_status_display }}</td>
@@ -171,6 +172,7 @@
         </table>
     </div>
     {% endif %}
+    {% endwith %}
 
     <!-- Tira de Movimientos de Efectivo -->
     {% if movements %}

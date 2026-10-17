@@ -632,7 +632,7 @@ class CashClosingAndRemittanceTestCase(TestCase):
         # Se generó la FinancialTransaction inmutable para el extracto
         self.assertIsNotNone(confirmed_rem.financial_transaction)
         trx = confirmed_rem.financial_transaction
-        self.assertEqual(trx.transaction_type, FinancialTransaction.TransactionType.CASH_REMITTANCE_DEPOSIT)
+        self.assertEqual(trx.transaction_type, FinancialTransaction.TransactionType.CASH_BANK_DEPOSIT)
         self.assertEqual(trx.amount, Decimal('3000.00'))
         self.assertEqual(trx.reference_code, "MINUTA-BAC-2026-999")
 

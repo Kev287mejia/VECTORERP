@@ -416,6 +416,7 @@ class FinancialTransaction(TenantScopedModel):
         CARD_SETTLEMENT = 'CARD_SETTLEMENT', 'Liquidación de Lote de Tarjetas'
         CHECK_CLEARING = 'CHECK_CLEARING', 'Compensación y Acreditación de Cheque'
         CHECK_REJECTION = 'CHECK_REJECTION', 'Rechazo de Cheque'
+        CASH_REMITTANCE_DEPOSIT = 'CASH_REMITTANCE_DEPOSIT', 'Depósito de Remesa de Efectivo'
 
     number = models.CharField(
         max_length=25,

@@ -169,6 +169,7 @@ def record_supplier_disbursement(
     exchange_rate_applied: Decimal = None,
     notes: str = '',
     idempotency_key: str = None,
+    pos_shift=None,
 ) -> tuple:
     """
     Servicio centralizado y seguro de liquidación y desembolso a proveedores.
@@ -390,7 +391,7 @@ def record_supplier_disbursement(
             )
         raise
 
-    # 8. Actualización de Tesorería (BankAccount y FinancialTransaction)
+    # 8. Actualización de Tesorería (BankAccount y FinancialTransaction o CashMovement)
     trx = None
     if locked_bank:
         locked_bank.current_balance -= amt
@@ -406,6 +407,29 @@ def record_supplier_disbursement(
             reference_code=clean_ref or egr.number,
             performed_by=user,
         )
+    elif payment_method == SupplierPayment.PaymentMethod.CASH:
+        active_pos_shift = pos_shift
+        if not active_pos_shift:
+            from apps.billing.models import PosRegisterShift
+            active_pos_shift = PosRegisterShift.objects.filter(
+                organization=organization,
+                status=PosRegisterShift.Status.OPEN,
+            ).filter(
+                models.Q(cashier=user) | models.Q(cashier__isnull=False)
+            ).order_by('-opened_at').first()
+
+        if active_pos_shift:
+            from apps.billing.services_cash import record_cash_movement
+            from apps.billing.models import CashMovement
+            record_cash_movement(
+                shift=active_pos_shift,
+                movement_type=CashMovement.MovementType.SUPPLIER_PAYMENT,
+                amount=amt,
+                concept=f"Pago a Proveedor {locked_po.supplier.commercial_name} - Egreso {egr.number}",
+                performed_by=user,
+                reference=egr.number,
+                supplier_payment=egr,
+            )
 
     # 9. Asiento Contable Cuadrado en Libro Diario (PAYMENTS)
     journal_entry = record_supplier_payment_journal_entry(

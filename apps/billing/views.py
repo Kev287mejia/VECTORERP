@@ -699,11 +699,13 @@ class CashSessionPrintView(ModuleAccessRequiredMixin, View):
 
 class PosShiftConsoleView(ModuleAccessRequiredMixin, View):
     """
-    Consola de Control de Turnos de Caja POS:
+    Consola Integral de Control de Turnos de Caja POS, Movimientos y Remesas:
     - Apertura de Gaveta con Fondo Inicial.
-    - Monitor en vivo de Corte X Parcial (recaudación en efectivo, tarjetas y total esperado).
-    - Arqueo Ciego y Cierre de Corte Z Definitivo con Sello SHA-256.
-    - Historial auditable de turnos cerrados con semáforo de cuadre.
+    - Monitor en vivo de Corte X Parcial (recaudación en efectivo, tarjetas, entradas, salidas y remesas).
+    - Registro de entradas y salidas de efectivo (gastos menores, aportes de sencillo).
+    - Preparación, despacho, entrega y depósito bancario de remesas de efectivo.
+    - Arqueo ciego por desglose de denominación y justificación obligatoria de discrepancias.
+    - Sellado de Corte Z Operativo definitivo con Hash SHA-256 inmutable.
     """
     required_module = 'billing'
     min_role_level = RoleLevel.TECHNICIAN
@@ -719,17 +721,27 @@ class PosShiftConsoleView(ModuleAccessRequiredMixin, View):
         ).order_by('-opened_at').first()
 
         x_metrics = None
+        active_movements = []
+        active_remittances = []
         if active_shift:
             x_metrics = compute_shift_x_cut_metrics(active_shift)
+            active_movements = list(active_shift.cash_movements.all().select_related('performed_by').order_by('-created_at')[:25])
+            active_remittances = list(active_shift.remittances.all().select_related('destination_bank_account', 'prepared_by', 'confirmed_by').order_by('-prepared_at'))
+
+        from apps.finance.models import BankAccount
+        bank_accounts = list(BankAccount.objects.filter(organization=org, is_active=True).order_by('bank_name'))
 
         closed_shifts = PosRegisterShift.objects.filter(
             organization=org,
             status=PosRegisterShift.Status.CLOSED_Z,
-        ).select_related('cashier').order_by('-closed_at')[:40]
+        ).select_related('cashier', 'supervisor').order_by('-closed_at')[:40]
 
         return render(request, self.template_name, {
             'active_shift': active_shift,
             'x_metrics': x_metrics,
+            'active_movements': active_movements,
+            'active_remittances': active_remittances,
+            'bank_accounts': bank_accounts,
             'closed_shifts': closed_shifts,
             'now': timezone.now(),
         })
@@ -759,36 +771,216 @@ class PosShiftConsoleView(ModuleAccessRequiredMixin, View):
 
             return redirect('billing:pos_shifts')
 
-        elif action == 'close_z':
-            shift_id = request.POST.get('shift_id')
-            declared_cash = request.POST.get('declared_cash_nio', '0.00')
+        # Buscar turno activo para acciones operativas
+        shift_id = request.POST.get('shift_id')
+        active_shift = None
+        if shift_id:
+            active_shift = PosRegisterShift.objects.filter(organization=org, pk=shift_id).first()
+        if not active_shift:
+            active_shift = PosRegisterShift.objects.filter(
+                organization=org,
+                status=PosRegisterShift.Status.OPEN,
+            ).filter(
+                models.Q(cashier=request.user) | models.Q(cashier__isnull=False)
+            ).order_by('-opened_at').first()
+
+        if action in ['cash_in', 'cash_out']:
+            if not active_shift:
+                messages.error(request, "No hay ningún turno abierto para registrar movimientos de efectivo.")
+                return redirect('billing:pos_shifts')
+
+            amount = request.POST.get('amount', '0.00')
+            concept = request.POST.get('concept', '')
+            reference = request.POST.get('reference', '')
+            from apps.billing.services_cash import record_cash_movement
+            from apps.billing.models import CashMovement
+
+            m_type = CashMovement.MovementType.CASH_IN if action == 'cash_in' else CashMovement.MovementType.CASH_OUT
+            try:
+                mov = record_cash_movement(
+                    shift=active_shift,
+                    movement_type=m_type,
+                    amount=Decimal(str(amount)),
+                    concept=concept,
+                    reference=reference,
+                    performed_by=request.user,
+                )
+                messages.success(
+                    request,
+                    f"{mov.get_movement_type_display()} por C$ {mov.amount:,.2f} registrado exitosamente."
+                )
+            except ValidationError as e:
+                messages.error(request, e.message if hasattr(e, 'message') else str(e))
+            except Exception as e:
+                messages.error(request, f"Error al registrar movimiento: {str(e)}")
+
+            return redirect('billing:pos_shifts')
+
+        elif action == 'prepare_remittance':
+            if not active_shift:
+                messages.error(request, "No hay ningún turno abierto para preparar remesas.")
+                return redirect('billing:pos_shifts')
+
+            bank_id = request.POST.get('bank_account_id')
+            amount = request.POST.get('amount', '0.00')
             notes = request.POST.get('notes', '')
 
-            active_shift = None
-            if shift_id:
-                active_shift = PosRegisterShift.objects.filter(organization=org, pk=shift_id).first()
-            if not active_shift:
-                active_shift = PosRegisterShift.objects.filter(
-                    organization=org,
-                    status=PosRegisterShift.Status.OPEN,
-                ).filter(
-                    models.Q(cashier=request.user) | models.Q(cashier__isnull=False)
-                ).first()
+            from apps.finance.models import BankAccount
+            bank = get_object_or_404(BankAccount.objects.filter(organization=org), pk=bank_id)
+            from apps.billing.services_cash import prepare_cash_remittance
+            try:
+                rem = prepare_cash_remittance(
+                    shift=active_shift,
+                    destination_bank_account=bank,
+                    amount=Decimal(str(amount)),
+                    user=request.user,
+                    notes=notes,
+                )
+                messages.success(
+                    request,
+                    f"Remesa {rem.remittance_number} por C$ {rem.amount:,.2f} preparada hacia {bank.bank_name}. Dinero aún en gaveta."
+                )
+            except ValidationError as e:
+                messages.error(request, e.message if hasattr(e, 'message') else str(e))
+            except Exception as e:
+                messages.error(request, f"Error al preparar remesa: {str(e)}")
 
+            return redirect('billing:pos_shifts')
+
+        elif action == 'dispatch_remittance':
+            rem_id = request.POST.get('remittance_id')
+            carrier_name = request.POST.get('carrier_name', '')
+            carrier_id = request.POST.get('carrier_id', '')
+
+            from apps.billing.models import CashRemittance
+            from apps.billing.services_cash import dispatch_cash_remittance
+            rem = get_object_or_404(CashRemittance.objects.filter(organization=org), pk=rem_id)
+            try:
+                dispatched_rem = dispatch_cash_remittance(
+                    remittance=rem,
+                    user=request.user,
+                    carrier_name=carrier_name,
+                    carrier_id=carrier_id,
+                )
+                messages.success(
+                    request,
+                    f"Remesa {dispatched_rem.remittance_number} entregada a {dispatched_rem.carrier_name or 'custodio'}. Efectivo descontado de gaveta y reconocido en tránsito."
+                )
+            except ValidationError as e:
+                messages.error(request, e.message if hasattr(e, 'message') else str(e))
+            except Exception as e:
+                messages.error(request, f"Error al despachar remesa: {str(e)}")
+
+            return redirect('billing:pos_shifts')
+
+        elif action == 'deposit_remittance':
+            rem_id = request.POST.get('remittance_id')
+            deposit_slip = request.POST.get('deposit_slip_number', '')
+            deposit_date = request.POST.get('deposit_date')
+
+            from apps.billing.models import CashRemittance
+            from apps.billing.services_cash import record_remittance_bank_deposit
+            rem = get_object_or_404(CashRemittance.objects.filter(organization=org), pk=rem_id)
+            try:
+                dep_rem = record_remittance_bank_deposit(
+                    remittance=rem,
+                    deposit_slip_number=deposit_slip,
+                    deposit_date=deposit_date,
+                    user=request.user,
+                )
+                messages.success(
+                    request,
+                    f"Boleta de depósito {dep_rem.deposit_slip_number} registrada para la remesa {dep_rem.remittance_number}. Pendiente de acreditación bancaria."
+                )
+            except ValidationError as e:
+                messages.error(request, e.message if hasattr(e, 'message') else str(e))
+            except Exception as e:
+                messages.error(request, f"Error al registrar depósito: {str(e)}")
+
+            return redirect('billing:pos_shifts')
+
+        elif action == 'confirm_remittance':
+            rem_id = request.POST.get('remittance_id')
+            deposit_slip = request.POST.get('deposit_slip_number', '')
+            deposit_date = request.POST.get('deposit_date')
+
+            from apps.billing.models import CashRemittance
+            from apps.billing.services_cash import confirm_remittance_deposit
+            rem = get_object_or_404(CashRemittance.objects.filter(organization=org), pk=rem_id)
+            try:
+                conf_rem = confirm_remittance_deposit(
+                    remittance=rem,
+                    user=request.user,
+                    deposit_slip_number=deposit_slip,
+                    deposit_date=deposit_date,
+                )
+                messages.success(
+                    request,
+                    f"Remesa {conf_rem.remittance_number} confirmada y acreditada en banco exitosamente (+C$ {conf_rem.amount:,.2f}). Transacción TRX registrada para conciliación."
+                )
+            except ValidationError as e:
+                messages.error(request, e.message if hasattr(e, 'message') else str(e))
+            except Exception as e:
+                messages.error(request, f"Error al confirmar remesa: {str(e)}")
+
+            return redirect('billing:pos_shifts')
+
+        elif action == 'reject_remittance':
+            rem_id = request.POST.get('remittance_id')
+            reason = request.POST.get('rejection_reason', '')
+
+            from apps.billing.models import CashRemittance
+            from apps.billing.services_cash import reject_cash_remittance
+            rem = get_object_or_404(CashRemittance.objects.filter(organization=org), pk=rem_id)
+            try:
+                rej_rem = reject_cash_remittance(
+                    remittance=rem,
+                    user=request.user,
+                    rejection_reason=reason,
+                )
+                messages.warning(
+                    request,
+                    f"Remesa {rej_rem.remittance_number} rechazada. Póliza compensatoria aplicada y fondos reintegrados."
+                )
+            except ValidationError as e:
+                messages.error(request, e.message if hasattr(e, 'message') else str(e))
+            except Exception as e:
+                messages.error(request, f"Error al rechazar remesa: {str(e)}")
+
+            return redirect('billing:pos_shifts')
+
+        elif action == 'close_z':
             if not active_shift:
                 messages.error(request, "No se encontró ningún turno activo para cerrar.")
                 return redirect('billing:pos_shifts')
 
+            declared_cash = request.POST.get('declared_cash_nio')
+            notes = request.POST.get('notes', '')
+            difference_justification = request.POST.get('difference_justification', '')
+
+            # Parsear posible desglose por denominación
+            denomination_breakdown = {}
+            denoms = ['1000', '500', '200', '100', '50', '20', '10', '5', '1', '0.50', '0.25', '0.10']
+            has_breakdown = False
+            for d in denoms:
+                val = request.POST.get(f'denom_{d.replace(".", "_")}')
+                if val and val.isdigit() and int(val) > 0:
+                    denomination_breakdown[d] = int(val)
+                    has_breakdown = True
+
             try:
                 closed_shift = close_pos_shift_z_cut(
                     shift=active_shift,
-                    declared_cash_nio=declared_cash,
+                    declared_cash_nio=Decimal(str(declared_cash)) if declared_cash else None,
                     user=request.user,
+                    supervisor=request.user if request.user != active_shift.cashier else None,
                     notes=notes,
+                    denomination_breakdown=denomination_breakdown if has_breakdown else None,
+                    difference_justification=difference_justification,
                 )
                 diff = closed_shift.cash_difference_nio
                 if diff == Decimal('0.00'):
-                    status_text = "CUADRADO PERFECTO (C$ 0.00)"
+                    status_text = "CUADRADO EXACTO (C$ 0.00)"
                 elif diff > Decimal('0.00'):
                     status_text = f"SOBRANTE DE C$ {diff:,.2f}"
                 else:
@@ -811,8 +1003,9 @@ class PosShiftConsoleView(ModuleAccessRequiredMixin, View):
 
 class PosShiftZReportPrintView(ModuleAccessRequiredMixin, View):
     """
-    Vista oficial de impresión de Acta de Arqueo y Corte Z de Caja POS.
-    Diseño All-Light Swiss Grid de alta densidad conforme a normativa fiscal DGI.
+    Vista oficial de impresión de Acta de Arqueo y Resumen Z Operativo de Caja POS.
+    Diseño All-Light Swiss Grid de alta densidad.
+    IMPORTANTE: Documento de control operativo interno (no certificación tributaria oficial).
     """
     required_module = 'billing'
     min_role_level = RoleLevel.TECHNICIAN
@@ -827,10 +1020,14 @@ class PosShiftZReportPrintView(ModuleAccessRequiredMixin, View):
         invoices = list(
             shift.shift_invoices.all().select_related('account').prefetch_related('payments').order_by('issue_date', 'number')
         )
+        movements = list(shift.cash_movements.all().select_related('performed_by').order_by('created_at'))
+        remittances = list(shift.remittances.all().select_related('destination_bank_account', 'prepared_by', 'confirmed_by').order_by('prepared_at'))
 
         return render(request, self.template_name, {
             'shift': shift,
             'invoices': invoices,
+            'movements': movements,
+            'remittances': remittances,
             'current_org': org,
             'now': timezone.now(),
         })

@@ -255,6 +255,7 @@ def ensure_default_chart_of_accounts(organization):
         ('1101-01', 'Caja General y Mostrador', AccountingAccount.AccountType.ASSET),
         ('1101-02', 'Cheques en Cartera y Valores por Depositar', AccountingAccount.AccountType.ASSET),
         ('1101-03', 'Tarjetas y Vouchers por Liquidar / Adquirentes', AccountingAccount.AccountType.ASSET),
+        ('1101-04', 'Efectivo y Remesas en Tránsito para Depósito', AccountingAccount.AccountType.ASSET),
         ('1102-01', 'Bancos Institucionales', AccountingAccount.AccountType.ASSET),
         ('1103-01', 'Clientes por Cobrar (CxC)', AccountingAccount.AccountType.ASSET),
         ('1104-01', 'IVA Crédito Fiscal Acreditable (15%)', AccountingAccount.AccountType.ASSET),

@@ -3,6 +3,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.core.validators import MinValueValidator
 from django.db import models
 from django.utils import timezone
 
@@ -948,6 +949,14 @@ class PosRegisterShift(TenantScopedModel):
         related_name='pos_shifts',
         verbose_name="Cajero Responsable",
     )
+    supervisor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='supervised_pos_shifts',
+        verbose_name="Supervisor que Autoriza Cierre",
+    )
     register_name = models.CharField(
         max_length=100,
         default='CAJA-PRINCIPAL-01',
@@ -989,6 +998,36 @@ class PosRegisterShift(TenantScopedModel):
         default=Decimal('0.00'),
         verbose_name="Ventas Tarjeta / Transferencia / Crédito (C$)",
     )
+    total_cash_inflow_nio = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Entradas Adicionales de Efectivo (C$)",
+    )
+    total_cash_outflow_nio = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Salidas de Efectivo / Gastos Menores (C$)",
+    )
+    total_remittances_nio = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Remesas Despachadas (C$)",
+    )
+    total_refunds_nio = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Devoluciones en Efectivo (C$)",
+    )
+    total_supplier_payments_nio = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Pagos a Proveedores en Efectivo (C$)",
+    )
     expected_cash_in_drawer_nio = models.DecimalField(
         max_digits=14,
         decimal_places=2,
@@ -1006,6 +1045,15 @@ class PosRegisterShift(TenantScopedModel):
         decimal_places=2,
         default=Decimal('0.00'),
         verbose_name="Diferencia de Caja (C$)",
+    )
+    denomination_breakdown = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="Desglose de Efectivo por Denominación",
+    )
+    difference_justification = models.TextField(
+        blank=True,
+        verbose_name="Justificación de Diferencia de Arqueo",
     )
     transactions_count = models.IntegerField(
         default=0,
@@ -1070,8 +1118,323 @@ class PosRegisterShift(TenantScopedModel):
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
-        if self.status == self.Status.CLOSED_Z:
+        if self.status == self.Status.CLOSED_Z or (
+            self.pk and PosRegisterShift.objects.filter(pk=self.pk, status=self.Status.CLOSED_Z).exists()
+        ):
             raise ValidationError("Un turno con Corte Z sellado es inmutable.")
+        super().delete(*args, **kwargs)
+
+
+class CashMovement(TenantScopedModel):
+    """
+    Subledger / Libro Auxiliar de Movimientos de Efectivo en Gaveta POS.
+    Registra cada entrada y salida física con trazabilidad de origen comercial y operativo.
+    """
+    class MovementType(models.TextChoices):
+        CASH_IN = 'CASH_IN', 'Entrada Adicional de Efectivo'
+        CASH_OUT = 'CASH_OUT', 'Salida de Efectivo / Gasto Menor'
+        POS_SALE = 'POS_SALE', 'Venta POS en Efectivo'
+        CUSTOMER_COLLECTION = 'CUSTOMER_COLLECTION', 'Cobro de Factura en Efectivo'
+        CUSTOMER_REFUND = 'CUSTOMER_REFUND', 'Devolución en Efectivo a Cliente'
+        SUPPLIER_PAYMENT = 'SUPPLIER_PAYMENT', 'Pago a Proveedor en Efectivo'
+        REMITTANCE_DISPATCH = 'REMITTANCE_DISPATCH', 'Despacho de Remesa para Depósito Bancario'
+        ADJUSTMENT = 'ADJUSTMENT', 'Ajuste Autorizado de Caja'
+
+    shift = models.ForeignKey(
+        PosRegisterShift,
+        on_delete=models.PROTECT,
+        related_name='cash_movements',
+        verbose_name="Turno de Caja POS",
+    )
+    movement_type = models.CharField(
+        max_length=30,
+        choices=MovementType.choices,
+        db_index=True,
+        verbose_name="Tipo de Movimiento",
+    )
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal('0.01'))],
+        verbose_name="Monto de Efectivo (C$)",
+    )
+    concept = models.CharField(
+        max_length=255,
+        verbose_name="Concepto / Detalle del Movimiento",
+    )
+    reference = models.CharField(
+        max_length=100,
+        blank=True,
+        verbose_name="Documento / Referencia Externa",
+    )
+    performed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name='performed_cash_movements',
+        verbose_name="Responsable del Movimiento",
+    )
+    authorized_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='authorized_cash_movements',
+        verbose_name="Autorizado por (Supervisor)",
+    )
+    invoice = models.ForeignKey(
+        'billing.Invoice',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='cash_movements',
+        verbose_name="Factura Relacionada",
+    )
+    payment_receipt = models.ForeignKey(
+        'billing.PaymentReceipt',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='cash_movements',
+        verbose_name="Recibo de Caja Relacionado",
+    )
+    supplier_payment = models.ForeignKey(
+        'purchasing.SupplierPayment',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='cash_movements',
+        verbose_name="Pago a Proveedor Relacionado",
+    )
+    remittance = models.ForeignKey(
+        'billing.CashRemittance',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='cash_movements',
+        verbose_name="Remesa Relacionada",
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name="Fecha y Hora de Registro",
+    )
+
+    class Meta(TenantScopedModel.Meta):
+        verbose_name = "Movimiento de Efectivo en Caja"
+        verbose_name_plural = "Movimientos de Efectivo en Caja"
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return f"{self.get_movement_type_display()} · C$ {self.amount} ({self.concept})"
+
+    def clean(self):
+        super().clean()
+        if self.shift_id:
+            if self.shift.organization_id != self.organization_id:
+                raise ValidationError("El turno de caja no pertenece a la misma organización.")
+            if self.shift.status == PosRegisterShift.Status.CLOSED_Z:
+                raise ValidationError("No se pueden registrar movimientos de efectivo en un turno cerrado con Corte Z.")
+        if self.amount is not None and self.amount <= Decimal('0.00'):
+            raise ValidationError("El monto del movimiento debe ser estrictamente positivo.")
+
+    def save(self, *args, **kwargs):
+        if self.pk and not self._state.adding:
+            raise ValidationError("Los movimientos de efectivo de caja son inmutables.")
+        self.clean()
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Los movimientos de efectivo de caja son inmutables. Prohibido eliminar movimientos históricos.")
+
+
+class CashRemittance(TenantScopedModel):
+    """
+    Ciclo de Remesas de Efectivo y Depósito Bancario:
+    PREPARED (en gaveta) -> IN_TRANSIT (en camino al banco) -> DEPOSITED (entregado en ventanilla) -> CONFIRMED (acreditado en banco) o REJECTED.
+    """
+    class Status(models.TextChoices):
+        PREPARED = 'PREPARED', 'Preparada en Gaveta'
+        IN_TRANSIT = 'IN_TRANSIT', 'Entregada a Custodio / En Tránsito'
+        DEPOSITED = 'DEPOSITED', 'Depositada en Banco (Pendiente Acreditación)'
+        CONFIRMED = 'CONFIRMED', 'Acreditada y Confirmada por Banco'
+        REJECTED = 'REJECTED', 'Rechazada / Anulada'
+
+    remittance_number = models.CharField(
+        max_length=30,
+        db_index=True,
+        verbose_name="Número de Remesa",
+        help_text="Folio secuencial ej: REM-2026-0001",
+    )
+    shift = models.ForeignKey(
+        PosRegisterShift,
+        on_delete=models.PROTECT,
+        related_name='remittances',
+        verbose_name="Turno Origen de Fondos",
+    )
+    destination_bank_account = models.ForeignKey(
+        'finance.BankAccount',
+        on_delete=models.PROTECT,
+        related_name='cash_remittances',
+        verbose_name="Cuenta Bancaria Destino",
+    )
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal('0.01'))],
+        verbose_name="Monto Remesado (C$ NIO)",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PREPARED,
+        db_index=True,
+        verbose_name="Estado de la Remesa",
+    )
+    prepared_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name='prepared_cash_remittances',
+        verbose_name="Preparado por (Cajero)",
+    )
+    prepared_at = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name="Fecha de Preparación",
+    )
+    dispatched_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='dispatched_cash_remittances',
+        verbose_name="Despachado / Entregado por",
+    )
+    dispatched_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="Fecha y Hora de Despacho",
+    )
+    carrier_name = models.CharField(
+        max_length=150,
+        blank=True,
+        verbose_name="Nombre de Custodio / Mensajero / Valija",
+    )
+    carrier_id = models.CharField(
+        max_length=50,
+        blank=True,
+        verbose_name="Identificación / Cédula del Custodio",
+    )
+    deposit_slip_number = models.CharField(
+        max_length=80,
+        blank=True,
+        db_index=True,
+        verbose_name="Número de Minuta / Boleta de Depósito Bancario",
+    )
+    deposit_date = models.DateField(
+        null=True,
+        blank=True,
+        verbose_name="Fecha del Depósito en Banco",
+    )
+    deposited_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='deposited_cash_remittances',
+        verbose_name="Registrado en Banco por",
+    )
+    confirmed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='confirmed_cash_remittances',
+        verbose_name="Confirmado / Acreditado por",
+    )
+    confirmed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="Fecha y Hora de Confirmación Bancaria",
+    )
+    rejection_reason = models.TextField(
+        blank=True,
+        verbose_name="Motivo de Rechazo o Discrepancia",
+    )
+    notes = models.TextField(
+        blank=True,
+        verbose_name="Observaciones",
+    )
+    financial_transaction = models.ForeignKey(
+        'finance.FinancialTransaction',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='cash_remittances',
+        verbose_name="Transacción Financiera Bancaria Asentada",
+    )
+    transit_journal_entry = models.ForeignKey(
+        'finance.JournalEntry',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='transit_cash_remittances',
+        verbose_name="Póliza Contable de Efectivo en Tránsito",
+    )
+    confirmation_journal_entry = models.ForeignKey(
+        'finance.JournalEntry',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='confirmation_cash_remittances',
+        verbose_name="Póliza Contable de Acreditación Bancaria",
+    )
+
+    class Meta(TenantScopedModel.Meta):
+        verbose_name = "Remesa de Efectivo a Banco"
+        verbose_name_plural = "Remesas de Efectivo a Banco"
+        ordering = ['-prepared_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'remittance_number'],
+                name='unique_pos_remittance_number_per_tenant',
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.remittance_number} · C$ {self.amount} -> {self.destination_bank_account.bank_name} [{self.get_status_display()}]"
+
+    def clean(self):
+        super().clean()
+        if self.shift_id and self.shift.organization_id != self.organization_id:
+            raise ValidationError("El turno de origen no pertenece a la misma organización.")
+        if self.destination_bank_account_id and self.destination_bank_account.organization_id != self.organization_id:
+            raise ValidationError("La cuenta bancaria destino no pertenece a la misma organización.")
+        if self.amount is not None and self.amount <= Decimal('0.00'):
+            raise ValidationError("El monto de la remesa debe ser estrictamente positivo.")
+
+    def save(self, *args, **kwargs):
+        if not self.remittance_number and self.organization_id:
+            year = timezone.now().year
+            prefix = f"REM-{year}-"
+            count = (
+                CashRemittance.objects.filter(
+                    organization_id=self.organization_id,
+                    remittance_number__startswith=prefix,
+                ).count()
+                + 1
+            )
+            candidate = f"{prefix}{count:04d}"
+            while CashRemittance.objects.filter(
+                organization_id=self.organization_id, remittance_number=candidate
+            ).exists():
+                count += 1
+                candidate = f"{prefix}{count:04d}"
+            self.remittance_number = candidate
+
+        self.clean()
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        if self.status != self.Status.PREPARED:
+            raise ValidationError("No se puede eliminar una remesa que ya fue despachada, depositada o confirmada.")
         super().delete(*args, **kwargs)
 
 

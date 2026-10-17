@@ -621,6 +621,23 @@ def _execute_pos_sale_inner(
 
     invoice.save(update_fields=['amount_paid', 'balance_due', 'status', 'pos_shift', 'updated_at'])
 
+    if active_shift:
+        if is_cash:
+            from apps.billing.models import CashMovement
+            CashMovement.objects.create(
+                organization=organization,
+                shift=active_shift,
+                movement_type=CashMovement.MovementType.POS_SALE,
+                amount=amt_nio,
+                concept=f"Venta POS Mostrador {invoice.number}",
+                reference=invoice.number,
+                performed_by=user,
+                invoice=invoice,
+                payment_receipt=receipt,
+            )
+        from apps.billing.services_pos_shift import compute_shift_x_cut_metrics
+        compute_shift_x_cut_metrics(active_shift)
+
     # 12. Asentar Registro de Idempotencia de Solicitud
     if clean_idempotency_key:
         PaymentIdempotencyRecord.objects.create(

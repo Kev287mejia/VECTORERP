@@ -1,10 +1,10 @@
 {% extends "layouts/base_erp.html" %}
 
-{% block title %}Control de Turnos de Caja POS &amp; Corte Z | {{ current_org.name }}{% endblock %}
+{% block title %}Control de Turnos de Caja POS, Arqueo &amp; Remesas | {{ current_org.name }}{% endblock %}
 
 {% block breadcrumb_section %}Facturación &amp; POS{% endblock %}
-{% block breadcrumb_page %}Turnos de Caja &amp; Corte Z{% endblock %}
-{% block page_title %}Control de Turnos de Caja POS &amp; Arqueo Corte Z{% endblock %}
+{% block breadcrumb_page %}Turnos de Caja &amp; Remesas{% endblock %}
+{% block page_title %}Control de Turnos de Caja, Arqueo Corte Z &amp; Remesas de Efectivo{% endblock %}
 
 {% block page_actions %}
 <div class="flex items-center gap-2">
@@ -22,8 +22,8 @@
 
     <!-- SECCIÓN 1: ESTADO DEL TURNO ACTUAL -->
     {% if active_shift %}
-    <!-- PANEL DE TURNO ACTIVO (CORTE X EN VIVO + FORMULARIO CORTE Z) -->
-    <div class="bg-white border border-zinc-200 rounded-[4px] p-5 space-y-5">
+    <!-- PANEL DE TURNO ACTIVO (CORTE X EN VIVO + REMESAS + FORMULARIO CORTE Z) -->
+    <div class="bg-white border border-zinc-200 rounded-[4px] p-5 space-y-6">
         <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-zinc-200 pb-4">
             <div>
                 <div class="inline-flex items-center gap-1.5 px-2 py-0.5 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-[4px] text-xs font-medium">
@@ -44,66 +44,290 @@
             </div>
         </div>
 
-        <!-- KPI Grid: Corte X en Vivo -->
-        <div class="grid grid-cols-2 md:grid-cols-6 gap-3">
-            <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-3">
-                <span class="text-xs text-zinc-500 font-medium block">Fondo inicial</span>
-                <span class="text-sm font-mono font-semibold text-zinc-900 tabular-nums mt-0.5 block">
+        <!-- KPI Grid: Corte X en Vivo y Flujo Matemático de Efectivo -->
+        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2.5">
+            <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-2.5">
+                <span class="text-[11px] text-zinc-500 font-medium block">Fondo inicial</span>
+                <span class="text-xs font-mono font-semibold text-zinc-900 tabular-nums mt-0.5 block">
                     C$ {{ active_shift.opening_cash_nio|floatformat:2 }}
                 </span>
             </div>
-            <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-3">
-                <span class="text-xs text-zinc-500 font-medium block">Ventas efectivo</span>
-                <span class="text-sm font-mono font-semibold text-emerald-700 tabular-nums mt-0.5 block">
+            <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-2.5">
+                <span class="text-[11px] text-zinc-500 font-medium block">(+) Ventas efvo.</span>
+                <span class="text-xs font-mono font-semibold text-emerald-700 tabular-nums mt-0.5 block">
                     C$ {{ x_metrics.cash_sales_nio|floatformat:2 }}
                 </span>
             </div>
-            <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-3">
-                <span class="text-xs text-zinc-500 font-medium block">Ventas tarjeta/otros</span>
-                <span class="text-sm font-mono font-semibold text-zinc-800 tabular-nums mt-0.5 block">
-                    C$ {{ x_metrics.card_transfer_sales_nio|floatformat:2 }}
+            <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-2.5">
+                <span class="text-[11px] text-zinc-500 font-medium block">(+) Entradas</span>
+                <span class="text-xs font-mono font-semibold text-emerald-700 tabular-nums mt-0.5 block">
+                    C$ {{ x_metrics.total_inflow_nio|floatformat:2 }}
                 </span>
             </div>
-            <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-3">
-                <span class="text-xs text-zinc-500 font-medium block">Ventas totales</span>
-                <span class="text-sm font-mono font-semibold text-zinc-900 tabular-nums mt-0.5 block">
-                    C$ {{ x_metrics.total_sales_nio|floatformat:2 }}
+            <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-2.5">
+                <span class="text-[11px] text-zinc-500 font-medium block">(-) Salidas/Gastos</span>
+                <span class="text-xs font-mono font-semibold text-rose-700 tabular-nums mt-0.5 block">
+                    C$ {{ x_metrics.total_outflow_nio|floatformat:2 }}
                 </span>
             </div>
-            <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-3">
-                <span class="text-xs text-zinc-500 font-medium block">Transacciones</span>
-                <span class="text-sm font-mono font-semibold text-zinc-900 tabular-nums mt-0.5 block">
-                    {{ x_metrics.transactions_count }}
+            <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-2.5">
+                <span class="text-[11px] text-zinc-500 font-medium block">(-) Remesas desp.</span>
+                <span class="text-xs font-mono font-semibold text-rose-700 tabular-nums mt-0.5 block">
+                    C$ {{ x_metrics.total_remittances_nio|floatformat:2 }}
                 </span>
             </div>
-            <div class="bg-zinc-900 text-white rounded-[4px] p-3 border border-zinc-900">
-                <span class="text-xs text-zinc-400 font-medium block">Esperado en gaveta</span>
-                <span class="text-sm font-mono font-semibold text-white tabular-nums mt-0.5 block">
+            <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-2.5">
+                <span class="text-[11px] text-zinc-500 font-medium block">(-) Devol./Pagos</span>
+                <span class="text-xs font-mono font-semibold text-rose-700 tabular-nums mt-0.5 block">
+                    C$ {{ x_metrics.total_supplier_payments_nio|add:x_metrics.total_refunds_nio|floatformat:2 }}
+                </span>
+            </div>
+            <div class="bg-zinc-900 text-white rounded-[4px] p-2.5 border border-zinc-900">
+                <span class="text-[11px] text-zinc-400 font-medium block">(=) En gaveta</span>
+                <span class="text-xs font-mono font-semibold text-white tabular-nums mt-0.5 block">
                     C$ {{ x_metrics.expected_cash_in_drawer_nio|floatformat:2 }}
+                </span>
+            </div>
+            <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-2.5">
+                <span class="text-[11px] text-zinc-500 font-medium block">Vtas. Tarjeta/Otros</span>
+                <span class="text-xs font-mono font-semibold text-zinc-800 tabular-nums mt-0.5 block">
+                    C$ {{ x_metrics.card_transfer_sales_nio|floatformat:2 }}
                 </span>
             </div>
         </div>
 
-        <!-- FORMULARIO DE ARQUEO CIEGO CORTE Z -->
-        <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-4 mt-4">
-            <div class="border-b border-zinc-200 pb-3 mb-4">
+        <!-- MÓDULO DE OPERACIONES: MOVIMIENTOS Y REMESAS -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <!-- Formulario de Movimientos de Caja (Entrada / Salida Manual) -->
+            <div class="border border-zinc-200 rounded-[4px] p-4 bg-zinc-50/50 space-y-3">
+                <div class="border-b border-zinc-200 pb-2">
+                    <h3 class="text-xs font-semibold text-zinc-800">
+                        Registrar Movimiento de Efectivo en Gaveta
+                    </h3>
+                    <p class="text-[11px] text-zinc-500">
+                        Aportes adicionales de cambio/sencillo o egresos por gastos menores de mostrador.
+                    </p>
+                </div>
+                <form method="POST" action="{% url 'billing:pos_shifts' %}" class="space-y-3">
+                    {% csrf_token %}
+                    <input type="hidden" name="shift_id" value="{{ active_shift.pk }}">
+                    <div class="grid grid-cols-2 gap-2">
+                        <div>
+                            <label class="block text-[11px] font-medium text-zinc-700 mb-1">Tipo de Operación *</label>
+                            <select name="action" class="w-full h-8 px-2 text-xs bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
+                                <option value="cash_in">(+) Entrada de Efectivo (Aporte Sencillo)</option>
+                                <option value="cash_out">(-) Salida de Efectivo (Gasto Menor)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-[11px] font-medium text-zinc-700 mb-1">Monto (C$ NIO) *</label>
+                            <input type="number" step="0.01" min="0.01" name="amount" required placeholder="0.00" class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-2">
+                        <div>
+                            <label class="block text-[11px] font-medium text-zinc-700 mb-1">Concepto / Motivo *</label>
+                            <input type="text" name="concept" required placeholder="ej: Compra insumos urgentes / Sencillo" class="w-full h-8 px-2.5 text-xs bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
+                        </div>
+                        <div>
+                            <label class="block text-[11px] font-medium text-zinc-700 mb-1">Referencia / Comprobante</label>
+                            <input type="text" name="reference" placeholder="ej: Recibo #450" class="w-full h-8 px-2.5 text-xs bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
+                        </div>
+                    </div>
+                    <div class="flex justify-end pt-1">
+                        <button type="submit" class="h-7 px-3 bg-zinc-800 hover:bg-zinc-700 text-white font-sans text-xs font-medium rounded-[4px] transition-colors">
+                            Registrar Movimiento en Gaveta
+                        </button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Formulario de Preparación de Remesas -->
+            <div class="border border-zinc-200 rounded-[4px] p-4 bg-zinc-50/50 space-y-3">
+                <div class="border-b border-zinc-200 pb-2">
+                    <h3 class="text-xs font-semibold text-zinc-800">
+                        Preparar Remesa de Efectivo para Depósito Bancario
+                    </h3>
+                    <p class="text-[11px] text-zinc-500">
+                        Traslada el efectivo recaudado hacia una cuenta bancaria institucional en custodia.
+                    </p>
+                </div>
+                <form method="POST" action="{% url 'billing:pos_shifts' %}" class="space-y-3">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="prepare_remittance">
+                    <input type="hidden" name="shift_id" value="{{ active_shift.pk }}">
+                    <div class="grid grid-cols-2 gap-2">
+                        <div>
+                            <label class="block text-[11px] font-medium text-zinc-700 mb-1">Cuenta Bancaria Destino *</label>
+                            <select name="bank_account_id" required class="w-full h-8 px-2 text-xs bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
+                                {% for b in bank_accounts %}
+                                <option value="{{ b.pk }}">{{ b.bank_name }} - {{ b.account_number }} ({{ b.currency }})</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-[11px] font-medium text-zinc-700 mb-1">Monto a Remesar (C$ NIO) *</label>
+                            <input type="number" step="0.01" min="0.01" name="amount" required placeholder="0.00" class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block text-[11px] font-medium text-zinc-700 mb-1">Notas / Observaciones de la Valija</label>
+                        <input type="text" name="notes" placeholder="ej: Remesa corte medio día valija sellada" class="w-full h-8 px-2.5 text-xs bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
+                    </div>
+                    <div class="flex justify-end pt-1">
+                        <button type="submit" class="h-7 px-3 bg-zinc-900 hover:bg-zinc-800 text-white font-sans text-xs font-medium rounded-[4px] transition-colors">
+                            Preparar Remesa en Gaveta
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- LISTADO DE REMESAS ACTIVAS DEL TURNO -->
+        {% if active_remittances %}
+        <div class="border border-zinc-200 rounded-[4px] overflow-hidden">
+            <div class="bg-zinc-100 px-4 py-2 border-b border-zinc-200 flex justify-between items-center">
+                <span class="text-xs font-semibold text-zinc-800">Control y Trazabilidad de Remesas del Turno ({{ active_remittances|length }})</span>
+                <span class="text-[11px] text-zinc-500">Ciclo: Preparada &rarr; En Tránsito &rarr; Depositada &rarr; Confirmada por Banco</span>
+            </div>
+            <table class="w-full text-left text-xs border-collapse font-sans">
+                <thead>
+                    <tr class="bg-zinc-50/60 border-b border-zinc-200 text-zinc-600 text-[11px]">
+                        <th class="py-2 px-3 font-mono">Folio Remesa</th>
+                        <th class="py-2 px-3">Cuenta Destino</th>
+                        <th class="py-2 px-3 text-right">Monto</th>
+                        <th class="py-2 px-3">Estado</th>
+                        <th class="py-2 px-3">Custodio / Boleta</th>
+                        <th class="py-2 px-3 text-right">Acciones Operativas</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-zinc-100 text-xs">
+                    {% for r in active_remittances %}
+                    <tr class="hover:bg-zinc-50/50">
+                        <td class="py-2 px-3 font-mono font-medium text-zinc-900">{{ r.remittance_number }}</td>
+                        <td class="py-2 px-3 text-zinc-700">{{ r.destination_bank_account.bank_name }}</td>
+                        <td class="py-2 px-3 text-right font-mono font-semibold text-zinc-900 tabular-nums">C$ {{ r.amount|floatformat:2 }}</td>
+                        <td class="py-2 px-3">
+                            <span class="px-2 py-0.5 text-[10px] font-mono rounded font-medium
+                                {% if r.status == 'PREPARED' %}bg-amber-50 text-amber-800 border border-amber-200
+                                {% elif r.status == 'IN_TRANSIT' %}bg-blue-50 text-blue-800 border border-blue-200
+                                {% elif r.status == 'DEPOSITED' %}bg-indigo-50 text-indigo-800 border border-indigo-200
+                                {% elif r.status == 'CONFIRMED' %}bg-emerald-50 text-emerald-800 border border-emerald-200
+                                {% else %}bg-rose-50 text-rose-800 border border-rose-200{% endif %}">
+                                {{ r.get_status_display }}
+                            </span>
+                        </td>
+                        <td class="py-2 px-3 text-[11px] text-zinc-600">
+                            {% if r.carrier_name %}Custodio: {{ r.carrier_name }}{% endif %}
+                            {% if r.deposit_slip_number %}<br>Minuta: <span class="font-mono font-medium">{{ r.deposit_slip_number }}</span>{% endif %}
+                        </td>
+                        <td class="py-2 px-3 text-right">
+                            <div class="flex items-center justify-end gap-1.5">
+                                {% if r.status == 'PREPARED' %}
+                                <form method="POST" action="{% url 'billing:pos_shifts' %}" class="inline">
+                                    {% csrf_token %}
+                                    <input type="hidden" name="action" value="dispatch_remittance">
+                                    <input type="hidden" name="remittance_id" value="{{ r.pk }}">
+                                    <button type="submit" class="h-6 px-2 bg-blue-600 hover:bg-blue-500 text-white text-[10px] font-medium rounded-[3px]">
+                                        Despachar a Custodio
+                                    </button>
+                                </form>
+                                {% elif r.status == 'IN_TRANSIT' %}
+                                <form method="POST" action="{% url 'billing:pos_shifts' %}" class="inline flex items-center gap-1">
+                                    {% csrf_token %}
+                                    <input type="hidden" name="action" value="deposit_remittance">
+                                    <input type="hidden" name="remittance_id" value="{{ r.pk }}">
+                                    <input type="text" name="deposit_slip_number" required placeholder="N° Minuta" class="h-6 px-1.5 text-[10px] border border-zinc-200 rounded w-20 font-mono">
+                                    <button type="submit" class="h-6 px-2 bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-medium rounded-[3px]">
+                                        Asentar Minuta
+                                    </button>
+                                </form>
+                                {% elif r.status == 'DEPOSITED' %}
+                                <form method="POST" action="{% url 'billing:pos_shifts' %}" class="inline">
+                                    {% csrf_token %}
+                                    <input type="hidden" name="action" value="confirm_remittance">
+                                    <input type="hidden" name="remittance_id" value="{{ r.pk }}">
+                                    <button type="submit" class="h-6 px-2 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-medium rounded-[3px]">
+                                        Confirmar en Banco
+                                    </button>
+                                </form>
+                                {% endif %}
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+
+        <!-- FORMULARIO DE ARQUEO CIEGO POR DENOMINACIÓN Y CORTE Z -->
+        <div class="bg-zinc-50 border border-zinc-200 rounded-[4px] p-4 space-y-4">
+            <div class="border-b border-zinc-200 pb-3">
                 <h3 class="text-xs font-semibold text-zinc-800">
-                    Arqueo ciego y sellado de Corte Z definitivo
+                    Arqueo Ciego por Denominación y Sellado de Corte Z Definitivo
                 </h3>
                 <p class="text-xs text-zinc-500 mt-0.5">
-                    El cajero debe ingresar el efectivo físico real contado en la gaveta. Al confirmar, el sistema calculará sobrantes o faltantes, emitirá el sello criptográfico SHA-256 e inmutabilizará el turno.
+                    El cajero debe declarar el efectivo físico contado en la gaveta. Puede ingresar el monto total o desglosarlo por denominación de billetes y monedas en córdobas.
                 </p>
             </div>
 
-            <form method="POST" action="{% url 'billing:pos_shifts' %}" class="space-y-4" onsubmit="return confirm('¿Está seguro de cerrar definitivamente el turno con Corte Z? Esta acción generará el sello SHA-256 inmutable.');">
+            <form method="POST" action="{% url 'billing:pos_shifts' %}" class="space-y-4" onsubmit="return confirm('¿Está seguro de cerrar definitivamente el turno con Corte Z? Esta acción sellará el reporte con hash SHA-256 e inmutabilizará el turno.');">
                 {% csrf_token %}
                 <input type="hidden" name="action" value="close_z">
                 <input type="hidden" name="shift_id" value="{{ active_shift.pk }}">
 
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <!-- Desglose Rápido por Billetes y Monedas (Córdobas NIO) -->
+                <div>
+                    <span class="block text-[11px] font-medium text-zinc-700 mb-1.5">Conteo Físico por Denominación (Opcional / Detallado)</span>
+                    <div class="grid grid-cols-3 sm:grid-cols-6 gap-2">
+                        <div>
+                            <span class="block text-[10px] font-mono text-zinc-500">Billetes C$ 1000</span>
+                            <input type="number" min="0" name="denom_1000" placeholder="0" class="w-full h-7 px-2 text-xs font-mono bg-white border border-zinc-200 rounded">
+                        </div>
+                        <div>
+                            <span class="block text-[10px] font-mono text-zinc-500">Billetes C$ 500</span>
+                            <input type="number" min="0" name="denom_500" placeholder="0" class="w-full h-7 px-2 text-xs font-mono bg-white border border-zinc-200 rounded">
+                        </div>
+                        <div>
+                            <span class="block text-[10px] font-mono text-zinc-500">Billetes C$ 200</span>
+                            <input type="number" min="0" name="denom_200" placeholder="0" class="w-full h-7 px-2 text-xs font-mono bg-white border border-zinc-200 rounded">
+                        </div>
+                        <div>
+                            <span class="block text-[10px] font-mono text-zinc-500">Billetes C$ 100</span>
+                            <input type="number" min="0" name="denom_100" placeholder="0" class="w-full h-7 px-2 text-xs font-mono bg-white border border-zinc-200 rounded">
+                        </div>
+                        <div>
+                            <span class="block text-[10px] font-mono text-zinc-500">Billetes C$ 50</span>
+                            <input type="number" min="0" name="denom_50" placeholder="0" class="w-full h-7 px-2 text-xs font-mono bg-white border border-zinc-200 rounded">
+                        </div>
+                        <div>
+                            <span class="block text-[10px] font-mono text-zinc-500">Billetes C$ 20</span>
+                            <input type="number" min="0" name="denom_20" placeholder="0" class="w-full h-7 px-2 text-xs font-mono bg-white border border-zinc-200 rounded">
+                        </div>
+                        <div>
+                            <span class="block text-[10px] font-mono text-zinc-500">Billetes C$ 10</span>
+                            <input type="number" min="0" name="denom_10" placeholder="0" class="w-full h-7 px-2 text-xs font-mono bg-white border border-zinc-200 rounded">
+                        </div>
+                        <div>
+                            <span class="block text-[10px] font-mono text-zinc-500">Monedas C$ 5</span>
+                            <input type="number" min="0" name="denom_5" placeholder="0" class="w-full h-7 px-2 text-xs font-mono bg-white border border-zinc-200 rounded">
+                        </div>
+                        <div>
+                            <span class="block text-[10px] font-mono text-zinc-500">Monedas C$ 1</span>
+                            <input type="number" min="0" name="denom_1" placeholder="0" class="w-full h-7 px-2 text-xs font-mono bg-white border border-zinc-200 rounded">
+                        </div>
+                        <div>
+                            <span class="block text-[10px] font-mono text-zinc-500">Monedas C$ 0.50</span>
+                            <input type="number" min="0" name="denom_0_50" placeholder="0" class="w-full h-7 px-2 text-xs font-mono bg-white border border-zinc-200 rounded">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2">
                     <div>
                         <label class="block text-xs font-medium text-zinc-700 mb-1">
-                            Efectivo físico declarado en gaveta (C$ NIO) *
+                            Efectivo Total Declarado en Gaveta (C$ NIO) *
                         </label>
                         <input type="number" 
                                step="0.01" 
@@ -112,22 +336,26 @@
                                required 
                                placeholder="0.00" 
                                class="w-full h-8 px-2.5 text-xs font-mono tabular-nums bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
-                        <span class="text-xs text-zinc-400 mt-1 block">
-                            Conteo físico de billetes y monedas en córdobas al momento del corte.
-                        </span>
                     </div>
 
                     <div>
                         <label class="block text-xs font-medium text-zinc-700 mb-1">
-                            Observaciones / incidencias del turno
+                            Justificación si existe Descuadre (Obligatoria ante faltante/sobrante)
                         </label>
-                        <input type="text" 
-                               name="notes" 
-                               placeholder="ej: Arqueo sin incidencias" 
+                        <input type="text"
+                               name="difference_justification"
+                               placeholder="Causa formal de la discrepancia de caja"
                                class="w-full h-8 px-2.5 text-xs font-sans bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
-                        <span class="text-xs text-zinc-400 mt-1 block">
-                            Justificación técnica ante cualquier discrepancia física.
-                        </span>
+                    </div>
+
+                    <div>
+                        <label class="block text-xs font-medium text-zinc-700 mb-1">
+                            Observaciones Generales de Cierre
+                        </label>
+                        <input type="text"
+                               name="notes"
+                               placeholder="ej: Arqueo sin incidencias"
+                               class="w-full h-8 px-2.5 text-xs font-sans bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
                     </div>
                 </div>
 
@@ -136,7 +364,7 @@
                         <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
                             <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z"/>
                         </svg>
-                        <span>Ejecutar arqueo ciego &amp; sellar Corte Z (SHA-256)</span>
+                        <span>Ejecutar Arqueo Ciego &amp; Sellar Corte Z Operativo (SHA-256)</span>
                     </button>
                 </div>
             </form>
@@ -153,29 +381,29 @@
                 <table class="w-full text-left text-xs border-collapse">
                     <thead>
                         <tr class="text-xs font-medium text-zinc-500 bg-zinc-50/60 border-b border-zinc-200 font-sans">
-                            <th class="py-3 px-4">Folio Factura</th>
-                            <th class="py-3 px-4">Fecha / Hora</th>
-                            <th class="py-3 px-4">Cliente</th>
-                            <th class="py-3 px-4">Condición</th>
-                            <th class="py-3 px-4 text-right">Subtotal</th>
-                            <th class="py-3 px-4 text-right">IVA 15%</th>
-                            <th class="py-3 px-4 text-right">Total Cobrado</th>
+                            <th class="py-2.5 px-3">Folio Factura</th>
+                            <th class="py-2.5 px-3">Fecha / Hora</th>
+                            <th class="py-2.5 px-3">Cliente</th>
+                            <th class="py-2.5 px-3">Condición</th>
+                            <th class="py-2.5 px-3 text-right">Subtotal</th>
+                            <th class="py-2.5 px-3 text-right">IVA 15%</th>
+                            <th class="py-2.5 px-3 text-right">Total Cobrado</th>
                         </tr>
                     </thead>
-                    <tbody class="divide-y divide-zinc-100 text-sm text-zinc-700">
+                    <tbody class="divide-y divide-zinc-100 text-xs text-zinc-700">
                         {% for inv in x_metrics.invoices %}
                         <tr class="hover:bg-zinc-50/60 transition-colors">
-                            <td class="py-3 px-4 font-mono font-medium text-zinc-900">
+                            <td class="py-2 px-3 font-mono font-medium text-zinc-900">
                                 <a href="{% url 'billing:invoice_detail' pk=inv.pk %}" class="hover:underline">
                                     {{ inv.number }}
                                 </a>
                             </td>
-                            <td class="py-3 px-4 text-zinc-600 font-mono text-xs">{{ inv.created_at|date:"d/m/Y H:i" }}</td>
-                            <td class="py-3 px-4 font-sans text-zinc-800">{{ inv.account.commercial_name|default:inv.account.legal_name }}</td>
-                            <td class="py-3 px-4 text-zinc-600 font-sans">{{ inv.get_payment_condition_display }}</td>
-                            <td class="py-3 px-4 text-right font-mono tabular-nums text-zinc-600">C$ {{ inv.subtotal|floatformat:2 }}</td>
-                            <td class="py-3 px-4 text-right font-mono tabular-nums text-zinc-600">C$ {{ inv.tax_total|floatformat:2 }}</td>
-                            <td class="py-3 px-4 text-right font-mono tabular-nums font-semibold text-zinc-900">C$ {{ inv.net_receivable|floatformat:2 }}</td>
+                            <td class="py-2 px-3 text-zinc-600 font-mono text-[11px]">{{ inv.created_at|date:"d/m/Y H:i" }}</td>
+                            <td class="py-2 px-3 font-sans text-zinc-800">{{ inv.account.commercial_name|default:inv.account.legal_name }}</td>
+                            <td class="py-2 px-3 text-zinc-600 font-sans">{{ inv.get_payment_condition_display }}</td>
+                            <td class="py-2 px-3 text-right font-mono tabular-nums text-zinc-600">C$ {{ inv.subtotal|floatformat:2 }}</td>
+                            <td class="py-2 px-3 text-right font-mono tabular-nums text-zinc-600">C$ {{ inv.tax_total|floatformat:2 }}</td>
+                            <td class="py-2 px-3 text-right font-mono tabular-nums font-semibold text-zinc-900">C$ {{ inv.net_receivable|floatformat:2 }}</td>
                         </tr>
                         {% endfor %}
                     </tbody>
@@ -206,130 +434,127 @@
 
             <div>
                 <label class="block text-xs font-medium text-zinc-700 mb-1">
-                    Identificador de caja / terminal *
+                    Identificador de terminal / caja *
                 </label>
-                <input type="text" 
-                       name="register_name" 
-                       value="CAJA-MOSTRADOR-01" 
-                       required 
-                       class="w-full h-8 px-2.5 text-xs font-sans bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
+                <input type="text"
+                       name="register_name"
+                       value="CAJA-PRINCIPAL-01"
+                       required
+                       class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
             </div>
 
             <div>
                 <label class="block text-xs font-medium text-zinc-700 mb-1">
-                    Fondo fijo inicial de apertura (C$ Córdobas) *
+                    Fondo fijo inicial en efectivo (C$ NIO) *
                 </label>
-                <input type="number" 
-                       step="0.01" 
-                       min="0" 
-                       name="opening_cash_nio" 
-                       value="2000.00" 
-                       required 
-                       placeholder="2000.00" 
-                       class="w-full h-8 px-2.5 text-xs font-mono tabular-nums bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400 font-semibold">
+                <input type="number"
+                       step="0.01"
+                       min="0"
+                       name="opening_cash_nio"
+                       required
+                       value="1000.00"
+                       class="w-full h-8 px-2.5 text-xs font-mono tabular-nums bg-white border border-zinc-200 rounded-[4px] focus:outline-none focus:border-zinc-400">
                 <span class="text-xs text-zinc-400 mt-1 block">
-                    Monto en gaveta antes de la primera venta del turno.
+                    Fondo asignado físicamente a la gaveta para vuelto al inicio de la jornada.
                 </span>
             </div>
 
             <div class="pt-2">
-                <button type="submit" class="w-full h-9 bg-zinc-900 hover:bg-zinc-800 text-white font-sans text-xs font-medium rounded-[4px] transition-colors flex items-center justify-center gap-2 cursor-pointer">
-                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M13.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z"/>
+                <button type="submit" class="w-full h-8 bg-zinc-900 hover:bg-zinc-800 text-white font-sans text-xs font-medium rounded-[4px] transition-colors flex items-center justify-center gap-1.5 cursor-pointer">
+                    <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4"/>
                     </svg>
-                    <span>Abrir turno de caja e iniciar operaciones</span>
+                    <span>Abrir turno de caja POS e iniciar operaciones</span>
                 </button>
             </div>
         </form>
     </div>
     {% endif %}
 
-    <!-- SECCIÓN 2: HISTORIAL AUDITABLE DE TURNOS CERRADOS (CORTES Z) -->
-    <div class="bg-white border border-zinc-200 rounded-[4px] overflow-hidden">
-        <div class="p-4 border-b border-zinc-200 bg-zinc-50/50 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+    <!-- SECCIÓN 2: HISTORIAL AUDITABLE DE TURNOS CERRADOS CON CORTE Z -->
+    <div class="bg-white border border-zinc-200 rounded-[4px] p-5 space-y-4">
+        <div class="border-b border-zinc-200 pb-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <div>
-                <h3 class="text-xs font-medium text-zinc-900">
-                    Historial de turnos cerrados &amp; actas de Corte Z
+                <h3 class="text-sm font-semibold text-zinc-900">
+                    Historial de turnos cerrados con Corte Z (Auditoría permanente)
                 </h3>
                 <p class="text-xs text-zinc-500 mt-0.5">
-                    Registro inmutable con sello criptográfico SHA-256 para auditoría fiscal y control de prevención de pérdidas.
+                    Registro inmutable de turnos de caja POS sellados con sello criptográfico SHA-256 y control de faltantes/sobrantes.
                 </p>
             </div>
-            <span class="text-xs font-mono text-zinc-500">
-                Total registrados: <strong>{{ closed_shifts|length }}</strong>
-            </span>
+            <span class="text-xs text-zinc-400 font-mono">Últimos {{ closed_shifts|length }} turnos</span>
         </div>
 
-        <div class="overflow-x-auto">
-            <table class="w-full text-left text-xs border-collapse">
+        {% if closed_shifts %}
+        <div class="border border-zinc-200 rounded-[4px] overflow-hidden">
+            <table class="w-full text-left text-xs border-collapse font-sans">
                 <thead>
-                    <tr class="text-xs font-medium text-zinc-500 bg-zinc-50/60 border-b border-zinc-200 font-sans">
-                        <th class="py-3 px-4">Folio turno</th>
-                        <th class="py-3 px-4">Terminal</th>
-                        <th class="py-3 px-4">Cajero</th>
-                        <th class="py-3 px-4">Apertura / Cierre</th>
-                        <th class="py-3 px-4 text-right">Fondo inicial</th>
-                        <th class="py-3 px-4 text-right">Ventas efectivo</th>
-                        <th class="py-3 px-4 text-right">Esperado</th>
-                        <th class="py-3 px-4 text-right">Declarado</th>
-                        <th class="py-3 px-4 text-center">Dictamen / Cuadre</th>
-                        <th class="py-3 px-4">Sello SHA-256</th>
-                        <th class="py-3 px-4 text-right">Acciones</th>
+                    <tr class="text-xs font-medium text-zinc-500 bg-zinc-50/60 border-b border-zinc-200">
+                        <th class="py-2.5 px-3">N° Turno</th>
+                        <th class="py-2.5 px-3">Caja</th>
+                        <th class="py-2.5 px-3">Cajero</th>
+                        <th class="py-2.5 px-3">Apertura / Cierre</th>
+                        <th class="py-2.5 px-3 text-right">Esperado</th>
+                        <th class="py-2.5 px-3 text-right">Declarado</th>
+                        <th class="py-2.5 px-3 text-right">Diferencia</th>
+                        <th class="py-2.5 px-3 text-center">Cuadre</th>
+                        <th class="py-2.5 px-3 text-right">Acta</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-zinc-100 text-sm text-zinc-700">
+                <tbody class="divide-y divide-zinc-100 text-zinc-700">
                     {% for s in closed_shifts %}
                     <tr class="hover:bg-zinc-50/60 transition-colors">
-                        <td class="py-3 px-4 font-mono font-medium text-zinc-900">{{ s.shift_number }}</td>
-                        <td class="py-3 px-4 text-zinc-700 font-sans">{{ s.register_name }}</td>
-                        <td class="py-3 px-4 font-sans text-zinc-800">{{ s.cashier.get_full_name|default:s.cashier.email }}</td>
-                        <td class="py-3 px-4 text-zinc-600 text-xs font-mono">
-                            <div>{{ s.opened_at|date:"d/m/Y H:i" }}</div>
-                            <div class="text-zinc-400">&rarr; {{ s.closed_at|date:"d/m/Y H:i" }}</div>
+                        <td class="py-2.5 px-3 font-mono font-medium text-zinc-900">
+                            {{ s.shift_number }}
                         </td>
-                        <td class="py-3 px-4 text-right font-mono tabular-nums text-zinc-600">C$ {{ s.opening_cash_nio|floatformat:2 }}</td>
-                        <td class="py-3 px-4 text-right font-mono tabular-nums text-emerald-700 font-medium">C$ {{ s.system_cash_sales_nio|floatformat:2 }}</td>
-                        <td class="py-3 px-4 text-right font-mono tabular-nums text-zinc-800">C$ {{ s.expected_cash_in_drawer_nio|floatformat:2 }}</td>
-                        <td class="py-3 px-4 text-right font-mono tabular-nums font-semibold text-zinc-900">C$ {{ s.declared_cash_nio|floatformat:2 }}</td>
-                        <td class="py-3 px-4 text-center">
+                        <td class="py-2.5 px-3 font-mono text-[11px] text-zinc-600">{{ s.register_name }}</td>
+                        <td class="py-2.5 px-3 text-zinc-800">{{ s.cashier.get_full_name|default:s.cashier.email }}</td>
+                        <td class="py-2.5 px-3 font-mono text-[11px] text-zinc-500">
+                            {{ s.opened_at|date:"d/m H:i" }} &rarr; {{ s.closed_at|date:"d/m H:i" }}
+                        </td>
+                        <td class="py-2.5 px-3 text-right font-mono tabular-nums text-zinc-700">
+                            C$ {{ s.expected_cash_in_drawer_nio|floatformat:2 }}
+                        </td>
+                        <td class="py-2.5 px-3 text-right font-mono tabular-nums text-zinc-900 font-medium">
+                            C$ {{ s.declared_cash_nio|floatformat:2 }}
+                        </td>
+                        <td class="py-2.5 px-3 text-right font-mono tabular-nums font-semibold
+                            {% if s.cash_difference_nio == 0 %}text-emerald-700{% elif s.cash_difference_nio > 0 %}text-blue-700{% else %}text-rose-700{% endif %}">
+                            C$ {{ s.cash_difference_nio|floatformat:2 }}
+                        </td>
+                        <td class="py-2.5 px-3 text-center">
                             {% if s.cash_difference_nio == 0 %}
-                            <span class="inline-block px-2 py-0.5 bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-[4px] text-xs font-medium font-sans">
-                                Cuadrado C$ 0.00
+                            <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-50 text-emerald-800 border border-emerald-200">
+                                Exacto
                             </span>
                             {% elif s.cash_difference_nio > 0 %}
-                            <span class="inline-block px-2 py-0.5 bg-sky-50 text-sky-800 border border-sky-200 rounded-[4px] text-xs font-medium font-sans">
-                                Sobrante +C$ {{ s.cash_difference_nio|floatformat:2 }}
+                            <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-50 text-blue-800 border border-blue-200">
+                                Sobrante
                             </span>
                             {% else %}
-                            <span class="inline-block px-2 py-0.5 bg-rose-50 text-rose-800 border border-rose-200 rounded-[4px] text-xs font-medium font-sans">
-                                Faltante -C$ {{ s.cash_difference_nio|stringformat:".2f"|slice:"1:" }}
+                            <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-rose-50 text-rose-800 border border-rose-200">
+                                Faltante
                             </span>
                             {% endif %}
                         </td>
-                        <td class="py-3 px-4 text-xs text-zinc-400 font-mono" title="{{ s.audit_hash }}">
-                            {{ s.audit_hash|slice:":12" }}...
-                        </td>
-                        <td class="py-3 px-4 text-right">
-                            <a href="{% url 'billing:pos_shift_print_z' pk=s.pk %}" 
-                               target="_blank" 
-                               class="h-7 px-2.5 inline-flex items-center gap-1 bg-white hover:bg-zinc-50 text-zinc-700 border border-zinc-200 rounded-[4px] text-xs font-sans transition-colors">
+                        <td class="py-2.5 px-3 text-right">
+                            <a href="{% url 'billing:pos_shift_print_z' pk=s.pk %}" class="inline-flex items-center gap-1 text-[11px] font-medium text-zinc-800 hover:text-zinc-900 hover:underline">
                                 <svg class="w-3 h-3 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
                                     <path stroke-linecap="round" stroke-linejoin="round" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/>
                                 </svg>
-                                <span>Acta Z</span>
+                                <span>Ver Resumen Z</span>
                             </a>
-                        </td>
-                    </tr>
-                    {% empty %}
-                    <tr>
-                        <td colspan="11" class="py-8 px-4 text-center text-zinc-400 font-sans">
-                            No se registran turnos de caja POS cerrados en esta organización.
                         </td>
                     </tr>
                     {% endfor %}
                 </tbody>
             </table>
         </div>
+        {% else %}
+        <div class="py-8 text-center text-zinc-400 text-xs">
+            No hay turnos cerrados con Corte Z registrados aún.
+        </div>
+        {% endif %}
     </div>
 
 </div>

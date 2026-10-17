@@ -108,6 +108,16 @@ class PosAndFefoVerticalTestSuite(TestCase):
             lifecycle_stage=Account.LifecycleStage.ACTIVE,
         )
 
+        from apps.finance.models import BankAccount
+        self.bank = BankAccount.objects.create(
+            organization=self.org,
+            bank_name=BankAccount.BankName.BAC,
+            account_number='001-FEFO-TEST-01',
+            currency='NIO',
+            current_balance=Decimal('100000.00'),
+            is_active=True,
+        )
+
         self.client = Client()
 
     def test_01_vertical_switch_to_pharmacy_activates_pos_fefo_and_hides_operations(self):
@@ -441,6 +451,7 @@ class PosAndFefoVerticalTestSuite(TestCase):
             }],
             account=self.client_account,
             payment_method='TRANSFER',
+            bank_account=self.bank,
             cash_received=Decimal('8481.25'),
         )
         self.assertEqual(inv_volume.subtotal, Decimal('7375.00'))

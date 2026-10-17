@@ -418,6 +418,7 @@ class PaymentReceipt(TenantScopedModel):
         TRANSFER_FICOHSA = 'TRANSFER_FICOHSA', 'Transferencia FICOHSA / BDF'
         CHECK = 'CHECK', 'Cheque Certificado'
         CASH = 'CASH', 'Efectivo en Caja'
+        CARD = 'CARD', 'Tarjeta de Crédito / Débito'
 
     number = models.CharField(
         max_length=25,

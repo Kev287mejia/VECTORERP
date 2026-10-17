@@ -253,6 +253,8 @@ def ensure_default_chart_of_accounts(organization):
 
     default_accounts = [
         ('1101-01', 'Caja General y Mostrador', AccountingAccount.AccountType.ASSET),
+        ('1101-02', 'Cheques en Cartera y Valores por Depositar', AccountingAccount.AccountType.ASSET),
+        ('1101-03', 'Tarjetas y Vouchers por Liquidar / Adquirentes', AccountingAccount.AccountType.ASSET),
         ('1102-01', 'Bancos Institucionales', AccountingAccount.AccountType.ASSET),
         ('1103-01', 'Clientes por Cobrar (CxC)', AccountingAccount.AccountType.ASSET),
         ('1104-01', 'IVA Crédito Fiscal Acreditable (15%)', AccountingAccount.AccountType.ASSET),
@@ -268,6 +270,7 @@ def ensure_default_chart_of_accounts(organization):
         ('4101-01', 'Ingresos por Ventas de Bienes y Servicios', AccountingAccount.AccountType.INCOME),
         ('5101-01', 'Costo de Ventas, Compras e Insumos', AccountingAccount.AccountType.EXPENSE),
         ('6101-01', 'Gastos Generales y de Administración', AccountingAccount.AccountType.EXPENSE),
+        ('6102-01', 'Comisiones Bancarias y Procesamiento de Tarjetas', AccountingAccount.AccountType.EXPENSE),
     ]
     accounts_map = {}
     for code, name, acct_type in default_accounts:
@@ -278,6 +281,21 @@ def ensure_default_chart_of_accounts(organization):
         )
         accounts_map[code] = acc
     return accounts_map
+
+
+def get_required_accounting_account(accounts_chart, code, organization):
+    """
+    Retorna la cuenta contable requerida desde el mapa o base de datos.
+    Falla de manera explícita y segura con ValidationError si no existe o está inactiva.
+    """
+    from django.core.exceptions import ValidationError
+    acc = accounts_chart.get(code) if accounts_chart else None
+    if not acc:
+        from apps.finance.models import AccountingAccount
+        acc = AccountingAccount.objects.filter(organization=organization, code=code, is_active=True).first()
+    if not acc or not acc.is_active:
+        raise ValidationError(f"La cuenta contable requerida '{code}' no está configurada o se encuentra inactiva para la empresa.")
+    return acc
 
 
 def record_invoice_sales_journal_entry(organization, invoice, user, accounts=None):
@@ -884,4 +902,499 @@ def sync_commercial_and_purchasing_to_ledger(organization, user):
         'purchases_synced': synced_purchases,
         'total_entries': synced_invoices + synced_purchases,
     }
+
+
+def record_card_batch_settlement(
+    organization,
+    bank_account,
+    batch_reference: str,
+    gross_amount: Decimal,
+    fee_amount: Decimal = Decimal('0.00'),
+    tax_retention_amount: Decimal = Decimal('0.00'),
+    user=None,
+    settlement_date=None,
+    notes: str = '',
+    idempotency_key: str = None,
+):
+    """
+    Liquidación Atómica de Lotes de Tarjetas de Crédito / Débito:
+    1. Valida pertenencia multi-tenant y estado activo de la cuenta bancaria.
+    2. Valida importes:
+       - gross_amount > 0
+       - fee_amount >= 0
+       - tax_retention_amount >= 0
+       - net_amount = gross_amount - fee_amount - tax_retention_amount > 0
+    3. Idempotencia estricta por clave (reintentos idénticos devuelven la liquidación existente,
+       parámetros discrepantes lanzan ValidationError).
+    4. Unicidad de referencia de lote por cuenta bancaria y organización.
+    5. Bloqueo pesimista de cuenta bancaria (select_for_update).
+    6. Incrementa BankAccount.current_balance += net_amount.
+    7. Emite FinancialTransaction (CARD_SETTLEMENT).
+    8. Emite JournalEntry (COLLECTIONS) con partida doble cuadrada:
+       - Débito: 1102-01 (Bancos) por net_amount
+       - Débito: 6102-01 (Comisiones Bancarias) por fee_amount (si fee_amount > 0)
+       - Débito: 1105-01 (Anticipo Retención IR) por tax_retention_amount (si tax_retention_amount > 0)
+       - Crédito: 1101-03 (Tarjetas y Vouchers por Liquidar) por gross_amount
+    9. Crea y retorna CardBatchSettlement.
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+    from django.db import IntegrityError, transaction
+    from django.core.exceptions import ValidationError
+    from apps.finance.models import CardBatchSettlement
+
+    clean_idempotency_key = (idempotency_key or '').strip()
+    clean_batch_ref = (batch_reference or '').strip()
+    gross = Decimal(str(gross_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    fee = Decimal(str(fee_amount or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    retention = Decimal(str(tax_retention_amount or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    if clean_idempotency_key:
+        existing = CardBatchSettlement.objects.filter(
+            organization=organization,
+            idempotency_key=clean_idempotency_key,
+        ).first()
+        if existing:
+            if (
+                existing.bank_account_id == bank_account.id
+                and existing.gross_amount == gross
+                and existing.fee_amount == fee
+                and existing.tax_retention_amount == retention
+                and existing.batch_reference == clean_batch_ref
+            ):
+                return existing
+            else:
+                raise ValidationError("La clave de idempotencia especificada ya fue utilizada con parámetros de liquidación diferentes.")
+
+    try:
+        with transaction.atomic():
+            return _record_card_batch_settlement_inner(
+                organization=organization,
+                bank_account=bank_account,
+                batch_reference=batch_reference,
+                gross_amount=gross_amount,
+                fee_amount=fee_amount,
+                tax_retention_amount=tax_retention_amount,
+                user=user,
+                settlement_date=settlement_date,
+                notes=notes,
+                clean_idempotency_key=clean_idempotency_key,
+                clean_batch_ref=clean_batch_ref,
+                gross=gross,
+                fee=fee,
+                retention=retention,
+            )
+    except IntegrityError:
+        if clean_idempotency_key:
+            existing = CardBatchSettlement.objects.filter(
+                organization=organization,
+                idempotency_key=clean_idempotency_key,
+            ).first()
+            if existing:
+                if (
+                    existing.bank_account_id == bank_account.id
+                    and existing.gross_amount == gross
+                    and existing.fee_amount == fee
+                    and existing.tax_retention_amount == retention
+                    and existing.batch_reference == clean_batch_ref
+                ):
+                    return existing
+                else:
+                    raise ValidationError("La clave de idempotencia especificada ya fue utilizada con parámetros de liquidación diferentes.")
+        raise
+
+
+def _record_card_batch_settlement_inner(
+    organization,
+    bank_account,
+    batch_reference: str,
+    gross_amount: Decimal,
+    fee_amount: Decimal,
+    tax_retention_amount: Decimal,
+    user,
+    settlement_date,
+    notes: str,
+    clean_idempotency_key: str,
+    clean_batch_ref: str,
+    gross: Decimal,
+    fee: Decimal,
+    retention: Decimal,
+):
+    from decimal import Decimal, ROUND_HALF_UP
+    from django.core.exceptions import ValidationError
+    from apps.finance.models import (
+        BankAccount,
+        CardBatchSettlement,
+        FinancialTransaction,
+        JournalEntry,
+        JournalEntryLine,
+    )
+
+    if bank_account.organization_id != organization.id:
+        raise ValidationError("La cuenta bancaria no pertenece a la organización de la liquidación.")
+    if not bank_account.is_active:
+        raise ValidationError("La cuenta bancaria seleccionada se encuentra inactiva.")
+
+    if not clean_batch_ref:
+        raise ValidationError("Se requiere una referencia o número de lote del adquirente para liquidar.")
+
+    if gross <= Decimal('0.00'):
+        raise ValidationError("El importe bruto del lote a liquidar debe ser estrictamente mayor a 0.00.")
+    if fee < Decimal('0.00') or retention < Decimal('0.00'):
+        raise ValidationError("Las comisiones y retenciones no pueden ser negativas.")
+
+    net = gross - fee - retention
+    if net <= Decimal('0.00'):
+        raise ValidationError(
+            f"El importe neto a acreditar ({net:.2f}) debe ser mayor a 0.00. Comisiones y retenciones exceden o igualan el bruto."
+        )
+
+    # Validar que no se liquide dos veces el mismo lote en la misma cuenta bancaria
+    dup_batch = CardBatchSettlement.objects.filter(
+        organization=organization,
+        bank_account=bank_account,
+        batch_reference=clean_batch_ref,
+    ).first()
+    if dup_batch:
+        raise ValidationError(
+            f"El lote '{clean_batch_ref}' ya fue liquidado previamente en esta cuenta bancaria con folio {dup_batch.settlement_number}."
+        )
+
+    # Bloqueo pesimista de cuenta bancaria
+    locked_bank = BankAccount.objects.select_for_update().get(id=bank_account.id, organization=organization)
+    locked_bank.current_balance += net
+    locked_bank.save(update_fields=['current_balance', 'updated_at'])
+
+    # Transacción de tesorería
+    trx = FinancialTransaction.objects.create(
+        organization=organization,
+        transaction_type=FinancialTransaction.TransactionType.CARD_SETTLEMENT,
+        bank_account=locked_bank,
+        amount=net,
+        balance_after=locked_bank.current_balance,
+        concept=f"Liquidación Lote Tarjetas {clean_batch_ref} (Bruto: {gross}, Comis: {fee}, Ret: {retention})",
+        reference_code=clean_batch_ref,
+        performed_by=user,
+    )
+
+    # Asiento contable
+    accounts_chart = ensure_default_chart_of_accounts(organization)
+    acc_bank = get_required_accounting_account(accounts_chart, '1102-01', organization)
+    acc_cards_clearing = get_required_accounting_account(accounts_chart, '1101-03', organization)
+    acc_fee = get_required_accounting_account(accounts_chart, '6102-01', organization) if fee > Decimal('0.00') else None
+    acc_ret = get_required_accounting_account(accounts_chart, '1105-01', organization) if retention > Decimal('0.00') else None
+
+    entry = JournalEntry.objects.create(
+        organization=organization,
+        date=settlement_date or timezone.now().date(),
+        entry_type=JournalEntry.EntryType.COLLECTIONS,
+        concept=f"Liquidación Lote Tarjetas {clean_batch_ref} en {locked_bank.get_bank_name_display()} {locked_bank.account_number}",
+        reference=clean_batch_ref,
+        created_by=user,
+    )
+
+    # Línea Débito a Bancos por el Neto Acreditado
+    JournalEntryLine.objects.create(
+        organization=organization,
+        entry=entry,
+        account=acc_bank,
+        concept=f"Depósito Neto Lote Tarjetas {clean_batch_ref}",
+        debit=net,
+        credit=Decimal('0.00'),
+    )
+
+    # Línea Débito a Comisiones Bancarias (Gasto) si aplica
+    if fee > Decimal('0.00'):
+        JournalEntryLine.objects.create(
+            organization=organization,
+            entry=entry,
+            account=acc_fee,
+            concept=f"Comisión Adquirente Lote Tarjetas {clean_batch_ref}",
+            debit=fee,
+            credit=Decimal('0.00'),
+        )
+
+    # Línea Débito a Anticipo Retención IR (Activo Fiscal) si aplica
+    if retention > Decimal('0.00'):
+        JournalEntryLine.objects.create(
+            organization=organization,
+            entry=entry,
+            account=acc_ret,
+            concept=f"Retención Fiscal en Tarjeta Lote {clean_batch_ref}",
+            debit=retention,
+            credit=Decimal('0.00'),
+        )
+
+    # Línea Crédito a Tarjetas y Vouchers por Liquidar por el Bruto
+    JournalEntryLine.objects.create(
+        organization=organization,
+        entry=entry,
+        account=acc_cards_clearing,
+        concept=f"Baja de Vouchers Liquidados Lote {clean_batch_ref}",
+        debit=Decimal('0.00'),
+        credit=gross,
+    )
+
+    entry.verify_and_save_balance()
+    if not entry.is_balanced:
+        raise ValidationError("Error contable: la póliza de liquidación de tarjetas no está cuadrada.")
+
+    settlement = CardBatchSettlement.objects.create(
+        organization=organization,
+        bank_account=locked_bank,
+        batch_reference=clean_batch_ref,
+        settlement_date=settlement_date or timezone.now().date(),
+        currency=locked_bank.currency,
+        gross_amount=gross,
+        fee_amount=fee,
+        tax_retention_amount=retention,
+        net_amount=net,
+        status=CardBatchSettlement.Status.SETTLED,
+        idempotency_key=clean_idempotency_key,
+        notes=notes,
+        financial_transaction=trx,
+        journal_entry=entry,
+        performed_by=user,
+    )
+
+    entry.source_card_settlement = settlement
+    entry.save(update_fields=['source_card_settlement', 'updated_at'])
+
+    return settlement
+
+
+@transaction.atomic
+def deposit_check_to_bank(
+    organization,
+    check_record,
+    bank_account,
+    deposit_slip_number: str,
+    user=None,
+):
+    """
+    Registra el depósito físico de un cheque en remesa bancaria:
+    - Valida que el cheque esté en estado RECEIVED.
+    - Valida pertenencia multi-tenant y estado activo de la cuenta bancaria.
+    - No acredita fondos aún (continúa en compensación).
+    - Actualiza el estado a DEPOSITED con la cuenta bancaria y la boleta de depósito.
+    """
+    from django.core.exceptions import ValidationError
+    from apps.finance.models import CheckReceiptRegister
+
+    if check_record.organization_id != organization.id:
+        raise ValidationError("El registro de cheque no pertenece a la organización.")
+    if bank_account.organization_id != organization.id:
+        raise ValidationError("La cuenta bancaria no pertenece a la organización.")
+    if not bank_account.is_active:
+        raise ValidationError("La cuenta bancaria seleccionada se encuentra inactiva.")
+
+    locked_check = CheckReceiptRegister.objects.select_for_update().get(id=check_record.id, organization=organization)
+    if locked_check.status != CheckReceiptRegister.Status.RECEIVED:
+        raise ValidationError(f"Solo se pueden depositar cheques en estado Recibido. Estado actual: {locked_check.get_status_display()}.")
+
+    clean_slip = (deposit_slip_number or '').strip()
+    if not clean_slip:
+        raise ValidationError("Se requiere el número de boleta o minuta de depósito bancario.")
+
+    locked_check.deposit_bank_account = bank_account
+    locked_check.deposit_slip_number = clean_slip
+    locked_check.status = CheckReceiptRegister.Status.DEPOSITED
+    locked_check.save(update_fields=['deposit_bank_account', 'deposit_slip_number', 'status', 'updated_at'])
+    return locked_check
+
+
+@transaction.atomic
+def clear_check_deposit(
+    organization,
+    check_record,
+    user=None,
+    bank_account=None,
+    clearing_reference: str = '',
+):
+    """
+    Compensación y Acreditación Líquida de Cheque en Cuenta Bancaria:
+    1. Valida que el cheque esté en estado DEPOSITED o RECEIVED.
+    2. Determina y bloquea pesimísticamente la cuenta bancaria destino.
+    3. Incrementa BankAccount.current_balance += check_record.amount.
+    4. Emite FinancialTransaction (CHECK_CLEARING).
+    5. Emite JournalEntry (COLLECTIONS):
+       - Débito: 1102-01 (Bancos Institucionales) por check_record.amount
+       - Crédito: 1101-02 (Cheques en Cartera y Valores por Depositar) por check_record.amount
+    6. Actualiza estado del cheque a CLEARED con timestamp y enlaces de auditoría.
+    """
+    from django.core.exceptions import ValidationError
+    from apps.finance.models import (
+        BankAccount,
+        CheckReceiptRegister,
+        FinancialTransaction,
+        JournalEntry,
+        JournalEntryLine,
+    )
+
+    if check_record.organization_id != organization.id:
+        raise ValidationError("El registro de cheque no pertenece a la organización.")
+
+    locked_check = CheckReceiptRegister.objects.select_for_update().get(id=check_record.id, organization=organization)
+    if locked_check.status == CheckReceiptRegister.Status.CLEARED:
+        raise ValidationError("Este cheque ya fue compensado y acreditado previamente.")
+    if locked_check.status == CheckReceiptRegister.Status.REJECTED:
+        raise ValidationError("No se puede compensar un cheque que fue rechazado.")
+
+    target_bank = bank_account or locked_check.deposit_bank_account
+    if not target_bank:
+        raise ValidationError("Se requiere una cuenta bancaria destino para acreditar la compensación del cheque.")
+    if target_bank.organization_id != organization.id:
+        raise ValidationError("La cuenta bancaria no pertenece a la organización.")
+    if not target_bank.is_active:
+        raise ValidationError("La cuenta bancaria se encuentra inactiva.")
+
+    locked_bank = BankAccount.objects.select_for_update().get(id=target_bank.id, organization=organization)
+    locked_bank.current_balance += locked_check.amount
+    locked_bank.save(update_fields=['current_balance', 'updated_at'])
+
+    ref = (clearing_reference or locked_check.deposit_slip_number or locked_check.check_number).strip()
+
+    trx = FinancialTransaction.objects.create(
+        organization=organization,
+        transaction_type=FinancialTransaction.TransactionType.CHECK_CLEARING,
+        bank_account=locked_bank,
+        amount=locked_check.amount,
+        balance_after=locked_bank.current_balance,
+        concept=f"Compensación y Acreditación de Cheque {locked_check.check_number} ({locked_check.drawer_name})",
+        reference_code=ref,
+        performed_by=user,
+    )
+
+    accounts_chart = ensure_default_chart_of_accounts(organization)
+    acc_bank = get_required_accounting_account(accounts_chart, '1102-01', organization)
+    acc_checks = get_required_accounting_account(accounts_chart, '1101-02', organization)
+
+    entry = JournalEntry.objects.create(
+        organization=organization,
+        date=timezone.now().date(),
+        entry_type=JournalEntry.EntryType.COLLECTIONS,
+        concept=f"Compensación Cheque {locked_check.check_number} en {locked_bank.get_bank_name_display()} {locked_bank.account_number}",
+        reference=ref,
+        created_by=user,
+    )
+
+    JournalEntryLine.objects.create(
+        organization=organization,
+        entry=entry,
+        account=acc_bank,
+        concept=f"Acreditación Líquida Cheque {locked_check.check_number}",
+        debit=locked_check.amount,
+        credit=Decimal('0.00'),
+    )
+    JournalEntryLine.objects.create(
+        organization=organization,
+        entry=entry,
+        account=acc_checks,
+        concept=f"Baja de Cheque en Cartera por Compensación {locked_check.check_number}",
+        debit=Decimal('0.00'),
+        credit=locked_check.amount,
+    )
+    entry.verify_and_save_balance()
+
+    locked_check.status = CheckReceiptRegister.Status.CLEARED
+    locked_check.cleared_at = timezone.now()
+    locked_check.deposit_bank_account = locked_bank
+    locked_check.financial_transaction = trx
+    locked_check.clearing_journal_entry = entry
+    locked_check.save()
+
+    return locked_check
+
+
+@transaction.atomic
+def reject_check(
+    organization,
+    check_record,
+    reason: str,
+    user=None,
+):
+    """
+    Rechazo / Devolución de Cheque no Compensado:
+    1. Valida que el cheque esté en estado RECEIVED o DEPOSITED (nunca CLEARED).
+    2. Reversión contable:
+       - Débito: 1103-01 (Clientes por Cobrar CxC) por check_record.amount
+       - Crédito: 1101-02 (Cheques en Cartera y Valores por Depositar) por check_record.amount
+    3. Si el cheque estaba asociado a una Factura (Invoice):
+       - Reactiva el saldo pendiente: invoice.balance_due += check_record.amount.
+       - Descuenta el abono: invoice.amount_paid -= check_record.amount.
+       - Transiciona el estado de la factura a PARTIAL o ISSUED.
+    4. Actualiza estado del cheque a REJECTED con el motivo de rechazo y póliza de reversión.
+    """
+    from decimal import Decimal
+    from django.core.exceptions import ValidationError
+    from apps.finance.models import (
+        CheckReceiptRegister,
+        JournalEntry,
+        JournalEntryLine,
+    )
+    from apps.billing.models import Invoice
+
+    if check_record.organization_id != organization.id:
+        raise ValidationError("El registro de cheque no pertenece a la organización.")
+
+    locked_check = CheckReceiptRegister.objects.select_for_update().get(id=check_record.id, organization=organization)
+    if locked_check.status == CheckReceiptRegister.Status.CLEARED:
+        raise ValidationError("No se puede rechazar directamente un cheque que ya fue acreditado en banco (requiere proceso de contracargo/protesto).")
+    if locked_check.status == CheckReceiptRegister.Status.REJECTED:
+        raise ValidationError("Este cheque ya se encuentra marcado como rechazado.")
+
+    clean_reason = (reason or '').strip()
+    if not clean_reason:
+        raise ValidationError("Se requiere especificar el motivo del rechazo del cheque (ej: fondos insuficientes, firma disconforme).")
+
+    accounts_chart = ensure_default_chart_of_accounts(organization)
+    acc_cxc = get_required_accounting_account(accounts_chart, '1103-01', organization)
+    acc_checks = get_required_accounting_account(accounts_chart, '1101-02', organization)
+
+    entry = JournalEntry.objects.create(
+        organization=organization,
+        date=timezone.now().date(),
+        entry_type=JournalEntry.EntryType.ADJUSTMENT,
+        concept=f"Rechazo y Reversión Cheque {locked_check.check_number}: {clean_reason}",
+        reference=locked_check.check_number,
+        created_by=user,
+    )
+
+    # Débito a CxC (Reactivación de la cuenta por cobrar)
+    JournalEntryLine.objects.create(
+        organization=organization,
+        entry=entry,
+        account=acc_cxc,
+        concept=f"Reactivación CxC por Cheque Rechazado {locked_check.check_number}",
+        debit=locked_check.amount,
+        credit=Decimal('0.00'),
+    )
+
+    # Crédito a Cheques en Cartera (Baja del valor protestado)
+    JournalEntryLine.objects.create(
+        organization=organization,
+        entry=entry,
+        account=acc_checks,
+        concept=f"Baja por Rechazo de Cheque {locked_check.check_number}",
+        debit=Decimal('0.00'),
+        credit=locked_check.amount,
+    )
+    entry.verify_and_save_balance()
+
+    # Reactivar la deuda en la factura si existe
+    if locked_check.source_invoice_id:
+        locked_inv = Invoice.objects.select_for_update().get(id=locked_check.source_invoice_id, organization=organization)
+        locked_inv.amount_paid = max(Decimal('0.00'), locked_inv.amount_paid - locked_check.amount)
+        locked_inv.balance_due = max(Decimal('0.00'), locked_inv.net_receivable - locked_inv.amount_paid)
+        if locked_inv.balance_due == locked_inv.net_receivable:
+            locked_inv.status = Invoice.Status.ISSUED
+        else:
+            locked_inv.status = Invoice.Status.PARTIAL
+        locked_inv.save(update_fields=['amount_paid', 'balance_due', 'status', 'updated_at'])
+
+    locked_check.status = CheckReceiptRegister.Status.REJECTED
+    locked_check.rejection_reason = clean_reason
+    locked_check.clearing_journal_entry = entry
+    locked_check.save(update_fields=['status', 'rejection_reason', 'clearing_journal_entry', 'updated_at'])
+
+    return locked_check
 

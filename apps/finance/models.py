@@ -413,6 +413,9 @@ class FinancialTransaction(TenantScopedModel):
         BANK_TRANSFER = 'BANK_TRANSFER', 'Transferencia entre Cuentas Bancarias'
         CLIENT_COLLECTION = 'CLIENT_COLLECTION', 'Cobro de Factura a Cliente'
         VENDOR_DISBURSEMENT = 'VENDOR_DISBURSEMENT', 'Pago a Proveedor con Retenciones'
+        CARD_SETTLEMENT = 'CARD_SETTLEMENT', 'Liquidación de Lote de Tarjetas'
+        CHECK_CLEARING = 'CHECK_CLEARING', 'Compensación y Acreditación de Cheque'
+        CHECK_REJECTION = 'CHECK_REJECTION', 'Rechazo de Cheque'
 
     number = models.CharField(
         max_length=25,
@@ -630,6 +633,14 @@ class JournalEntry(TenantScopedModel):
         related_name='journal_entries',
         verbose_name="Egreso / Pago Fuente",
     )
+    source_card_settlement = models.ForeignKey(
+        'finance.CardBatchSettlement',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='journal_entries',
+        verbose_name="Liquidación de Tarjetas Fuente",
+    )
     total_debit = models.DecimalField(
         max_digits=14,
         decimal_places=2,
@@ -769,3 +780,260 @@ class JournalEntryLine(TenantScopedModel):
     def __str__(self) -> str:
         return f"{self.entry.number} · {self.account.code} | D:{self.debit} C:{self.credit}"
 
+
+class CardBatchSettlement(TenantScopedModel):
+    """
+    Liquidación y Conciliación de Lotes de Tarjetas de Crédito / Débito (Adquirente / BAC / Banpro / Red Enlace).
+    Concilia el importe bruto pendiente en cuenta transitoria (1101-03), deduce la comisión bancaria
+    y retenciones fiscales aplicables, y acredita los fondos netos líquidos en la cuenta bancaria.
+    """
+    class Status(models.TextChoices):
+        SETTLED = 'SETTLED', 'Liquidado y Acreditado'
+        VOID = 'VOID', 'Anulado'
+
+    settlement_number = models.CharField(
+        max_length=25,
+        db_index=True,
+        verbose_name="N° de Liquidación",
+        help_text="Folio secuencial de liquidación ej: LIQ-2026-0001",
+    )
+    bank_account = models.ForeignKey(
+        BankAccount,
+        on_delete=models.PROTECT,
+        related_name='card_settlements',
+        verbose_name="Cuenta Bancaria Destino",
+    )
+    batch_reference = models.CharField(
+        max_length=80,
+        verbose_name="N° de Lote / Terminal / Cierre Adquirente",
+        help_text="ej: LOTE-BAC-99823",
+    )
+    settlement_date = models.DateField(
+        default=timezone.now,
+        verbose_name="Fecha de Liquidación Bancaria",
+    )
+    currency = models.CharField(
+        max_length=10,
+        default='NIO',
+        verbose_name="Moneda",
+    )
+    gross_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        verbose_name="Monto Bruto Liquidado (C$)",
+        help_text="Monto total procesado en vouchers de tarjeta",
+    )
+    fee_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Comisión del Procesador / Adquirente (C$)",
+    )
+    tax_retention_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Retención Fiscal Aplicada (IR / IMI) (C$)",
+    )
+    net_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        verbose_name="Monto Neto Acreditado en Banco (C$)",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.SETTLED,
+        verbose_name="Estado de Liquidación",
+    )
+    idempotency_key = models.CharField(
+        max_length=120,
+        blank=True,
+        db_index=True,
+        verbose_name="Clave de Idempotencia",
+    )
+    notes = models.TextField(
+        blank=True,
+        verbose_name="Observaciones / Comprobante de Liquidación",
+    )
+    financial_transaction = models.ForeignKey(
+        FinancialTransaction,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='card_settlements',
+        verbose_name="Transacción Financiera Bancaria",
+    )
+    journal_entry = models.ForeignKey(
+        JournalEntry,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='card_settlements',
+        verbose_name="Póliza Contable de Liquidación",
+    )
+    performed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        verbose_name="Operador / Contador",
+    )
+
+    class Meta(TenantScopedModel.Meta):
+        verbose_name = "Liquidación de Lote de Tarjetas"
+        verbose_name_plural = "Liquidaciones de Lotes de Tarjetas"
+        ordering = ['-settlement_date', '-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'settlement_number'],
+                name='unique_card_settlement_number_per_tenant',
+            ),
+            models.UniqueConstraint(
+                fields=['organization', 'idempotency_key'],
+                condition=models.Q(idempotency_key__isnull=False) & ~models.Q(idempotency_key=''),
+                name='unique_card_settlement_idempotency_key',
+            ),
+            models.UniqueConstraint(
+                fields=['organization', 'bank_account', 'batch_reference'],
+                name='unique_bank_batch_reference_per_tenant',
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.settlement_number} · Lote {self.batch_reference} -> {self.bank_account.account_number} ({self.net_amount} {self.currency})"
+
+    def save(self, *args, **kwargs):
+        if not self.settlement_number and self.organization_id:
+            year = self.settlement_date.year if self.settlement_date else timezone.now().year
+            prefix = f"LIQ-{year}-"
+            count = CardBatchSettlement.objects.filter(
+                organization_id=self.organization_id,
+                settlement_number__startswith=prefix
+            ).count() + 1
+            candidate = f"{prefix}{count:04d}"
+            while CardBatchSettlement.objects.filter(
+                organization_id=self.organization_id, settlement_number=candidate
+            ).exists():
+                count += 1
+                candidate = f"{prefix}{count:04d}"
+            self.settlement_number = candidate
+        super().save(*args, **kwargs)
+
+
+class CheckReceiptRegister(TenantScopedModel):
+    """
+    Control y Custodia de Cheques Recibidos en Cartera / Mostrador.
+    Trazabilidad del ciclo de vida del cheque:
+    RECEPCIÓN (Caja) -> DEPÓSITO (Remesa bancaria) -> COMPENSACIÓN / ACREDITACIÓN (o RECHAZO).
+    """
+    class Status(models.TextChoices):
+        RECEIVED = 'RECEIVED', 'Recibido en Cartera / Custodia'
+        DEPOSITED = 'DEPOSITED', 'Depositado / En Compensación'
+        CLEARED = 'CLEARED', 'Compensado y Acreditado en Banco'
+        REJECTED = 'REJECTED', 'Rechazado / Rebotado'
+
+    check_number = models.CharField(
+        max_length=50,
+        db_index=True,
+        verbose_name="Número de Cheque",
+    )
+    drawer_bank = models.CharField(
+        max_length=80,
+        blank=True,
+        verbose_name="Banco Librador",
+        help_text="ej: BAC, Banpro, Lafise, etc.",
+    )
+    drawer_name = models.CharField(
+        max_length=150,
+        blank=True,
+        verbose_name="Librador / Titular de la Cuenta",
+    )
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        verbose_name="Monto del Cheque (C$)",
+    )
+    currency = models.CharField(
+        max_length=10,
+        default='NIO',
+        verbose_name="Moneda",
+    )
+    received_date = models.DateField(
+        default=timezone.now,
+        verbose_name="Fecha de Recepción",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.RECEIVED,
+        db_index=True,
+        verbose_name="Estado del Cheque",
+    )
+    payment_receipt = models.ForeignKey(
+        'billing.PaymentReceipt',
+        on_delete=models.CASCADE,
+        related_name='check_records',
+        verbose_name="Recibo de Cobro Asociado",
+    )
+    source_invoice = models.ForeignKey(
+        'billing.Invoice',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='check_records',
+        verbose_name="Factura Liquidada",
+    )
+    deposit_bank_account = models.ForeignKey(
+        BankAccount,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='deposited_checks',
+        verbose_name="Cuenta Bancaria de Depósito",
+    )
+    deposit_slip_number = models.CharField(
+        max_length=80,
+        blank=True,
+        verbose_name="N° Boleta / Minuta de Depósito",
+    )
+    cleared_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="Fecha y Hora de Acreditación",
+    )
+    rejection_reason = models.CharField(
+        max_length=255,
+        blank=True,
+        verbose_name="Motivo de Rechazo (si aplica)",
+    )
+    financial_transaction = models.ForeignKey(
+        FinancialTransaction,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='cleared_checks',
+        verbose_name="Transacción Financiera de Acreditación",
+    )
+    clearing_journal_entry = models.ForeignKey(
+        JournalEntry,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='check_entries',
+        verbose_name="Póliza Contable de Compensación o Reversión",
+    )
+    received_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='received_checks',
+        verbose_name="Cajero Receptor",
+    )
+
+    class Meta(TenantScopedModel.Meta):
+        verbose_name = "Cheque en Cartera"
+        verbose_name_plural = "Cheques en Cartera y Depósitos"
+        ordering = ['-received_date', '-created_at']
+
+    def __str__(self) -> str:
+        return f"{self.check_number} · {self.drawer_name} ({self.amount} {self.currency}) [{self.get_status_display()}]"

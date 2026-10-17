@@ -24,9 +24,11 @@ from apps.finance.models import (
     FinancialTransaction,
     JournalEntry,
     JournalEntryLine,
+    CheckReceiptRegister,
 )
 from apps.finance.services import (
     ensure_default_chart_of_accounts,
+    get_required_accounting_account,
     record_invoice_sales_journal_entry,
 )
 
@@ -192,21 +194,46 @@ def _execute_pos_sale_inner(
                 lifecycle_stage=Account.LifecycleStage.ACTIVE,
             )
 
-    # 3. Validación y bloqueo de cuenta bancaria según método de pago
-    is_bank_method = (
-        payment_method in [
+    # 3. Categorización estricta de medio de pago y validación defensiva de cuenta bancaria
+    m_str = str(payment_method or '').strip().upper()
+
+    is_cash = (
+        m_str == PaymentReceipt.PaymentMethod.CASH
+        or m_str in ['CASH', 'EFECTIVO']
+    )
+    is_transfer = (
+        m_str in [
             PaymentReceipt.PaymentMethod.TRANSFER_BAC,
             PaymentReceipt.PaymentMethod.TRANSFER_BANPRO,
             PaymentReceipt.PaymentMethod.TRANSFER_LAFISE,
             PaymentReceipt.PaymentMethod.TRANSFER_FICOHSA,
-            PaymentReceipt.PaymentMethod.CHECK,
         ]
-        or str(payment_method).upper().startswith('TRANSFER')
-        or str(payment_method).upper() in ['CARD', 'TARJETA', 'CHEQUE', 'CHECK']
+        or m_str.startswith('TRANSFER')
+    )
+    is_card = (
+        m_str in [PaymentReceipt.PaymentMethod.CARD, 'CARD', 'TARJETA', 'TARJETA_CREDITO', 'TARJETA_DEBITO']
+    )
+    is_check = (
+        m_str in [PaymentReceipt.PaymentMethod.CHECK, 'CHECK', 'CHEQUE']
     )
 
     locked_bank = None
-    if is_bank_method:
+    if is_transfer:
+        if not bank_account:
+            raise ValidationError("Las ventas cobradas mediante transferencia bancaria requieren una cuenta bancaria de destino explícita.")
+        if bank_account.organization_id != organization.id:
+            raise ValidationError("La cuenta bancaria no pertenece a la organización de la venta.")
+        if not bank_account.is_active:
+            raise ValidationError("La cuenta bancaria seleccionada se encuentra inactiva.")
+        locked_bank = BankAccount.objects.select_for_update().get(id=bank_account.id, organization=organization)
+    elif is_card or is_check:
+        # En cobros con tarjeta o cheque recibidos en mostrador, los fondos NO están acreditados en banco.
+        # Por tanto, no se bloquea ni se modifica BankAccount.current_balance en el momento de la venta.
+        locked_bank = None
+    elif is_cash:
+        locked_bank = None
+    else:
+        # Método no reconocido específicamente: si es bancario exige cuenta sin fallback .first()
         if bank_account:
             if bank_account.organization_id != organization.id:
                 raise ValidationError("La cuenta bancaria no pertenece a la organización de la venta.")
@@ -214,12 +241,9 @@ def _execute_pos_sale_inner(
                 raise ValidationError("La cuenta bancaria seleccionada se encuentra inactiva.")
             locked_bank = BankAccount.objects.select_for_update().get(id=bank_account.id, organization=organization)
         else:
-            locked_bank = BankAccount.objects.select_for_update().filter(
-                organization=organization,
-                is_active=True
-            ).first()
+            locked_bank = None
 
-    # Verificación de unicidad de referencia bancaria si se especificó
+    # Verificación de unicidad de referencia bancaria para transferencias confirmadas
     if clean_ref and locked_bank:
         existing_ref = PaymentReceipt.objects.filter(
             organization=organization,
@@ -466,12 +490,18 @@ def _execute_pos_sale_inner(
     else:
         amount_in_receipt_curr = invoice.net_receivable
 
+    receipt_method = PaymentReceipt.PaymentMethod.CARD if is_card else (
+        PaymentReceipt.PaymentMethod.CHECK if is_check else (
+            payment_method or PaymentReceipt.PaymentMethod.CASH
+        )
+    )
+
     receipt = PaymentReceipt.objects.create(
         organization=organization,
         invoice=invoice,
         bank_account=locked_bank,
         payment_date=timezone.now().date(),
-        payment_method=payment_method or PaymentReceipt.PaymentMethod.CASH,
+        payment_method=receipt_method,
         reference_number=ref_to_use,
         currency_paid=receipt_curr,
         amount_in_payment_currency=amount_in_receipt_curr,
@@ -481,9 +511,9 @@ def _execute_pos_sale_inner(
         notes=notes or "Cancelación total de contado en terminal de mostrador (POS)",
     )
 
-    # 9. Movimiento de Tesorería si es método bancario
+    # 9. Movimiento de Tesorería bancaria únicamente para transferencias confirmadas
     trx = None
-    if locked_bank:
+    if is_transfer and locked_bank:
         if locked_bank.currency == receipt_curr:
             bank_amt = amount_in_receipt_curr
         elif locked_bank.currency == 'NIO' and receipt_curr == 'USD':
@@ -506,6 +536,23 @@ def _execute_pos_sale_inner(
             reference_code=receipt.reference_number or receipt.number,
             performed_by=user,
         )
+    elif is_check:
+        # Registro en cartera y custodia física del cheque
+        check_record = CheckReceiptRegister.objects.create(
+            organization=organization,
+            check_number=clean_ref or f"CHK-{invoice.number}",
+            drawer_bank=(bank_account.bank_name if bank_account else ''),
+            drawer_name=invoice.account.commercial_name if invoice.account else 'Cliente Mostrador',
+            amount=amount_in_receipt_curr,
+            currency=receipt_curr,
+            received_date=receipt.payment_date,
+            status=CheckReceiptRegister.Status.RECEIVED,
+            payment_receipt=receipt,
+            source_invoice=invoice,
+            deposit_bank_account=bank_account if (bank_account and bank_account.organization_id == organization.id) else None,
+            received_by=user,
+        )
+        invoice.check_record = check_record
 
     # 10. Contabilizar Cobro en el Libro Diario (Póliza COLLECTIONS)
     rate_nio = invoice.exchange_rate if invoice.currency_code == 'USD' else Decimal('1.0')
@@ -529,7 +576,17 @@ def _execute_pos_sale_inner(
             created_by=user,
         )
 
-        acc_debit = accounts_chart['1102-01'] if locked_bank else accounts_chart['1101-01']
+        if is_transfer and locked_bank:
+            acc_debit = get_required_accounting_account(accounts_chart, '1102-01', organization)
+        elif is_card:
+            acc_debit = get_required_accounting_account(accounts_chart, '1101-03', organization)
+        elif is_check:
+            acc_debit = get_required_accounting_account(accounts_chart, '1101-02', organization)
+        else:
+            acc_debit = get_required_accounting_account(accounts_chart, '1101-01', organization)
+
+        acc_cxc = get_required_accounting_account(accounts_chart, '1103-01', organization)
+
         JournalEntryLine.objects.create(
             organization=organization,
             entry=collection_entry,
@@ -541,7 +598,7 @@ def _execute_pos_sale_inner(
         JournalEntryLine.objects.create(
             organization=organization,
             entry=collection_entry,
-            account=accounts_chart['1103-01'],
+            account=acc_cxc,
             concept=f"Abono CxC Factura Mostrador {invoice.number}",
             debit=Decimal('0.00'),
             credit=amt_nio,

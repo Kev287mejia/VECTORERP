@@ -91,3 +91,5 @@ htmlcov/
 .agents/
 .scratch/
 scratch/
+.worktrees/
+

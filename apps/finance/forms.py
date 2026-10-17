@@ -177,3 +177,42 @@ class PettyCashDisburseForm(forms.Form):
         super().__init__(*args, **kwargs)
         if organization:
             self.fields['bank_account'].queryset = BankAccount.objects.for_org(organization).filter(is_active=True)
+
+
+class BankStatementUploadForm(forms.Form):
+    """Formulario para carga y validación de extractos bancarios en CSV."""
+    bank_account = forms.ModelChoiceField(
+        queryset=BankAccount.objects.none(),
+        widget=forms.Select(attrs={'class': SELECT_BASE_CLS}),
+        label="Cuenta Bancaria Institucional"
+    )
+    file = forms.FileField(
+        widget=forms.FileInput(attrs={
+            'class': 'block w-full text-xs text-zinc-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-xs file:font-medium file:bg-zinc-900 file:text-white hover:file:bg-zinc-800 cursor-pointer',
+            'accept': '.csv,text/csv,text/plain'
+        }),
+        label="Archivo de Extracto Bancario (.csv)",
+        help_text="Formatos admitidos: CSV estándar (BAC, Banpro, Lafise, BDF, Ficohsa). Tamaño máx: 5MB."
+    )
+    initial_balance = forms.DecimalField(
+        required=False,
+        initial=Decimal('0.00'),
+        widget=forms.TextInput(attrs={'class': INPUT_MONO_CLS, 'placeholder': '0.00'}),
+        label="Saldo Inicial según Extracto (Opcional)"
+    )
+    final_balance = forms.DecimalField(
+        required=False,
+        initial=Decimal('0.00'),
+        widget=forms.TextInput(attrs={'class': INPUT_MONO_CLS, 'placeholder': '0.00'}),
+        label="Saldo Final según Extracto (Opcional)"
+    )
+    notes = forms.CharField(
+        required=False,
+        widget=forms.TextInput(attrs={'class': INPUT_BASE_CLS, 'placeholder': 'ej: Extracto Mensual Cuentas Corrientes'}),
+        label="Notas / Memo del Lote"
+    )
+
+    def __init__(self, *args, organization=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if organization:
+            self.fields['bank_account'].queryset = BankAccount.objects.for_org(organization).filter(is_active=True)

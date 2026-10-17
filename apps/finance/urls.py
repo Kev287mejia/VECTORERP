@@ -26,4 +26,12 @@ urlpatterns = [
     # Consola Tributaria DGI Nicaragua y Exportación VET
     path('dgi-vet/', views.DgiTaxConsoleView.as_view(), name='dgi_vet'),
     path('dgi-vet/export-csv/', views.DgiVetCsvExportView.as_view(), name='dgi_vet_export_csv'),
+
+    # Conciliación Bancaria y Trazabilidad de Extractos (Fase 1C.5.1)
+    path('reconciliation/', views.BankReconciliationDashboardView.as_view(), name='reconciliation_dashboard'),
+    path('reconciliation/import/', views.BankStatementImportView.as_view(), name='statement_import'),
+    path('reconciliation/statements/<uuid:pk>/', views.BankStatementDetailView.as_view(), name='statement_detail'),
+    path('reconciliation/matches/confirm/', views.BankReconciliationConfirmMatchView.as_view(), name='match_confirm'),
+    path('reconciliation/matches/undo/', views.BankReconciliationUndoMatchView.as_view(), name='match_undo'),
+    path('reconciliation/statements/<uuid:pk>/auto-match/', views.BankReconciliationAutoMatchView.as_view(), name='auto_match'),
 ]

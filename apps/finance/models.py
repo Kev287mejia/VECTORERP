@@ -505,6 +505,14 @@ class FinancialTransaction(TenantScopedModel):
     def delete(self, *args, **kwargs):
         raise ValidationError("El registro de auditoría financiera es inmutable. Prohibido eliminar transacciones históricas.")
 
+    @property
+    def is_reconciled(self) -> bool:
+        """Indica si la transacción fue conciliada con una línea de extracto bancario."""
+        try:
+            return self.reconciliation_match is not None
+        except Exception:
+            return False
+
 
 class AccountingAccount(TenantScopedModel):
     """
@@ -1037,3 +1045,286 @@ class CheckReceiptRegister(TenantScopedModel):
 
     def __str__(self) -> str:
         return f"{self.check_number} · {self.drawer_name} ({self.amount} {self.currency}) [{self.get_status_display()}]"
+
+
+class BankStatement(TenantScopedModel):
+    """
+    Lote de Extracto Bancario importado para una cuenta bancaria (BAC, Banpro, Lafise, BDF, Ficohsa).
+    Permite contrastar los movimientos del banco contra el libro mayor de tesorería del ERP.
+    """
+    class Status(models.TextChoices):
+        IMPORTED = 'IMPORTED', 'Importado'
+        IN_PROGRESS = 'IN_PROGRESS', 'En Proceso de Conciliación'
+        RECONCILED = 'RECONCILED', 'Conciliado'
+        ARCHIVED = 'ARCHIVED', 'Archivado'
+
+    statement_number = models.CharField(
+        max_length=30,
+        db_index=True,
+        blank=True,
+        verbose_name="Folio de Extracto",
+        help_text="ej: EXT-2026-0001",
+    )
+    bank_account = models.ForeignKey(
+        BankAccount,
+        on_delete=models.PROTECT,
+        related_name='bank_statements',
+        verbose_name="Cuenta Bancaria",
+    )
+    file_name = models.CharField(
+        max_length=255,
+        verbose_name="Nombre del Archivo",
+    )
+    file_hash = models.CharField(
+        max_length=64,
+        db_index=True,
+        verbose_name="Hash SHA-256 del Archivo",
+    )
+    period_start = models.DateField(
+        null=True,
+        blank=True,
+        verbose_name="Inicio de Periodo",
+    )
+    period_end = models.DateField(
+        null=True,
+        blank=True,
+        verbose_name="Fin de Periodo",
+    )
+    initial_balance = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Saldo Inicial del Extracto",
+    )
+    final_balance = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Saldo Final del Extracto",
+    )
+    total_lines = models.PositiveIntegerField(
+        default=0,
+        verbose_name="Total de Líneas",
+    )
+    total_debits = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Total Cargos / Débitos",
+    )
+    total_credits = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        verbose_name="Total Abonos / Créditos",
+    )
+    status = models.CharField(
+        max_length=25,
+        choices=Status.choices,
+        default=Status.IMPORTED,
+        db_index=True,
+        verbose_name="Estado de Conciliación",
+    )
+    imported_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='imported_bank_statements',
+        verbose_name="Importado por",
+    )
+    notes = models.TextField(
+        blank=True,
+        verbose_name="Notas de Conciliación",
+    )
+
+    class Meta(TenantScopedModel.Meta):
+        verbose_name = "Extracto Bancario"
+        verbose_name_plural = "Extractos Bancarios"
+        ordering = ['-period_end', '-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'bank_account', 'file_hash'],
+                name='unique_bank_statement_file_per_account',
+            ),
+            models.UniqueConstraint(
+                fields=['organization', 'statement_number'],
+                name='unique_bank_statement_number_per_tenant',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.statement_number and self.organization_id:
+            year = self.period_end.year if self.period_end else timezone.now().year
+            prefix = f"EXT-{year}-"
+            count = BankStatement.objects.filter(
+                organization_id=self.organization_id,
+                statement_number__startswith=prefix
+            ).count() + 1
+            candidate = f"{prefix}{count:04d}"
+            while BankStatement.objects.filter(organization_id=self.organization_id, statement_number=candidate).exists():
+                count += 1
+                candidate = f"{prefix}{count:04d}"
+            self.statement_number = candidate
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return f"{self.statement_number} · {self.bank_account} ({self.file_name}) [{self.get_status_display()}]"
+
+
+class BankStatementLine(TenantScopedModel):
+    """
+    Línea individual de un extracto bancario importado.
+    Representa un movimiento asentado por la institución financiera (débito/cargo o crédito/abono).
+    """
+    class MovementType(models.TextChoices):
+        DEBIT = 'DEBIT', 'Cargo / Débito (Salida del Banco)'
+        CREDIT = 'CREDIT', 'Abono / Crédito (Entrada al Banco)'
+
+    class LineStatus(models.TextChoices):
+        UNRECONCILED = 'UNRECONCILED', 'Pendiente de Conciliación'
+        RECONCILED = 'RECONCILED', 'Conciliado'
+        DISCREPANCY = 'DISCREPANCY', 'Con Discrepancia'
+        IGNORED = 'IGNORED', 'Ignorado / Excluido'
+
+    statement = models.ForeignKey(
+        BankStatement,
+        on_delete=models.CASCADE,
+        related_name='lines',
+        verbose_name="Extracto Bancario",
+    )
+    bank_account = models.ForeignKey(
+        BankAccount,
+        on_delete=models.PROTECT,
+        related_name='statement_lines',
+        verbose_name="Cuenta Bancaria",
+    )
+    line_number = models.PositiveIntegerField(
+        verbose_name="N° Línea",
+    )
+    post_date = models.DateField(
+        db_index=True,
+        verbose_name="Fecha de Operación",
+    )
+    value_date = models.DateField(
+        null=True,
+        blank=True,
+        verbose_name="Fecha Valor",
+    )
+    movement_type = models.CharField(
+        max_length=10,
+        choices=MovementType.choices,
+        verbose_name="Tipo de Movimiento",
+    )
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        verbose_name="Importe",
+    )
+    currency = models.CharField(
+        max_length=10,
+        default='NIO',
+        verbose_name="Moneda",
+    )
+    reference = models.CharField(
+        max_length=100,
+        blank=True,
+        db_index=True,
+        verbose_name="Referencia Bancaria",
+    )
+    description = models.CharField(
+        max_length=255,
+        verbose_name="Descripción / Concepto Bancario",
+    )
+    line_hash = models.CharField(
+        max_length=64,
+        db_index=True,
+        verbose_name="Hash Único de Línea",
+    )
+    status = models.CharField(
+        max_length=25,
+        choices=LineStatus.choices,
+        default=LineStatus.UNRECONCILED,
+        db_index=True,
+        verbose_name="Estado",
+    )
+    matched_transaction = models.OneToOneField(
+        FinancialTransaction,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='reconciled_statement_line',
+        verbose_name="Transacción ERP Conciliada",
+    )
+
+    class Meta(TenantScopedModel.Meta):
+        verbose_name = "Línea de Extracto Bancario"
+        verbose_name_plural = "Líneas de Extractos Bancarios"
+        ordering = ['post_date', 'line_number']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['statement', 'line_number'],
+                name='unique_statement_line_number',
+            ),
+            models.UniqueConstraint(
+                fields=['organization', 'bank_account', 'line_hash'],
+                name='unique_statement_line_hash_per_account',
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"Línea {self.line_number} [{self.post_date}] {self.get_movement_type_display()}: {self.amount} {self.currency} - {self.description[:30]}"
+
+
+class BankReconciliationMatch(TenantScopedModel):
+    """
+    Registro de Conciliación y Emparejamiento entre una línea de extracto bancario y una transacción ERP.
+    Garantiza trazabilidad de auditoría, usuario responsable y previene emparejamientos dobles.
+    """
+    class MatchType(models.TextChoices):
+        EXACT = 'EXACT', 'Coincidencia Exacta'
+        MANUAL = 'MANUAL', 'Coincidencia Manual / Revisada'
+
+    statement_line = models.OneToOneField(
+        BankStatementLine,
+        on_delete=models.CASCADE,
+        related_name='reconciliation_match',
+        verbose_name="Línea de Extracto",
+    )
+    financial_transaction = models.OneToOneField(
+        FinancialTransaction,
+        on_delete=models.PROTECT,
+        related_name='reconciliation_match',
+        verbose_name="Transacción Financiera ERP",
+    )
+    match_type = models.CharField(
+        max_length=20,
+        choices=MatchType.choices,
+        default=MatchType.EXACT,
+        verbose_name="Tipo de Coincidencia",
+    )
+    reconciled_at = models.DateTimeField(
+        default=timezone.now,
+        verbose_name="Fecha y Hora de Conciliación",
+    )
+    reconciled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='confirmed_reconciliations',
+        verbose_name="Conciliado por",
+    )
+    notes = models.CharField(
+        max_length=255,
+        blank=True,
+        verbose_name="Notas de Conciliación",
+    )
+
+    class Meta(TenantScopedModel.Meta):
+        verbose_name = "Conciliación Bancaria (Emparejamiento)"
+        verbose_name_plural = "Conciliaciones Bancarias (Emparejamientos)"
+        ordering = ['-reconciled_at']
+
+    def __str__(self) -> str:
+        return f"Match [{self.get_match_type_display()}]: Line {self.statement_line_id} <-> TRX {self.financial_transaction.number}"

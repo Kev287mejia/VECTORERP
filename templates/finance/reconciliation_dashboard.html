@@ -1,0 +1,322 @@
+{% extends "layouts/base_erp.html" %}
+
+{% block title %}Conciliación bancaria · Finanzas{% endblock %}
+{% block breadcrumb_section %}Finanzas{% endblock %}
+{% block breadcrumb_page %}Conciliación bancaria{% endblock %}
+{% block page_title %}Conciliación bancaria y extractos{% endblock %}
+
+{% block page_actions %}
+<div class="flex items-center gap-2" x-data>
+    <a href="{% url 'finance:dashboard' %}" 
+       class="h-8 px-3 bg-white border border-zinc-200 hover:bg-zinc-50 text-zinc-700 text-xs font-medium rounded-md transition-colors flex items-center gap-1.5 cursor-pointer">
+        <svg class="w-3.5 h-3.5 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18"/>
+        </svg>
+        <span>Volver a tesorería</span>
+    </a>
+    <button type="button" 
+            onclick="document.getElementById('import-statement-modal').classList.remove('hidden')"
+            class="h-8 px-3 bg-zinc-900 hover:bg-zinc-800 text-white text-xs font-medium rounded-md transition-colors flex items-center gap-1.5 cursor-pointer">
+        <svg class="w-3.5 h-3.5 text-zinc-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
+        </svg>
+        <span>Importar extracto bancario</span>
+    </button>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+
+    <!-- MENSAJES DE ESTADO -->
+    {% if messages %}
+    <div class="space-y-2">
+        {% for message in messages %}
+        <div class="p-3 text-xs rounded-md border flex items-center justify-between {% if message.tags == 'success' %}bg-emerald-50 border-emerald-200 text-emerald-800{% elif message.tags == 'error' %}bg-rose-50 border-rose-200 text-rose-800{% else %}bg-blue-50 border-blue-200 text-blue-800{% endif %}">
+            <span>{{ message }}</span>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- 1. RESUMEN DE CUENTAS BANCARIAS -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {% for item in account_summaries %}
+        <div class="bg-white border border-zinc-200 rounded-[4px] p-4 shadow-xs">
+            <div class="flex items-center justify-between border-b border-zinc-100 pb-2 mb-3">
+                <span class="text-xs font-mono font-bold text-zinc-900 tracking-wide uppercase">
+                    {{ item.bank_account.get_bank_name_display }}
+                </span>
+                <span class="text-[11px] font-mono font-medium px-2 py-0.5 rounded bg-zinc-100 text-zinc-600">
+                    {{ item.bank_account.currency }}
+                </span>
+            </div>
+            <div class="space-y-1.5 font-mono text-xs">
+                <div class="flex justify-between text-zinc-500">
+                    <span>N° Cuenta:</span>
+                    <span class="text-zinc-900 font-semibold">{{ item.bank_account.account_number }}</span>
+                </div>
+                <div class="flex justify-between text-zinc-500">
+                    <span>Saldo Contable (Libros):</span>
+                    <span class="text-zinc-900 font-bold">{{ item.bank_account.currency }} {{ item.bank_account.current_balance|floatformat:2 }}</span>
+                </div>
+                <div class="flex justify-between text-zinc-500">
+                    <span>Último Extracto:</span>
+                    <span class="text-zinc-700">
+                        {% if item.latest_statement %}
+                            {{ item.latest_statement.statement_number }} ({{ item.latest_statement.period_end }})
+                        {% else %}
+                            <em class="text-zinc-400">Sin extractos</em>
+                        {% endif %}
+                    </span>
+                </div>
+                <div class="pt-2 border-t border-zinc-100 flex justify-between text-[11px]">
+                    <span class="text-amber-700 font-medium">Líneas extracto pdtes: {{ item.unreconciled_lines_count }}</span>
+                    <span class="text-blue-700 font-medium">TRX ERP en tránsito: {{ item.unreconciled_tx_count }}</span>
+                </div>
+            </div>
+        </div>
+        {% empty %}
+        <div class="col-span-3 p-8 bg-white border border-zinc-200 rounded text-center text-zinc-400 text-xs">
+            No hay cuentas bancarias activas registradas en la organización.
+        </div>
+        {% endfor %}
+    </div>
+
+    <!-- 2. LOTES DE EXTRACTOS IMPORTADOS -->
+    <div class="bg-white border border-zinc-200 rounded-[4px] overflow-hidden">
+        <div class="p-3 border-b border-zinc-200 bg-zinc-50/50 flex items-center justify-between">
+            <div>
+                <span class="text-xs font-mono font-semibold text-zinc-900 uppercase tracking-wider block">
+                    Extractos bancarios importados
+                </span>
+                <span class="text-[11px] font-mono text-zinc-500 block">
+                    Historial de lotes de movimientos bancarios y estado de conciliación
+                </span>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-xs font-mono">
+                <thead>
+                    <tr class="border-b border-zinc-200 bg-zinc-50/30 text-zinc-500 text-[11px]">
+                        <th class="p-2.5">Folio</th>
+                        <th class="p-2.5">Cuenta Bancaria</th>
+                        <th class="p-2.5">Archivo</th>
+                        <th class="p-2.5">Periodo</th>
+                        <th class="p-2.5 text-center">Líneas</th>
+                        <th class="p-2.5 text-right">Abonos (Créditos)</th>
+                        <th class="p-2.5 text-right">Cargos (Débitos)</th>
+                        <th class="p-2.5 text-center">Estado</th>
+                        <th class="p-2.5 text-center">Acciones</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-zinc-200/60">
+                    {% for stmt in statements %}
+                    <tr class="hover:bg-zinc-50/50 transition-colors">
+                        <td class="p-2.5 font-bold text-zinc-900">
+                            <a href="{% url 'finance:statement_detail' stmt.pk %}" class="hover:underline text-zinc-900">
+                                {{ stmt.statement_number }}
+                            </a>
+                        </td>
+                        <td class="p-2.5 text-zinc-700">
+                            {{ stmt.bank_account.get_bank_name_display }} · {{ stmt.bank_account.account_number }}
+                        </td>
+                        <td class="p-2.5 text-zinc-600 truncate max-w-xs" title="{{ stmt.file_name }}">
+                            {{ stmt.file_name }}
+                        </td>
+                        <td class="p-2.5 text-zinc-600 text-[11px]">
+                            {{ stmt.period_start|default:"-" }} al {{ stmt.period_end|default:"-" }}
+                        </td>
+                        <td class="p-2.5 text-center text-zinc-900 font-semibold">
+                            {{ stmt.total_lines }}
+                        </td>
+                        <td class="p-2.5 text-right font-medium text-emerald-700">
+                            +{{ stmt.total_credits|floatformat:2 }} {{ stmt.bank_account.currency }}
+                        </td>
+                        <td class="p-2.5 text-right font-medium text-rose-700">
+                            -{{ stmt.total_debits|floatformat:2 }} {{ stmt.bank_account.currency }}
+                        </td>
+                        <td class="p-2.5 text-center">
+                            {% if stmt.status == 'RECONCILED' %}
+                                <span class="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800">CONCILIADO</span>
+                            {% elif stmt.status == 'IN_PROGRESS' %}
+                                <span class="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800">EN PROCESO</span>
+                            {% else %}
+                                <span class="px-2 py-0.5 rounded text-[10px] font-bold bg-zinc-100 text-zinc-700">IMPORTADO</span>
+                            {% endif %}
+                        </td>
+                        <td class="p-2.5 text-center">
+                            <a href="{% url 'finance:statement_detail' stmt.pk %}" 
+                               class="px-2.5 py-1 bg-zinc-900 hover:bg-zinc-800 text-white rounded-[3px] text-[11px] font-medium transition-colors">
+                                Auditar / Conciliar &rarr;
+                            </a>
+                        </td>
+                    </tr>
+                    {% empty %}
+                    <tr>
+                        <td colspan="9" class="p-8 text-center text-zinc-400 font-sans">
+                            No se han importado extractos bancarios en la organización.
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- 3. HISTORIAL DE CONCILIACIONES CONFIRMADAS -->
+    <div class="bg-white border border-zinc-200 rounded-[4px] overflow-hidden">
+        <div class="p-3 border-b border-zinc-200 bg-zinc-50/50 flex items-center justify-between">
+            <div>
+                <span class="text-xs font-mono font-semibold text-zinc-900 uppercase tracking-wider block">
+                    Conciliaciones confirmadas recientes
+                </span>
+                <span class="text-[11px] font-mono text-zinc-500 block">
+                    Trazabilidad de auditoría de emparejamientos y reversiones
+                </span>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-xs font-mono">
+                <thead>
+                    <tr class="border-b border-zinc-200 bg-zinc-50/30 text-zinc-500 text-[11px]">
+                        <th class="p-2.5">Fecha Concil.</th>
+                        <th class="p-2.5">Cuenta</th>
+                        <th class="p-2.5">Línea Extracto (Banco)</th>
+                        <th class="p-2.5">Transacción ERP</th>
+                        <th class="p-2.5 text-right">Importe</th>
+                        <th class="p-2.5 text-center">Tipo</th>
+                        <th class="p-2.5">Operador</th>
+                        <th class="p-2.5 text-center">Acción</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-zinc-200/60">
+                    {% for m in recent_matches %}
+                    <tr class="hover:bg-zinc-50/50 transition-colors">
+                        <td class="p-2.5 text-zinc-600 text-[11px]">
+                            {{ m.reconciled_at|date:"Y-m-d H:i" }}
+                        </td>
+                        <td class="p-2.5 text-zinc-800">
+                            {{ m.statement_line.bank_account.get_bank_name_display }}
+                        </td>
+                        <td class="p-2.5 text-zinc-900">
+                            <span class="font-bold">{{ m.statement_line.post_date }}</span> · {{ m.statement_line.description|truncatechars:35 }} (Ref: {{ m.statement_line.reference|default:"-" }})
+                        </td>
+                        <td class="p-2.5 text-zinc-900">
+                            <span class="font-bold">{{ m.financial_transaction.number }}</span> · {{ m.financial_transaction.get_transaction_type_display }}
+                        </td>
+                        <td class="p-2.5 text-right font-bold text-zinc-900">
+                            {{ m.statement_line.currency }} {{ m.statement_line.amount|floatformat:2 }}
+                        </td>
+                        <td class="p-2.5 text-center">
+                            <span class="px-2 py-0.5 rounded text-[10px] font-semibold {% if m.match_type == 'EXACT' %}bg-emerald-50 text-emerald-800 border border-emerald-200{% else %}bg-blue-50 text-blue-800 border border-blue-200{% endif %}">
+                                {{ m.get_match_type_display }}
+                            </span>
+                        </td>
+                        <td class="p-2.5 text-zinc-600 text-[11px]">
+                            {{ m.reconciled_by.get_full_name|default:m.reconciled_by.email }}
+                        </td>
+                        <td class="p-2.5 text-center">
+                            <form method="post" action="{% url 'finance:match_undo' %}" onsubmit="return confirm('¿Está seguro de revertir esta conciliación? Los movimientos volverán a quedar pendientes.');">
+                                {% csrf_token %}
+                                <input type="hidden" name="match_id" value="{{ m.id }}">
+                                <button type="submit" class="px-2 py-1 text-[10px] font-medium text-rose-700 bg-rose-50 hover:bg-rose-100 rounded border border-rose-200 transition-colors cursor-pointer">
+                                    Deshacer
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% empty %}
+                    <tr>
+                        <td colspan="8" class="p-8 text-center text-zinc-400 font-sans">
+                            No hay conciliaciones confirmadas registradas en el histórico reciente.
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- MODAL: IMPORTAR EXTRACTO BANCARIO -->
+<div id="import-statement-modal" class="hidden fixed inset-0 z-50 overflow-y-auto bg-black/40 backdrop-blur-xs flex items-center justify-center p-4">
+    <div class="bg-white border border-zinc-200 rounded-[6px] shadow-xl w-full max-w-xl p-6 relative">
+        <div class="flex items-center justify-between border-b border-zinc-100 pb-3 mb-4">
+            <div>
+                <h3 class="text-sm font-mono font-bold text-zinc-900 uppercase">Importar extracto bancario</h3>
+                <p class="text-[11px] text-zinc-500 font-sans mt-0.5">Soporte nativo para formatos CSV de BAC, Banpro, Lafise, BDF y Ficohsa.</p>
+            </div>
+            <button type="button" 
+                    onclick="document.getElementById('import-statement-modal').classList.add('hidden')"
+                    class="text-zinc-400 hover:text-zinc-600 text-lg leading-none cursor-pointer">
+                &times;
+            </button>
+        </div>
+
+        <form method="post" action="{% url 'finance:statement_import' %}" enctype="multipart/form-data" class="space-y-4">
+            {% csrf_token %}
+
+            <div>
+                <label class="block text-xs font-mono font-medium text-zinc-700 mb-1">
+                    Cuenta Bancaria Destino *
+                </label>
+                {{ upload_form.bank_account }}
+            </div>
+
+            <div>
+                <label class="block text-xs font-mono font-medium text-zinc-700 mb-1">
+                    Archivo de Extracto (.CSV) *
+                </label>
+                {{ upload_form.file }}
+                <p class="text-[11px] text-zinc-500 mt-1 font-sans">
+                    Columnas admitidas: <code>fecha</code>, <code>descripcion</code>, <code>referencia</code>, <code>monto</code> y <code>tipo</code> (o columnas separadas <code>debito</code> y <code>credito</code>).
+                </p>
+            </div>
+
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-xs font-mono font-medium text-zinc-700 mb-1">
+                        Saldo Inicial en Extracto (Opcional)
+                    </label>
+                    {{ upload_form.initial_balance }}
+                </div>
+                <div>
+                    <label class="block text-xs font-mono font-medium text-zinc-700 mb-1">
+                        Saldo Final en Extracto (Opcional)
+                    </label>
+                    {{ upload_form.final_balance }}
+                </div>
+            </div>
+
+            <div>
+                <label class="block text-xs font-mono font-medium text-zinc-700 mb-1">
+                    Notas de Conciliación
+                </label>
+                {{ upload_form.notes }}
+            </div>
+
+            <div class="p-3 bg-zinc-50 border border-zinc-200 rounded text-[11px] text-zinc-600 space-y-1 font-sans">
+                <p class="font-bold text-zinc-800 font-mono">Garantías de Integridad Financiera:</p>
+                <ul class="list-disc list-inside space-y-0.5">
+                    <li>La importación de extractos <strong>NO modifica el saldo bancario</strong> del ERP.</li>
+                    <li>Detección automática de duplicados para evitar reimportaciones accidentales.</li>
+                    <li>Aislamiento estricto por empresa (multi-tenant).</li>
+                </ul>
+            </div>
+
+            <div class="flex items-center justify-end gap-2 pt-3 border-t border-zinc-100">
+                <button type="button" 
+                        onclick="document.getElementById('import-statement-modal').classList.add('hidden')"
+                        class="px-4 py-2 border border-zinc-200 text-zinc-700 text-xs font-medium rounded hover:bg-zinc-50 cursor-pointer">
+                    Cancelar
+                </button>
+                <button type="submit" 
+                        class="px-4 py-2 bg-zinc-900 hover:bg-zinc-800 text-white text-xs font-medium rounded transition-colors cursor-pointer">
+                    Subir y procesar extracto
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}

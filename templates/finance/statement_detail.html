@@ -1,0 +1,424 @@
+{% extends "layouts/base_erp.html" %}
+
+{% block title %}Extracto {{ statement.statement_number }} · Conciliación{% endblock %}
+{% block breadcrumb_section %}Finanzas{% endblock %}
+{% block breadcrumb_page %}Conciliación bancaria{% endblock %}
+{% block page_title %}Extracto {{ statement.statement_number }}{% endblock %}
+
+{% block page_actions %}
+<div class="flex items-center gap-2">
+    <a href="{% url 'finance:reconciliation_dashboard' %}" 
+       class="h-8 px-3 bg-white border border-zinc-200 hover:bg-zinc-50 text-zinc-700 text-xs font-medium rounded-md transition-colors flex items-center gap-1.5 cursor-pointer">
+        <svg class="w-3.5 h-3.5 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18"/>
+        </svg>
+        <span>Volver a consola</span>
+    </a>
+    {% if matching_report.exact_matches %}
+    <form method="post" action="{% url 'finance:auto_match' statement.pk %}" onsubmit="return confirm('¿Desea conciliar automáticamente todas las coincidencias exactas comprobadas?');">
+        {% csrf_token %}
+        <button type="submit" 
+                class="h-8 px-3 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-medium rounded-md transition-colors flex items-center gap-1.5 cursor-pointer">
+            <svg class="w-3.5 h-3.5 text-emerald-200" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5"/>
+            </svg>
+            <span>Auto-conciliar exactas ({{ matching_report.exact_matches|length }})</span>
+        </button>
+    </form>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+
+    <!-- MENSAJES DE ESTADO -->
+    {% if messages %}
+    <div class="space-y-2">
+        {% for message in messages %}
+        <div class="p-3 text-xs rounded-md border flex items-center justify-between {% if message.tags == 'success' %}bg-emerald-50 border-emerald-200 text-emerald-800{% elif message.tags == 'error' %}bg-rose-50 border-rose-200 text-rose-800{% else %}bg-blue-50 border-blue-200 text-blue-800{% endif %}">
+            <span>{{ message }}</span>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- 1. ENCABEZADO Y BALANCE DEL EXTRACTO -->
+    <div class="bg-white border border-zinc-200 rounded-[4px] p-4 shadow-xs">
+        <div class="flex flex-wrap items-center justify-between gap-4 border-b border-zinc-100 pb-3 mb-3">
+            <div>
+                <span class="text-xs font-mono font-bold text-zinc-900 tracking-wide uppercase block">
+                    {{ statement.bank_account.get_bank_name_display }} · {{ statement.bank_account.account_number }} [{{ statement.bank_account.currency }}]
+                </span>
+                <span class="text-[11px] font-mono text-zinc-500 block">
+                    Archivo: <strong>{{ statement.file_name }}</strong> · Periodo: {{ statement.period_start|default:"-" }} al {{ statement.period_end|default:"-" }}
+                </span>
+            </div>
+            <div>
+                {% if statement.status == 'RECONCILED' %}
+                    <span class="px-2.5 py-1 rounded text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">TOTALMENTE CONCILIADO</span>
+                {% elif statement.status == 'IN_PROGRESS' %}
+                    <span class="px-2.5 py-1 rounded text-xs font-bold bg-amber-100 text-amber-800 border border-amber-200">CONCILIACIÓN EN PROCESO</span>
+                {% else %}
+                    <span class="px-2.5 py-1 rounded text-xs font-bold bg-zinc-100 text-zinc-700 border border-zinc-200">PENDIENTE DE REVISIÓN</span>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3 font-mono text-xs">
+            <div class="bg-zinc-50/70 p-2.5 rounded border border-zinc-100">
+                <span class="text-[10px] text-zinc-500 uppercase block">Saldo Inicial Extracto</span>
+                <span class="font-bold text-zinc-800">{{ statement.bank_account.currency }} {{ statement.initial_balance|floatformat:2 }}</span>
+            </div>
+            <div class="bg-zinc-50/70 p-2.5 rounded border border-zinc-100">
+                <span class="text-[10px] text-zinc-500 uppercase block">Saldo Final Extracto</span>
+                <span class="font-bold text-zinc-800">{{ statement.bank_account.currency }} {{ statement.final_balance|floatformat:2 }}</span>
+            </div>
+            <div class="bg-emerald-50/40 p-2.5 rounded border border-emerald-100">
+                <span class="text-[10px] text-emerald-700 uppercase block">Total Abonos (+Créditos)</span>
+                <span class="font-bold text-emerald-800">+{{ statement.total_credits|floatformat:2 }}</span>
+            </div>
+            <div class="bg-rose-50/40 p-2.5 rounded border border-rose-100">
+                <span class="text-[10px] text-rose-700 uppercase block">Total Cargos (-Débitos)</span>
+                <span class="font-bold text-rose-800">-{{ statement.total_debits|floatformat:2 }}</span>
+            </div>
+            <div class="bg-zinc-50/70 p-2.5 rounded border border-zinc-100">
+                <span class="text-[10px] text-zinc-500 uppercase block">Saldo en Libros ERP</span>
+                <span class="font-bold text-zinc-900">{{ statement.bank_account.currency }} {{ statement.bank_account.current_balance|floatformat:2 }}</span>
+            </div>
+            <div class="bg-zinc-50/70 p-2.5 rounded border border-zinc-100">
+                <span class="text-[10px] text-zinc-500 uppercase block">Movimientos en Lote</span>
+                <span class="font-bold text-zinc-900">{{ statement.total_lines }} líneas</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 2. COINCIDENCIAS EXACTAS PROPUESTAS -->
+    {% if matching_report.exact_matches %}
+    <div class="bg-white border border-emerald-200 rounded-[4px] overflow-hidden shadow-xs">
+        <div class="p-3 border-b border-emerald-100 bg-emerald-50/40 flex items-center justify-between">
+            <div>
+                <span class="text-xs font-mono font-bold text-emerald-950 uppercase tracking-wider block">
+                    ✓ Coincidencias exactas comprobadas ({{ matching_report.exact_matches|length }})
+                </span>
+                <span class="text-[11px] font-mono text-emerald-700 block">
+                    Monto, sentido bancario, referencia y fecha coinciden de manera unívoca
+                </span>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-xs font-mono">
+                <thead>
+                    <tr class="border-b border-emerald-100 bg-emerald-50/20 text-emerald-800 text-[11px]">
+                        <th class="p-2.5">Línea Extracto (Banco)</th>
+                        <th class="p-2.5">Ref. Banco</th>
+                        <th class="p-2.5">Transacción ERP</th>
+                        <th class="p-2.5">Ref. ERP</th>
+                        <th class="p-2.5 text-right">Importe</th>
+                        <th class="p-2.5 text-center">Acción</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-emerald-100">
+                    {% for item in matching_report.exact_matches %}
+                    <tr class="hover:bg-emerald-50/30 transition-colors">
+                        <td class="p-2.5">
+                            <span class="font-bold">#{{ item.statement_line.line_number }} · {{ item.statement_line.post_date }}</span>
+                            <div class="text-[11px] text-zinc-600 truncate max-w-xs">{{ item.statement_line.description }}</div>
+                        </td>
+                        <td class="p-2.5 text-zinc-700">
+                            {{ item.statement_line.reference|default:"-" }}
+                        </td>
+                        <td class="p-2.5">
+                            <span class="font-bold text-zinc-900">{{ item.financial_transaction.number }}</span>
+                            <div class="text-[11px] text-zinc-600">{{ item.financial_transaction.get_transaction_type_display }} ({{ item.financial_transaction.created_at|date:"Y-m-d" }})</div>
+                        </td>
+                        <td class="p-2.5 text-zinc-700">
+                            {{ item.financial_transaction.reference_code|default:"-" }}
+                        </td>
+                        <td class="p-2.5 text-right font-bold {% if item.statement_line.movement_type == 'CREDIT' %}text-emerald-700{% else %}text-rose-700{% endif %}">
+                            {% if item.statement_line.movement_type == 'CREDIT' %}+{% else %}-{% endif %}{{ item.statement_line.amount|floatformat:2 }}
+                        </td>
+                        <td class="p-2.5 text-center">
+                            <form method="post" action="{% url 'finance:match_confirm' %}">
+                                {% csrf_token %}
+                                <input type="hidden" name="statement_line_id" value="{{ item.statement_line.id }}">
+                                <input type="hidden" name="transaction_id" value="{{ item.financial_transaction.id }}">
+                                <input type="hidden" name="match_type" value="EXACT">
+                                <button type="submit" class="px-3 py-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded text-[11px] font-medium transition-colors cursor-pointer">
+                                    Confirmar
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- 3. COINCIDENCIAS POTENCIALES QUE REQUIEREN REVISIÓN -->
+    {% if matching_report.potential_matches %}
+    <div class="bg-white border border-amber-200 rounded-[4px] overflow-hidden shadow-xs">
+        <div class="p-3 border-b border-amber-100 bg-amber-50/40 flex items-center justify-between">
+            <div>
+                <span class="text-xs font-mono font-bold text-amber-950 uppercase tracking-wider block">
+                    ⚠ Coincidencias potenciales para revisión ({{ matching_report.potential_matches|length }})
+                </span>
+                <span class="text-[11px] font-mono text-amber-700 block">
+                    El monto coincide, pero existen múltiples candidatos o la referencia bancaria difiere
+                </span>
+            </div>
+        </div>
+        <div class="p-4 space-y-4">
+            {% for item in matching_report.potential_matches %}
+            <div class="border border-amber-200/80 rounded bg-amber-50/15 p-3 space-y-2">
+                <div class="flex flex-wrap items-center justify-between gap-2 border-b border-amber-100 pb-2">
+                    <div class="text-xs font-mono">
+                        <span class="font-bold text-zinc-900">Línea #{{ item.statement_line.line_number }}</span> · 
+                        <span>Fecha: {{ item.statement_line.post_date }}</span> · 
+                        <span class="font-bold {% if item.statement_line.movement_type == 'CREDIT' %}text-emerald-700{% else %}text-rose-700{% endif %}">
+                            {{ item.statement_line.currency }} {{ item.statement_line.amount|floatformat:2 }} ({{ item.statement_line.get_movement_type_display }})
+                        </span>
+                        <div class="text-[11px] text-zinc-600 mt-0.5">
+                            Detalle: "{{ item.statement_line.description }}" · Ref: <code>{{ item.statement_line.reference|default:"N/A" }}</code>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="text-[11px] font-mono font-semibold text-zinc-700 uppercase">
+                    Transacciones ERP Candidatas Encontradas:
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-2 font-mono text-xs">
+                    {% for cand in item.candidate_transactions %}
+                    <div class="bg-white border border-zinc-200 rounded p-2.5 flex items-center justify-between gap-2">
+                        <div>
+                            <div class="font-bold text-zinc-900">{{ cand.number }} · {{ cand.created_at|date:"Y-m-d" }}</div>
+                            <div class="text-[11px] text-zinc-600">{{ cand.get_transaction_type_display }}</div>
+                            <div class="text-[11px] text-zinc-500">Ref ERP: <code>{{ cand.reference_code|default:"-" }}</code> · Concepto: {{ cand.concept|truncatechars:30 }}</div>
+                        </div>
+                        <form method="post" action="{% url 'finance:match_confirm' %}">
+                            {% csrf_token %}
+                            <input type="hidden" name="statement_line_id" value="{{ item.statement_line.id }}">
+                            <input type="hidden" name="transaction_id" value="{{ cand.id }}">
+                            <input type="hidden" name="match_type" value="MANUAL">
+                            <button type="submit" class="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded text-[11px] font-medium transition-colors cursor-pointer">
+                                Emparejar
+                            </button>
+                        </form>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- 4. DISCREPANCIAS DE MONTO DETECTADAS -->
+    {% if matching_report.discrepancies %}
+    <div class="bg-white border border-rose-200 rounded-[4px] overflow-hidden shadow-xs">
+        <div class="p-3 border-b border-rose-100 bg-rose-50/40">
+            <span class="text-xs font-mono font-bold text-rose-950 uppercase tracking-wider block">
+                ✕ Discrepancias detectadas ({{ matching_report.discrepancies|length }})
+            </span>
+            <span class="text-[11px] font-mono text-rose-700 block">
+                Misma referencia externa pero con importes monetarios diferentes
+            </span>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-xs font-mono">
+                <thead>
+                    <tr class="border-b border-rose-100 bg-rose-50/20 text-rose-800 text-[11px]">
+                        <th class="p-2.5">Línea Extracto</th>
+                        <th class="p-2.5">Referencia</th>
+                        <th class="p-2.5 text-right">Monto Extracto</th>
+                        <th class="p-2.5">Transacción ERP</th>
+                        <th class="p-2.5 text-right">Monto ERP</th>
+                        <th class="p-2.5 text-right">Diferencia</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-rose-100">
+                    {% for item in matching_report.discrepancies %}
+                    <tr class="hover:bg-rose-50/30">
+                        <td class="p-2.5 font-bold">#{{ item.statement_line.line_number }} · {{ item.statement_line.post_date }}</td>
+                        <td class="p-2.5 font-bold text-rose-900">{{ item.statement_line.reference }}</td>
+                        <td class="p-2.5 text-right font-bold">{{ item.statement_line.currency }} {{ item.statement_line.amount|floatformat:2 }}</td>
+                        <td class="p-2.5">{{ item.financial_transaction.number }} ({{ item.financial_transaction.get_transaction_type_display }})</td>
+                        <td class="p-2.5 text-right font-bold">{{ item.financial_transaction.amount|floatformat:2 }}</td>
+                        <td class="p-2.5 text-right font-bold text-rose-700">
+                            Discrepancia detectada
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- 5. MOVIMIENTOS PENDIENTES DEL EXTRACTO (Sin correspondencia en ERP) -->
+    {% if matching_report.unmatched_statement_lines %}
+    <div class="bg-white border border-zinc-200 rounded-[4px] overflow-hidden">
+        <div class="p-3 border-b border-zinc-200 bg-zinc-50/50 flex items-center justify-between">
+            <div>
+                <span class="text-xs font-mono font-semibold text-zinc-900 uppercase tracking-wider block">
+                    Movimientos del extracto pendientes de justificación ({{ matching_report.unmatched_statement_lines|length }})
+                </span>
+                <span class="text-[11px] font-mono text-zinc-500 block">
+                    Movimientos asentados por el banco sin registro equivalente en ERP (comisiones, cargos directos, intereses)
+                </span>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-xs font-mono">
+                <thead>
+                    <tr class="border-b border-zinc-200 bg-zinc-50/30 text-zinc-500 text-[11px]">
+                        <th class="p-2.5">Línea</th>
+                        <th class="p-2.5">Fecha</th>
+                        <th class="p-2.5">Sentido</th>
+                        <th class="p-2.5">Descripción Bancaria</th>
+                        <th class="p-2.5">Referencia</th>
+                        <th class="p-2.5 text-right">Importe</th>
+                        <th class="p-2.5 text-center">Estado</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-zinc-200/60">
+                    {% for item in matching_report.unmatched_statement_lines %}
+                    <tr class="hover:bg-zinc-50/50">
+                        <td class="p-2.5 font-bold text-zinc-700">#{{ item.statement_line.line_number }}</td>
+                        <td class="p-2.5 text-zinc-600">{{ item.statement_line.post_date }}</td>
+                        <td class="p-2.5">
+                            {% if item.statement_line.movement_type == 'CREDIT' %}
+                                <span class="text-emerald-700 font-semibold">+Abono</span>
+                            {% else %}
+                                <span class="text-rose-700 font-semibold">-Cargo</span>
+                            {% endif %}
+                        </td>
+                        <td class="p-2.5 text-zinc-900">{{ item.statement_line.description }}</td>
+                        <td class="p-2.5 text-zinc-600">{{ item.statement_line.reference|default:"-" }}</td>
+                        <td class="p-2.5 text-right font-bold text-zinc-900">
+                            {{ item.statement_line.currency }} {{ item.statement_line.amount|floatformat:2 }}
+                        </td>
+                        <td class="p-2.5 text-center">
+                            <span class="px-2 py-0.5 rounded text-[10px] bg-zinc-100 text-zinc-600 font-semibold">SIN ERP</span>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- 6. PARTIDAS EN TRÁNSITO DEL ERP -->
+    {% if matching_report.unmatched_erp_transactions %}
+    <div class="bg-white border border-zinc-200 rounded-[4px] overflow-hidden">
+        <div class="p-3 border-b border-zinc-200 bg-zinc-50/50 flex items-center justify-between">
+            <div>
+                <span class="text-xs font-mono font-semibold text-zinc-900 uppercase tracking-wider block">
+                    Partidas en tránsito registradas en ERP ({{ matching_report.unmatched_erp_transactions|length }})
+                </span>
+                <span class="text-[11px] font-mono text-zinc-500 block">
+                    Transacciones financieras confirmadas en ERP que aún no se reflejan en este extracto bancario
+                </span>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-xs font-mono">
+                <thead>
+                    <tr class="border-b border-zinc-200 bg-zinc-50/30 text-zinc-500 text-[11px]">
+                        <th class="p-2.5">Folio TRX</th>
+                        <th class="p-2.5">Fecha</th>
+                        <th class="p-2.5">Tipo Operación</th>
+                        <th class="p-2.5">Concepto</th>
+                        <th class="p-2.5">Referencia</th>
+                        <th class="p-2.5 text-right">Importe</th>
+                        <th class="p-2.5 text-center">Estado</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-zinc-200/60">
+                    {% for tx in matching_report.unmatched_erp_transactions %}
+                    <tr class="hover:bg-zinc-50/50">
+                        <td class="p-2.5 font-bold text-zinc-900">{{ tx.number }}</td>
+                        <td class="p-2.5 text-zinc-600">{{ tx.created_at|date:"Y-m-d" }}</td>
+                        <td class="p-2.5 text-zinc-700">{{ tx.get_transaction_type_display }}</td>
+                        <td class="p-2.5 text-zinc-800">{{ tx.concept|truncatechars:40 }}</td>
+                        <td class="p-2.5 text-zinc-600">{{ tx.reference_code|default:"-" }}</td>
+                        <td class="p-2.5 text-right font-bold text-zinc-900">{{ tx.amount|floatformat:2 }}</td>
+                        <td class="p-2.5 text-center">
+                            <span class="px-2 py-0.5 rounded text-[10px] bg-blue-50 text-blue-700 font-semibold border border-blue-200">EN TRÁNSITO</span>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- 7. LISTADO TOTAL DE LÍNEAS DEL EXTRACTO (AUDITORÍA COMPLETA) -->
+    <div class="bg-white border border-zinc-200 rounded-[4px] overflow-hidden">
+        <div class="p-3 border-b border-zinc-200 bg-zinc-50/50 flex items-center justify-between">
+            <div>
+                <span class="text-xs font-mono font-semibold text-zinc-900 uppercase tracking-wider block">
+                    Auditoría completa de líneas del extracto ({{ all_lines|length }})
+                </span>
+                <span class="text-[11px] font-mono text-zinc-500 block">
+                    Detalle inmutable de todos los movimientos importados en este lote
+                </span>
+            </div>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-xs font-mono">
+                <thead>
+                    <tr class="border-b border-zinc-200 bg-zinc-50/30 text-zinc-500 text-[11px]">
+                        <th class="p-2.5">#</th>
+                        <th class="p-2.5">Fecha</th>
+                        <th class="p-2.5">Sentido</th>
+                        <th class="p-2.5">Descripción</th>
+                        <th class="p-2.5">Referencia</th>
+                        <th class="p-2.5 text-right">Importe</th>
+                        <th class="p-2.5 text-center">Estado</th>
+                        <th class="p-2.5">Transacción ERP Emparejada</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-zinc-200/60">
+                    {% for l in all_lines %}
+                    <tr class="hover:bg-zinc-50/50">
+                        <td class="p-2.5 font-bold text-zinc-500">{{ l.line_number }}</td>
+                        <td class="p-2.5 text-zinc-700">{{ l.post_date }}</td>
+                        <td class="p-2.5">
+                            {% if l.movement_type == 'CREDIT' %}
+                                <span class="text-emerald-700 font-semibold">+Abono</span>
+                            {% else %}
+                                <span class="text-rose-700 font-semibold">-Cargo</span>
+                            {% endif %}
+                        </td>
+                        <td class="p-2.5 text-zinc-900">{{ l.description }}</td>
+                        <td class="p-2.5 text-zinc-600">{{ l.reference|default:"-" }}</td>
+                        <td class="p-2.5 text-right font-bold text-zinc-900">{{ l.amount|floatformat:2 }}</td>
+                        <td class="p-2.5 text-center">
+                            {% if l.status == 'RECONCILED' %}
+                                <span class="px-2 py-0.5 rounded text-[10px] bg-emerald-100 text-emerald-800 font-bold">CONCILIADO</span>
+                            {% else %}
+                                <span class="px-2 py-0.5 rounded text-[10px] bg-zinc-100 text-zinc-600 font-medium">PENDIENTE</span>
+                            {% endif %}
+                        </td>
+                        <td class="p-2.5 text-[11px]">
+                            {% if l.matched_transaction %}
+                                <span class="font-bold text-zinc-900">{{ l.matched_transaction.number }}</span> ({{ l.matched_transaction.get_transaction_type_display }})
+                            {% else %}
+                                <span class="text-zinc-400">-</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+</div>
+{% endblock %}

@@ -539,3 +539,14 @@ class DgiVetCsvExportView(ModuleAccessRequiredMixin, View):
         response = HttpResponse(csv_payload, content_type='text/csv; charset=utf-8')
         response['Content-Disposition'] = f'attachment; filename="{filename}"'
         return response
+
+
+# Vistas de Conciliación Bancaria y Trazabilidad de Extractos (Fase 1C.5.1)
+from apps.finance.views_reconciliation import (
+    BankReconciliationDashboardView,
+    BankStatementImportView,
+    BankStatementDetailView,
+    BankReconciliationConfirmMatchView,
+    BankReconciliationUndoMatchView,
+    BankReconciliationAutoMatchView,
+)

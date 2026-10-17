@@ -84,16 +84,16 @@ class SandboxScenarioSeeder:
         CorporateDocument.objects.filter(organization=organization).delete()
         RepositoryFolder.objects.filter(organization=organization).delete()
 
-        # 1. Compras, Proveedores y Cuentas por Pagar (apps/purchasing)
+        # 1. Asientos de Partida Doble en Borrador y Catálogo Contable (apps/finance)
+        JournalEntryLine.objects.filter(organization=organization).delete()
+        JournalEntry.objects.filter(organization=organization).delete()
+        AccountingAccount.objects.filter(organization=organization).delete()
+
+        # 1.1 Compras, Proveedores y Cuentas por Pagar (apps/purchasing)
         SupplierPayment.objects.filter(organization=organization).delete()
         PurchaseOrderItem.objects.filter(organization=organization).delete()
         PurchaseOrder.objects.filter(organization=organization).delete()
         Supplier.objects.filter(organization=organization).delete()
-
-        # 1.8 Asientos de Partida Doble y Catálogo Contable (apps/finance)
-        JournalEntryLine.objects.filter(organization=organization).delete()
-        JournalEntry.objects.filter(organization=organization).delete()
-        AccountingAccount.objects.filter(organization=organization).delete()
 
         # 2. Facturación Fiscal, Retenciones DGI, Recibos Oficiales de Caja (ROC) y Arqueos Z
         PosRegisterShift.objects.filter(organization=organization).update(status=PosRegisterShift.Status.OPEN, audit_hash='')
@@ -1712,10 +1712,7 @@ class SandboxScenarioSeeder:
         po2.withholding_certificate_number = 'RET-2026-0002'
         po2.save()
 
-        # Sincronización Contable Automática con apps/finance (Partida Doble NIIF/DGI)
-        sync_commercial_and_purchasing_to_ledger(organization, owner_user)
-
-        # Asiento 1: Aporte de Capital Social Inicial (100% Cuadrado: Debe == Haber)
+        # Asiento 1: Aporte de Capital Social Inicial (Borrador Cuadrado para Evaluación)
         accounts_map = ensure_default_chart_of_accounts(organization)
         if not JournalEntry.objects.filter(organization=organization, concept__icontains='Capital Social').exists():
             entry_capital = JournalEntry.objects.create(
@@ -1744,9 +1741,14 @@ class SandboxScenarioSeeder:
                 debit=Decimal('0.00'),
                 credit=Decimal('500000.00'),
             )
-            entry_capital.verify_and_save_balance()
+            JournalEntry.objects.filter(pk=entry_capital.pk).update(
+                total_debit=Decimal('500000.00'),
+                total_credit=Decimal('500000.00'),
+                is_balanced=False,
+                updated_at=timezone.now(),
+            )
 
-        # Asiento 2: Reconocimiento de Ingresos por Servicios Mayores de Ingeniería
+        # Asiento 2: Reconocimiento de Ingresos por Servicios Mayores de Ingeniería (Borrador Cuadrado)
         if not JournalEntry.objects.filter(organization=organization, concept__icontains='Hito Mayor Subestación').exists():
             entry_income = JournalEntry.objects.create(
                 organization=organization,
@@ -1801,7 +1803,12 @@ class SandboxScenarioSeeder:
                 debit=Decimal('0.00'),
                 credit=Decimal('30000.00'),
             )
-            entry_income.verify_and_save_balance()
+            JournalEntry.objects.filter(pk=entry_income.pk).update(
+                total_debit=Decimal('230000.00'),
+                total_credit=Decimal('230000.00'),
+                is_balanced=False,
+                updated_at=timezone.now(),
+            )
 
         # =========================================================================
         # 8. REPOSITORIO DOCUMENTAL INSTITUCIONAL (apps/repository)
@@ -2247,8 +2254,9 @@ class SandboxScenarioSeeder:
                 'status': PayrollPeriod.Status.DRAFT,
             }
         )
-        if period_oct.status == PayrollPeriod.Status.DRAFT:
-            close_and_account_payroll_period(period_oct, owner_user)
+        # Mantener el período de nómina en borrador para permitir pruebas interactivas de cierre y vaciado limpio sin pólizas inmutables
+        # if period_oct.status == PayrollPeriod.Status.DRAFT:
+        #     close_and_account_payroll_period(period_oct, owner_user)
 
         return {
             'organization': organization,

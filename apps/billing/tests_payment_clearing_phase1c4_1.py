@@ -836,6 +836,291 @@ class PosPaymentClearingTestCase(TestCase):
         self.assertEqual(inv.balance_due, Decimal('500.00'))
         self.assertEqual(inv.status, Invoice.Status.PARTIAL)
 
+    def test_15_sales_and_collection_dual_journal_audit_with_explicit_vat(self):
+        """
+        15. Auditoría del Ciclo Contable de Ventas con IVA 15% Explícito:
+        - Verifica por separado la póliza SALES (CxC 1103-01, Ingresos 4101-01, IVA Débito 2102-01).
+        - Verifica por separado la póliza COLLECTIONS (Caja 1101-01 cancelando CxC 1103-01).
+        - Constata que la posición neta de CxC queda en 0.00.
+        - Constata la ausencia de omisiones y duplicaciones en Kardex y facturación.
+        """
+        stock_before = StockBalance.objects.get(
+            organization=self.org_a,
+            warehouse=self.warehouse_a,
+            item=self.item_cement,
+        ).quantity
+
+        inv = execute_pos_sale(
+            organization=self.org_a,
+            user=self.user_a,
+            warehouse=self.warehouse_a,
+            cart_items=[{
+                'item_id': str(self.item_cement.id),
+                'quantity': Decimal('2.00'),
+                'price_tier': 'RETAIL',
+            }],
+            account=self.client_a,
+            payment_method=PaymentReceipt.PaymentMethod.CASH,
+            notes='Venta para auditoría contable dual con IVA',
+        )
+
+        # Totales esperados: Base = 800.00, IVA 15% = 120.00, Total Neto = 920.00
+        self.assertEqual(inv.subtotal, Decimal('800.00'))
+        self.assertEqual(inv.tax_total, Decimal('120.00'))
+        self.assertEqual(inv.net_receivable, Decimal('920.00'))
+        self.assertEqual(inv.amount_paid, Decimal('920.00'))
+        self.assertEqual(inv.balance_due, Decimal('0.00'))
+        self.assertEqual(inv.status, Invoice.Status.PAID)
+
+        # 1. Póliza de Ventas (SALES)
+        sales_entry = inv.journal_entries.filter(entry_type=JournalEntry.EntryType.SALES).first()
+        self.assertIsNotNone(sales_entry, "Debe existir la póliza de ventas SALES.")
+        self.assertTrue(sales_entry.is_balanced)
+        self.assertEqual(sales_entry.total_debit, Decimal('920.00'))
+        self.assertEqual(sales_entry.total_credit, Decimal('920.00'))
+
+        sales_lines = {l.account.code: (l.debit, l.credit) for l in sales_entry.lines.all()}
+        # DEBE: CxC Clientes 1103-01 por el total neto a cobrar
+        self.assertEqual(sales_lines['1103-01'], (Decimal('920.00'), Decimal('0.00')))
+        # HABER: Ingresos Gravados 4101-01 por la base imponible
+        self.assertEqual(sales_lines['4101-01'], (Decimal('0.00'), Decimal('800.00')))
+        # HABER: IVA 15% Débito Fiscal 2102-01
+        self.assertEqual(sales_lines['2102-01'], (Decimal('0.00'), Decimal('120.00')))
+
+        # 2. Póliza de Cobro (COLLECTIONS)
+        receipt = inv.payments.first()
+        self.assertIsNotNone(receipt)
+        col_entry = JournalEntry.objects.filter(source_payment_receipt=receipt).first()
+        self.assertIsNotNone(col_entry, "Debe existir la póliza de cobro COLLECTIONS.")
+        self.assertTrue(col_entry.is_balanced)
+        self.assertEqual(col_entry.total_debit, Decimal('920.00'))
+        self.assertEqual(col_entry.total_credit, Decimal('920.00'))
+
+        col_lines = {l.account.code: (l.debit, l.credit) for l in col_entry.lines.all()}
+        # DEBE: Caja General 1101-01
+        self.assertEqual(col_lines['1101-01'], (Decimal('920.00'), Decimal('0.00')))
+        # HABER: Cancelación de CxC Clientes 1103-01
+        self.assertEqual(col_lines['1103-01'], (Decimal('0.00'), Decimal('920.00')))
+
+        # 3. Conciliación de CxC neta
+        total_cxc_debit = sales_lines['1103-01'][0] + col_lines.get('1103-01', (Decimal('0.00'), Decimal('0.00')))[0]
+        total_cxc_credit = sales_lines['1103-01'][1] + col_lines.get('1103-01', (Decimal('0.00'), Decimal('0.00')))[1]
+        self.assertEqual(total_cxc_debit, total_cxc_credit, "El saldo residual de CxC para la venta POS debe ser exactamente 0.00.")
+
+        # 4. Kardex e Inventario
+        stock_after = StockBalance.objects.get(
+            organization=self.org_a,
+            warehouse=self.warehouse_a,
+            item=self.item_cement,
+        ).quantity
+        self.assertEqual(stock_after, stock_before - Decimal('2.00'))
+        kardex = StockMovement.objects.filter(invoice=inv)
+        self.assertEqual(kardex.count(), 1)
+        self.assertEqual(kardex.first().movement_type, StockMovement.MovementType.OUT_SALE_POS)
+        self.assertEqual(kardex.first().quantity, Decimal('2.00'))
+
+        # 5. Cero duplicación
+        self.assertEqual(inv.journal_entries.count(), 2)
+        self.assertEqual(inv.payments.count(), 1)
+
+    def test_16_check_lifecycle_duplicate_transitions_and_cross_tenant_rejected(self):
+        """
+        16. Auditoría Exhaustiva del Ciclo de Cheques:
+        - Bloqueo de transiciones duplicadas o inválidas (segundo depósito, segunda compensación, segundo rechazo).
+        - Bloqueo de operaciones cross-tenant (cheque de Org A depositado o compensado por Org B).
+        - Validación estricta de campos obligatorios (motivo de rechazo, boleta de depósito).
+        """
+        inv = execute_pos_sale(
+            organization=self.org_a,
+            user=self.user_a,
+            warehouse=self.warehouse_a,
+            cart_items=[{'item_id': str(self.item_cement.id), 'quantity': Decimal('1.00')}],
+            account=self.client_a,
+            payment_method=PaymentReceipt.PaymentMethod.CHECK,
+            reference_number='CHK-LIFECYCLE-01',
+        )
+        chk = CheckReceiptRegister.objects.get(check_number='CHK-LIFECYCLE-01')
+        self.assertEqual(chk.status, CheckReceiptRegister.Status.RECEIVED)
+
+        # 1. Depósito inválido por falta de boleta
+        with self.assertRaises(ValidationError) as ctx_slip:
+            deposit_check_to_bank(self.org_a, chk, self.bank_a1, deposit_slip_number='   ')
+        self.assertIn("boleta", str(ctx_slip.exception).lower())
+
+        # 2. Depósito inválido en banco inactivo
+        with self.assertRaises(ValidationError) as ctx_inact:
+            deposit_check_to_bank(self.org_a, chk, self.bank_a_inactive, deposit_slip_number='SLIP-01')
+        self.assertIn("inactiva", str(ctx_inact.exception).lower())
+
+        # 3. Depósito cross-tenant rechazado (Banco de Org B)
+        with self.assertRaises(ValidationError) as ctx_xbank:
+            deposit_check_to_bank(self.org_a, chk, self.bank_b, deposit_slip_number='SLIP-01')
+        self.assertIn("no pertenece a la organización", str(ctx_xbank.exception).lower())
+
+        # 4. Depósito ejecutado bajo Org B rechazado
+        with self.assertRaises(ValidationError) as ctx_xorg:
+            deposit_check_to_bank(self.org_b, chk, self.bank_b, deposit_slip_number='SLIP-01')
+        self.assertIn("no pertenece a la organización", str(ctx_xorg.exception).lower())
+
+        # 5. Depósito válido a DEPOSITED
+        deposit_check_to_bank(self.org_a, chk, self.bank_a1, deposit_slip_number='SLIP-VALID-01')
+        chk.refresh_from_db()
+        self.assertEqual(chk.status, CheckReceiptRegister.Status.DEPOSITED)
+
+        # 6. Segundo depósito en cheque ya depositado RECHAZADO
+        with self.assertRaises(ValidationError) as ctx_dup_dep:
+            deposit_check_to_bank(self.org_a, chk, self.bank_a1, deposit_slip_number='SLIP-VALID-02')
+        self.assertIn("solo se pueden depositar cheques en estado recibido", str(ctx_dup_dep.exception).lower())
+
+        # 7. Compensación ejecutada bajo Org B RECHAZADA
+        with self.assertRaises(ValidationError):
+            clear_check_deposit(self.org_b, chk, user=self.user_b, bank_account=self.bank_b)
+
+        # 8. Compensación exitosa a CLEARED
+        bal_before = self.bank_a1.current_balance
+        clear_check_deposit(self.org_a, chk, user=self.user_a, bank_account=self.bank_a1)
+        chk.refresh_from_db()
+        self.assertEqual(chk.status, CheckReceiptRegister.Status.CLEARED)
+        self.bank_a1.refresh_from_db()
+        self.assertEqual(self.bank_a1.current_balance, bal_before + chk.amount)
+
+        # 9. Segunda compensación en cheque ya acreditado RECHAZADA
+        with self.assertRaises(ValidationError) as ctx_dup_clear:
+            clear_check_deposit(self.org_a, chk, user=self.user_a, bank_account=self.bank_a1)
+        self.assertIn("ya fue compensado", str(ctx_dup_clear.exception).lower())
+
+        # 10. Intento de rechazar un cheque ya compensado RECHAZADO
+        with self.assertRaises(ValidationError) as ctx_rej_cleared:
+            reject_check(self.org_a, chk, reason='Intento indebido de rebote posterior', user=self.user_a)
+        self.assertIn("no se puede rechazar directamente un cheque que ya fue acreditado", str(ctx_rej_cleared.exception).lower())
+
+        # 11. Flujo de cheque rechazado independiente
+        inv2 = execute_pos_sale(
+            organization=self.org_a,
+            user=self.user_a,
+            warehouse=self.warehouse_a,
+            cart_items=[{'item_id': str(self.item_cement.id), 'quantity': Decimal('1.00')}],
+            account=self.client_a,
+            payment_method=PaymentReceipt.PaymentMethod.CHECK,
+            reference_number='CHK-LIFECYCLE-02',
+        )
+        chk2 = CheckReceiptRegister.objects.get(check_number='CHK-LIFECYCLE-02')
+
+        # Rechazo sin motivo RECHAZADO
+        with self.assertRaises(ValidationError):
+            reject_check(self.org_a, chk2, reason='   ', user=self.user_a)
+
+        # Rechazo cross-tenant RECHAZADO
+        with self.assertRaises(ValidationError):
+            reject_check(self.org_b, chk2, reason='Motivo válido', user=self.user_b)
+
+        # Rechazo válido
+        reject_check(self.org_a, chk2, reason='Cheque devuelto por orden de no pago', user=self.user_a)
+        chk2.refresh_from_db()
+        self.assertEqual(chk2.status, CheckReceiptRegister.Status.REJECTED)
+
+        # Segundo intento de rechazo RECHAZADO
+        with self.assertRaises(ValidationError) as ctx_dup_rej:
+            reject_check(self.org_a, chk2, reason='Segundo intento', user=self.user_a)
+        self.assertIn("ya se encuentra marcado como rechazado", str(ctx_dup_rej.exception).lower())
+
+        # Intento de compensar cheque rechazado RECHAZADO
+        with self.assertRaises(ValidationError) as ctx_clear_rej:
+            clear_check_deposit(self.org_a, chk2, user=self.user_a, bank_account=self.bank_a1)
+        self.assertIn("no se puede compensar un cheque que fue rechazado", str(ctx_clear_rej.exception).lower())
+
+    def test_17_card_batch_settlement_arithmetic_and_negative_validations(self):
+        """
+        17. Auditoría de Liquidaciones de Tarjetas y Cuenta Transitoria 1105-01:
+        - Bloqueo de importes negativos, ceros e inconsistencias aritméticas.
+        - Validación de la cuenta 1105-01 como ACTIVO circulante (Anticipo de Impuestos Retenidos).
+        - Conciliación estricta de Debe == Haber y cancelación de la cuenta 1101-03 por el bruto.
+        """
+        # 1. Bruto <= 0
+        with self.assertRaises(ValidationError) as ctx1:
+            record_card_batch_settlement(
+                organization=self.org_a,
+                bank_account=self.bank_a1,
+                batch_reference='LOTE-ERR-01',
+                gross_amount=Decimal('0.00'),
+            )
+        self.assertIn("mayor a 0.00", str(ctx1.exception).lower())
+
+        # 2. Comisiones o retenciones negativas
+        with self.assertRaises(ValidationError) as ctx2:
+            record_card_batch_settlement(
+                organization=self.org_a,
+                bank_account=self.bank_a1,
+                batch_reference='LOTE-ERR-02',
+                gross_amount=Decimal('100.00'),
+                fee_amount=Decimal('-5.00'),
+            )
+        self.assertIn("no pueden ser negativas", str(ctx2.exception).lower())
+
+        # 3. Neto <= 0 (Comisiones + Retenciones >= Bruto)
+        with self.assertRaises(ValidationError) as ctx3:
+            record_card_batch_settlement(
+                organization=self.org_a,
+                bank_account=self.bank_a1,
+                batch_reference='LOTE-ERR-03',
+                gross_amount=Decimal('100.00'),
+                fee_amount=Decimal('60.00'),
+                tax_retention_amount=Decimal('50.00'),
+            )
+        self.assertIn("debe ser mayor a 0.00", str(ctx3.exception).lower())
+
+        # 4. Banco inactivo rechazado
+        with self.assertRaises(ValidationError) as ctx4:
+            record_card_batch_settlement(
+                organization=self.org_a,
+                bank_account=self.bank_a_inactive,
+                batch_reference='LOTE-ERR-04',
+                gross_amount=Decimal('500.00'),
+            )
+        self.assertIn("inactiva", str(ctx4.exception).lower())
+
+        # 5. Referencia de lote vacía rechazada
+        with self.assertRaises(ValidationError) as ctx5:
+            record_card_batch_settlement(
+                organization=self.org_a,
+                bank_account=self.bank_a1,
+                batch_reference='   ',
+                gross_amount=Decimal('500.00'),
+            )
+        self.assertIn("referencia o número de lote", str(ctx5.exception).lower())
+
+        # 6. Inspección de cuenta 1105-01 en el catálogo contable de la organización
+        chart = ensure_default_chart_of_accounts(self.org_a)
+        acc_1105_01 = chart['1105-01']
+        self.assertEqual(acc_1105_01.account_type, AccountingAccount.AccountType.ASSET)
+        self.assertIn("anticipo retención ir", acc_1105_01.name.lower())
+
+        # 7. Liquidación válida con verificación de asientos
+        settlement = record_card_batch_settlement(
+            organization=self.org_a,
+            bank_account=self.bank_a1,
+            batch_reference='LOTE-AUDIT-FINAL-77',
+            gross_amount=Decimal('2000.00'),
+            fee_amount=Decimal('60.00'),
+            tax_retention_amount=Decimal('40.00'),
+            user=self.user_a,
+        )
+        self.assertEqual(settlement.net_amount, Decimal('1900.00'))
+        self.assertEqual(settlement.gross_amount, settlement.net_amount + settlement.fee_amount + settlement.tax_retention_amount)
+
+        pol = JournalEntry.objects.filter(reference='LOTE-AUDIT-FINAL-77').first()
+        self.assertIsNotNone(pol)
+        self.assertTrue(pol.is_balanced)
+        lines = {l.account.code: (l.debit, l.credit) for l in pol.lines.all()}
+        # DEBE Banco 1102-01: 1900.00
+        self.assertEqual(lines['1102-01'], (Decimal('1900.00'), Decimal('0.00')))
+        # DEBE Gastos Bancarios 6102-01: 60.00
+        self.assertEqual(lines['6102-01'], (Decimal('60.00'), Decimal('0.00')))
+        # DEBE Anticipo Retención IR 1105-01: 40.00
+        self.assertEqual(lines['1105-01'], (Decimal('40.00'), Decimal('0.00')))
+        # HABER Tarjetas por Liquidar 1101-03: 2000.00 (Bruto cancelado)
+        self.assertEqual(lines['1101-03'], (Decimal('0.00'), Decimal('2000.00')))
+
 
 class PosConcurrencyClearingTestCase(TransactionTestCase):
     """

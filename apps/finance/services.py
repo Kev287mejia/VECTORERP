@@ -317,8 +317,9 @@ def record_invoice_sales_journal_entry(organization, invoice, user, accounts=Non
         accounts = ensure_default_chart_of_accounts(organization)
 
     rate = invoice.exchange_rate if invoice.currency_code == 'USD' else Decimal('1.0')
+    taxable_base = invoice.subtotal - getattr(invoice, 'discount_total', Decimal('0.00'))
     net_receivable_nio = (invoice.net_receivable * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-    subtotal_nio = (invoice.subtotal * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    subtotal_nio = (taxable_base * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     tax_total_nio = (invoice.tax_total * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     ir_retention_nio = (invoice.ir_retention_amount * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     imi_retention_nio = (invoice.imi_retention_amount * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)

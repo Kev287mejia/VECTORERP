@@ -1268,10 +1268,6 @@ def _record_card_batch_settlement_inner(
         credit=gross,
     )
 
-    entry.verify_and_save_balance()
-    if not entry.is_balanced:
-        raise ValidationError("Error contable: la póliza de liquidación de tarjetas no está cuadrada.")
-
     settlement = CardBatchSettlement.objects.create(
         organization=organization,
         bank_account=locked_bank,
@@ -1292,6 +1288,10 @@ def _record_card_batch_settlement_inner(
 
     entry.source_card_settlement = settlement
     entry.save(update_fields=['source_card_settlement', 'updated_at'])
+
+    entry.verify_and_save_balance()
+    if not entry.is_balanced:
+        raise ValidationError("Error contable: la póliza de liquidación de tarjetas no está cuadrada.")
 
     return settlement
 

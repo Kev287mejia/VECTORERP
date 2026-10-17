@@ -12,12 +12,14 @@ from apps.tenancy.models import Organization, OrganizationMembership, RoleLevel
 from apps.finance.models import (
     AccountingAccount,
     BankAccount,
+    CardBatchSettlement,
     JournalEntry,
     JournalEntryLine,
     PettyCashFund,
 )
 from apps.finance.services import (
     ensure_default_chart_of_accounts,
+    record_card_batch_settlement,
 )
 
 User = get_user_model()
@@ -376,6 +378,60 @@ class Phase1C83CDatabaseIntegrityTestCase(TestCase):
 
         account_before.refresh_from_db()
         self.assertEqual(account_before.name, 'Cuenta Temporal Rollback')
+
+    def test_h11_11_raw_sql_update_on_card_settlement_balanced_entry_is_blocked_by_trigger(self):
+        """
+        11. Validación de trigger PostgreSQL mediante SQL directo (cursor.execute) sobre la póliza
+        cerrada y balanceada generada por el servicio real record_card_batch_settlement() (H-13).
+        """
+        if connection.vendor != 'postgresql':
+            self.skipTest("Prueba específica de triggers nativos PostgreSQL")
+
+        bank = BankAccount.objects.create(
+            organization=self.org,
+            bank_name=BankAccount.BankName.BAC,
+            account_number='000-SQL-SETTLE-01',
+            account_type=BankAccount.AccountType.CHECKING,
+            currency='NIO',
+            current_balance=Decimal('20000.00'),
+            is_active=True,
+        )
+
+        settlement = record_card_batch_settlement(
+            organization=self.org,
+            bank_account=bank,
+            batch_reference='BATCH-SQL-TEST-01',
+            gross_amount=Decimal('4000.00'),
+            fee_amount=Decimal('120.00'),
+            tax_retention_amount=Decimal('60.00'),
+            user=self.auditor,
+            notes='Liquidación para prueba SQL directo H-13',
+            idempotency_key='IDEMP-SQL-H13-001',
+        )
+
+        entry = settlement.journal_entry
+        self.assertIsNotNone(entry)
+        self.assertTrue(entry.is_balanced)
+
+        original_concept = entry.concept
+        original_total_debit = entry.total_debit
+        original_total_credit = entry.total_credit
+
+        # Ejecutar UPDATE directo con cursor SQL nativo dentro de subtransacción controlada (savepoint)
+        with self.assertRaises(DatabaseError):
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE finance_journalentry SET concept = %s WHERE id = %s",
+                        ['Concepto alterado mediante SQL directo', entry.id]
+                    )
+
+        # Confirmar que la póliza conserva su valor original y que la transacción de prueba sigue activa
+        entry.refresh_from_db()
+        self.assertEqual(entry.concept, original_concept)
+        self.assertEqual(entry.total_debit, original_total_debit)
+        self.assertEqual(entry.total_credit, original_total_credit)
+        self.assertTrue(entry.is_balanced)
 
     # =========================================================================
     # H-12: LÍMITE AUTORIZADO DE CAJA CHICA (CHECK CONSTRAINTS)

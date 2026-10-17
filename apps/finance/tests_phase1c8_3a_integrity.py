@@ -10,6 +10,7 @@ from apps.tenancy.models import Organization, OrganizationMembership, RoleLevel
 from apps.finance.models import (
     AccountingAccount,
     BankAccount,
+    CardBatchSettlement,
     FinancialTransaction,
     JournalEntry,
     JournalEntryLine,
@@ -18,6 +19,7 @@ from apps.finance.models import (
 from apps.finance.services import (
     allocate_petty_cash_fund,
     ensure_default_chart_of_accounts,
+    record_card_batch_settlement,
     record_supplier_payment_journal_entry,
 )
 from apps.finance.views import PettyCashFundCreateView
@@ -705,3 +707,167 @@ class Phase1C83AIntegrityTestCase(TestCase):
         final_entries_count = JournalEntry.objects.filter(organization=self.org).count()
         # En esta fase 1C.8.3A, no se generan pólizas desbalanceadas o sin catálogo aprobado
         self.assertEqual(final_entries_count, initial_entries_count)
+
+
+class Phase1C83HCardSettlementIntegrityTestCase(TestCase):
+    """
+    VECTOR ERP — Fase 1C.8.3I: Validación Funcional de Regresión de Liquidación de Tarjetas (H-13).
+    - Valida que la liquidación cree un CardBatchSettlement válido y una póliza cuadrada.
+    - Valida la relación recíproca entre CardBatchSettlement y JournalEntry.
+    - Valida los importes contables (banco, comisión, retención y transitoria de tarjetas).
+    - Valida que la póliza contable quede sellada e inmutable tras la liquidación.
+    - Valida que la atomicidad revierta todas las operaciones ante errores.
+    """
+
+    def setUp(self):
+        self.country_ni, _ = CountryConfig.objects.get_or_create(
+            code='NI',
+            defaults={
+                'name': 'Nicaragua',
+                'flag_emoji': '🇳🇮',
+                'primary_currency_code': 'NIO',
+                'primary_currency_symbol': 'C$',
+                'secondary_currency_code': 'USD',
+                'secondary_currency_symbol': '$',
+                'tax_id_label': 'RUC',
+                'tax_id_regex': r'^[A-Z]\d{13}$',
+                'is_active': True,
+                'default_tax_rate': Decimal('15.00'),
+                'default_tax_name': 'IVA',
+            }
+        )
+        self.org = Organization.objects.create(
+            name="Comercial CardSettlement Test S.A.",
+            legal_name="Comercial CardSettlement Test S.A.",
+            tax_id="J0310000009999",
+            country=self.country_ni,
+            is_active=True,
+        )
+        self.user = User.objects.create_user(
+            email='card_settlement_auditor@erpvector.com',
+            password='audit_secure_password_2026',
+            full_name='Auditor de Liquidaciones',
+        )
+        OrganizationMembership.objects.create(
+            user=self.user,
+            organization=self.org,
+            role_level=RoleLevel.OWNER_ADMIN,
+            is_active=True,
+        )
+        self.bank = BankAccount.objects.create(
+            organization=self.org,
+            bank_name=BankAccount.BankName.BAC,
+            account_number='000-CARD-SETTLE-01',
+            account_type=BankAccount.AccountType.CHECKING,
+            currency='NIO',
+            current_balance=Decimal('50000.00'),
+            is_active=True,
+        )
+        ensure_default_chart_of_accounts(self.org)
+
+    def test_h13_01_card_batch_settlement_succeeds_and_links_reciprocally(self):
+        """H-13: Comprueba que la liquidación se cree, enlace la póliza recíprocamente y quede cuadrada."""
+        gross = Decimal('5000.00')
+        fee = Decimal('150.00')        # 3% comisión
+        retention = Decimal('75.00')  # 1.5% retención
+        net = gross - fee - retention  # 4,775.00 NIO
+
+        settlement = record_card_batch_settlement(
+            organization=self.org,
+            bank_account=self.bank,
+            batch_reference='BATCH-H13-TEST-01',
+            gross_amount=gross,
+            fee_amount=fee,
+            tax_retention_amount=retention,
+            user=self.user,
+            notes='Liquidación exitosa H-13',
+            idempotency_key='IDEMP-H13-001',
+        )
+
+        self.assertIsNotNone(settlement)
+        self.assertEqual(settlement.gross_amount, gross)
+        self.assertEqual(settlement.fee_amount, fee)
+        self.assertEqual(settlement.tax_retention_amount, retention)
+        self.assertEqual(settlement.net_amount, net)
+        self.assertEqual(settlement.status, CardBatchSettlement.Status.SETTLED)
+
+        # Saldo bancario incrementado por el neto
+        self.bank.refresh_from_db()
+        self.assertEqual(self.bank.current_balance, Decimal('54775.00'))
+
+        # Póliza contable cuadrada
+        entry = settlement.journal_entry
+        self.assertIsNotNone(entry)
+        self.assertTrue(entry.is_balanced)
+        self.assertEqual(entry.total_debit, gross)
+        self.assertEqual(entry.total_credit, gross)
+
+        # Relación recíproca verificada
+        self.assertEqual(entry.source_card_settlement_id, settlement.id)
+
+        # Verificación detallada de líneas contables
+        lines = {l.account.code: (l.debit, l.credit) for l in entry.lines.all()}
+        self.assertEqual(lines['1102-01'], (net, Decimal('0.00')))        # Débito Bancos
+        self.assertEqual(lines['6102-01'], (fee, Decimal('0.00')))        # Débito Comisiones
+        self.assertEqual(lines['1105-01'], (retention, Decimal('0.00')))  # Débito Retención IR
+        self.assertEqual(lines['1101-03'], (Decimal('0.00'), gross))      # Crédito Vouchers por Cobrar
+
+    def test_h13_02_card_batch_settlement_entry_is_immutable_after_creation(self):
+        """H-13: Comprueba que una vez finalizada la liquidación, la póliza generada sea estrictamente inmutable."""
+        settlement = record_card_batch_settlement(
+            organization=self.org,
+            bank_account=self.bank,
+            batch_reference='BATCH-H13-IMMUTABLE-01',
+            gross_amount=Decimal('2000.00'),
+            fee_amount=Decimal('60.00'),
+            tax_retention_amount=Decimal('30.00'),
+            user=self.user,
+        )
+        entry = settlement.journal_entry
+        self.assertTrue(entry.is_balanced)
+
+        # 1. Modificación de cabecera debe ser rechazada
+        entry.concept = "Modificación no autorizada de concepto"
+        with self.assertRaises(ValidationError):
+            entry.save(update_fields=['concept'])
+
+        # 2. Eliminación de póliza debe ser rechazada
+        with self.assertRaises(ValidationError):
+            entry.delete()
+
+        # 3. Inserción de nueva línea en póliza cerrada debe ser rechazada
+        acct_bank = AccountingAccount.objects.get(organization=self.org, code='1102-01')
+        with self.assertRaises(ValidationError):
+            JournalEntryLine.objects.create(
+                organization=self.org,
+                entry=entry,
+                account=acct_bank,
+                concept="Línea no autorizada",
+                debit=Decimal('100.00'),
+                credit=Decimal('0.00'),
+            )
+
+    def test_h13_03_card_batch_settlement_atomicity_on_error(self):
+        """H-13: Comprueba que si ocurre un error contable o de validación, la transacción se revierte al 100%."""
+        initial_balance = self.bank.current_balance
+        initial_settlements = CardBatchSettlement.objects.filter(organization=self.org).count()
+        initial_entries = JournalEntry.objects.filter(organization=self.org).count()
+        initial_trx = FinancialTransaction.objects.filter(organization=self.org).count()
+
+        # Intento con comisiones superiores al bruto (neto negativo)
+        with self.assertRaises(ValidationError):
+            record_card_batch_settlement(
+                organization=self.org,
+                bank_account=self.bank,
+                batch_reference='BATCH-H13-FAIL',
+                gross_amount=Decimal('100.00'),
+                fee_amount=Decimal('150.00'),  # Excede bruto
+                tax_retention_amount=Decimal('0.00'),
+                user=self.user,
+            )
+
+        self.bank.refresh_from_db()
+        self.assertEqual(self.bank.current_balance, initial_balance)
+        self.assertEqual(CardBatchSettlement.objects.filter(organization=self.org).count(), initial_settlements)
+        self.assertEqual(JournalEntry.objects.filter(organization=self.org).count(), initial_entries)
+        self.assertEqual(FinancialTransaction.objects.filter(organization=self.org).count(), initial_trx)

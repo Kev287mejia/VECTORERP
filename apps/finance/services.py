@@ -53,7 +53,7 @@ def allocate_petty_cash_fund(
         bank_account=bank,
         petty_cash_fund=caja,
         amount=amt,
-        balance_after=caja.current_balance,
+        balance_after=bank.current_balance,
         concept=f"Apertura / Dotación de Fondo Fijo {caja.code} ({caja.name})",
         reference_code=f"CHQ-{caja.code}",
         performed_by=user,
@@ -236,7 +236,7 @@ def disburse_petty_cash_replenishment(
         bank_account=bank,
         petty_cash_fund=caja,
         amount=amt,
-        balance_after=caja.current_balance,
+        balance_after=bank.current_balance,
         concept=f"Desembolso de Reposición {rep.code} para {caja.name}",
         reference_code=rep.code,
         performed_by=user,
@@ -1315,6 +1315,11 @@ def deposit_check_to_bank(
     if locked_check.status != CheckReceiptRegister.Status.RECEIVED:
         raise ValidationError(f"Solo se pueden depositar cheques en estado Recibido. Estado actual: {locked_check.get_status_display()}.")
 
+    if bank_account.currency != locked_check.currency:
+        raise ValidationError(
+            f"Incompatibilidad de divisa: No se puede depositar un cheque en {locked_check.currency} en una cuenta bancaria en {bank_account.currency}."
+        )
+
     clean_slip = (deposit_slip_number or '').strip()
     if not clean_slip:
         raise ValidationError("Se requiere el número de boleta o minuta de depósito bancario.")
@@ -1372,6 +1377,10 @@ def clear_check_deposit(
         raise ValidationError("La cuenta bancaria se encuentra inactiva.")
 
     locked_bank = BankAccount.objects.select_for_update().get(id=target_bank.id, organization=organization)
+    if locked_bank.currency != locked_check.currency:
+        raise ValidationError(
+            f"Incompatibilidad de divisa: La moneda del cheque ({locked_check.currency}) no coincide con la moneda de la cuenta bancaria destino ({locked_bank.currency})."
+        )
     locked_bank.current_balance += locked_check.amount
     locked_bank.save(update_fields=['current_balance', 'updated_at'])
 

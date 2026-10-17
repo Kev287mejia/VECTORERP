@@ -275,6 +275,11 @@ def prepare_cash_bank_deposit(
     if destination_bank_account.organization_id != locked_shift.organization_id:
         raise ValidationError("La cuenta bancaria destino no pertenece a la misma organización que el turno.")
 
+    if destination_bank_account.currency != 'NIO':
+        raise ValidationError(
+            f"Incompatibilidad de divisa: Las remesas de efectivo de caja POS en moneda nacional (NIO) solo pueden depositarse en cuentas bancarias en Córdobas (NIO), no en {destination_bank_account.currency}."
+        )
+
     amt = Decimal(str(amount or '0.00')).quantize(Decimal('0.01'))
     if amt <= Decimal('0.00'):
         raise ValidationError("El monto a depositar debe ser mayor a cero.")
@@ -495,6 +500,11 @@ def confirm_bank_deposit(
 
     org = locked_deposit.organization
     bank = BankAccount.objects.select_for_update().get(pk=locked_deposit.destination_bank_account_id)
+
+    if bank.currency != 'NIO':
+        raise ValidationError(
+            f"Incompatibilidad de divisa: No se puede acreditar un depósito en efectivo en Córdobas (NIO) en una cuenta bancaria en {bank.currency}."
+        )
 
     # 1. Incrementar saldo bancario
     bank.current_balance += locked_deposit.amount

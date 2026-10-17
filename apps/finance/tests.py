@@ -261,7 +261,7 @@ class FinanceModuleEndToEndTestCase(TestCase):
         self.assertEqual(self.fund_alfa.current_balance, Decimal('10000.00'))
         self.assertEqual(self.bank_bac.current_balance, Decimal('190000.00'))
         self.assertEqual(trx_dotacion.transaction_type, FinancialTransaction.TransactionType.PETTY_CASH_ALLOCATION)
-        self.assertEqual(trx_dotacion.balance_after, Decimal('10000.00'))
+        self.assertEqual(trx_dotacion.balance_after, Decimal('190000.00'))  # H-01: Saldo bancario posterior
 
         # Paso 2: Registrar Gasto 1 (Combustible en ruta a mina)
         exp1 = record_petty_cash_expense(
@@ -348,7 +348,7 @@ class FinanceModuleEndToEndTestCase(TestCase):
         # Saldo bancario debe reflejar el débito de los C$ 4,000.00 reembolsados
         self.assertEqual(self.bank_bac.current_balance, Decimal('186000.00'))
         self.assertEqual(trx_disburse.transaction_type, FinancialTransaction.TransactionType.PETTY_CASH_REPLENISH)
-        self.assertEqual(trx_disburse.balance_after, Decimal('10000.00'))
+        self.assertEqual(trx_disburse.balance_after, Decimal('186000.00'))  # H-01: Saldo bancario posterior
 
     # =========================================================================
     # 2. PRUEBA: PREVENCIÓN DE SOBREGIRO Y SALDO NEGATIVO

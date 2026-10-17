@@ -1053,9 +1053,8 @@ class PurchasingDisbursementPhase1B2TestCase(TestCase):
 
         initial_bank_bal = self.bank_bac_usd.current_balance
 
-        # Intento de liquidar a una tasa diferente (ej: 37.5000 vs reconocimiento 36.6243)
-        tc_divergente = Decimal('37.5000')
-        with self.assertRaises(ValidationError) as ctx_tc:
+        # Intento de liquidar con tasa inválida (cero o negativa) debe ser rechazado
+        with self.assertRaises(ValidationError) as ctx_neg:
             record_supplier_disbursement(
                 organization=self.org,
                 purchase_order=po,
@@ -1063,39 +1062,54 @@ class PurchasingDisbursementPhase1B2TestCase(TestCase):
                 currency_paid='USD',
                 user=self.commercial_mgr,
                 bank_account=self.bank_bac_usd,
-                reference_number='TRF-BAC-DIFF-TC',
-                exchange_rate_applied=tc_divergente,
+                reference_number='TRF-BAC-NEG-TC',
+                exchange_rate_applied=Decimal('-1.0'),
             )
+        self.assertIn("estrictamente mayor a 0", str(ctx_neg.exception))
 
-        self.assertIn("Operación cambiaria no soportada", str(ctx_tc.exception))
-        self.assertIn("diferencial cambiario", str(ctx_tc.exception))
-
-        # Comprobar que no hubo mutación en orden, factura ni banco
-        po.refresh_from_db()
-        inv.refresh_from_db()
-        self.bank_bac_usd.refresh_from_db()
-
-        self.assertEqual(po.amount_paid, Decimal('0.00'))
-        self.assertEqual(po.balance_due, Decimal('1000.00'))
-        self.assertEqual(inv.amount_paid, Decimal('0.00'))
-        self.assertEqual(inv.balance_due, Decimal('1000.00'))
-        self.assertEqual(self.bank_bac_usd.current_balance, initial_bank_bal)
-        self.assertFalse(SupplierPayment.objects.filter(reference_number='TRF-BAC-DIFF-TC').exists())
-
-        # Rechazo a nivel de modelo SupplierPayment.save()
+        # Rechazo a nivel de modelo SupplierPayment.save() con tasa negativa o cero
         bad_payment = SupplierPayment(
             organization=self.org,
             purchase_order=po,
             bank_account=self.bank_bac_usd,
             currency_paid='USD',
             amount_in_payment_currency=Decimal('1000.00'),
-            exchange_rate_applied=tc_divergente,
+            exchange_rate_applied=Decimal('0.0000'),
             amount_applied_to_order=Decimal('1000.00'),
             paid_by=self.commercial_mgr,
         )
         with self.assertRaises(ValidationError) as ctx_model:
             bad_payment.save()
-        self.assertIn("Operación cambiaria no soportada", str(ctx_model.exception))
+        self.assertIn("estrictamente mayor a 0", str(ctx_model.exception))
+
+        # Liquidación a tasa divergente (37.5000 vs 36.6243) procesada exitosamente con diferencial cambiario (Fase 1C.6)
+        tc_divergente = Decimal('37.5000')
+        egr, trx, pol = record_supplier_disbursement(
+            organization=self.org,
+            purchase_order=po,
+            amount=Decimal('1000.00'),
+            currency_paid='USD',
+            user=self.commercial_mgr,
+            bank_account=self.bank_bac_usd,
+            reference_number='TRF-BAC-DIFF-TC',
+            exchange_rate_applied=tc_divergente,
+        )
+
+        # Comprobar mutación correcta en orden, factura, banco y póliza con diferencial
+        po.refresh_from_db()
+        inv.refresh_from_db()
+        self.bank_bac_usd.refresh_from_db()
+
+        self.assertEqual(po.amount_paid, Decimal('1000.00'))
+        self.assertEqual(po.balance_due, Decimal('0.00'))
+        self.assertEqual(inv.amount_paid, Decimal('1000.00'))
+        self.assertEqual(inv.balance_due, Decimal('0.00'))
+        self.assertEqual(self.bank_bac_usd.current_balance, initial_bank_bal - Decimal('1000.00'))
+        self.assertIsNotNone(pol)
+        # Pérdida cambiaria reflejada: 1000 * (37.5000 - 36.6243) = 875.70 NIO
+        fx_line = pol.lines.filter(account__code='6201-01').first()
+        self.assertIsNotNone(fx_line)
+        self.assertEqual(fx_line.debit, Decimal('875.70'))
 
     def test_21_foreign_currency_matching_exchange_rate_reconciles_ledger_cleanly(self):
         """

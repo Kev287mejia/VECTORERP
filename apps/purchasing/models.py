@@ -780,18 +780,8 @@ class SupplierPayment(TenantScopedModel):
                 f"Incompatibilidad monetaria: La moneda de la factura ({self.supplier_invoice.currency_code}) "
                 f"no coincide con la moneda de la orden de compra ({self.purchase_order.currency_code})."
             )
-        if (
-            self.purchase_order_id
-            and self.purchase_order.currency_code != 'NIO'
-            and self.exchange_rate_applied
-            and self.exchange_rate_applied != self.purchase_order.exchange_rate
-        ):
-            raise ValidationError(
-                f"Operación cambiaria no soportada: La orden de compra {self.purchase_order.number} está denominada en moneda extranjera "
-                f"({self.purchase_order.currency_code}) y fue reconocida contablemente a una tasa de {self.purchase_order.exchange_rate:.4f}. "
-                f"No se permite liquidar a una tasa diferente ({self.exchange_rate_applied:.4f}) porque no existe una política contable "
-                f"aprobada para el diferencial cambiario (ganancia/pérdida en cambio)."
-            )
+        if self.exchange_rate_applied is not None and self.exchange_rate_applied <= Decimal('0.0000'):
+            raise ValidationError("La tasa de cambio aplicada debe ser un valor positivo estrictamente mayor a 0.")
 
     def save(self, *args, **kwargs):
         if not self._state.adding and self.pk:
@@ -800,18 +790,8 @@ class SupplierPayment(TenantScopedModel):
         if self.purchase_order_id and not self.organization_id:
             self.organization_id = self.purchase_order.organization_id
 
-        if (
-            self.purchase_order_id
-            and self.purchase_order.currency_code != 'NIO'
-            and self.exchange_rate_applied
-            and self.exchange_rate_applied != self.purchase_order.exchange_rate
-        ):
-            raise ValidationError(
-                f"Operación cambiaria no soportada: La orden de compra {self.purchase_order.number} está denominada en moneda extranjera "
-                f"({self.purchase_order.currency_code}) y fue reconocida contablemente a una tasa de {self.purchase_order.exchange_rate:.4f}. "
-                f"No se permite liquidar a una tasa diferente ({self.exchange_rate_applied:.4f}) porque no existe una política contable "
-                f"aprobada para el diferencial cambiario (ganancia/pérdida en cambio)."
-            )
+        if self.exchange_rate_applied is not None and self.exchange_rate_applied <= Decimal('0.0000'):
+            raise ValidationError("La tasa de cambio aplicada debe ser un valor positivo estrictamente mayor a 0.")
 
         # Conversión bimonetaria
         if not self.amount_applied_to_order or self.amount_applied_to_order <= Decimal('0.00'):

@@ -269,9 +269,11 @@ def ensure_default_chart_of_accounts(organization):
         ('3101-01', 'Capital Social Pagado / Aporte Inicial', AccountingAccount.AccountType.EQUITY),
         ('3201-01', 'Resultados Acumulados de Ejercicios Anteriores', AccountingAccount.AccountType.EQUITY),
         ('4101-01', 'Ingresos por Ventas de Bienes y Servicios', AccountingAccount.AccountType.INCOME),
+        ('4201-01', 'Ganancia por Diferencial Cambiario', AccountingAccount.AccountType.INCOME),
         ('5101-01', 'Costo de Ventas, Compras e Insumos', AccountingAccount.AccountType.EXPENSE),
         ('6101-01', 'Gastos Generales y de Administración', AccountingAccount.AccountType.EXPENSE),
         ('6102-01', 'Comisiones Bancarias y Procesamiento de Tarjetas', AccountingAccount.AccountType.EXPENSE),
+        ('6201-01', 'Pérdida por Diferencial Cambiario', AccountingAccount.AccountType.EXPENSE),
     ]
     accounts_map = {}
     for code, name, acct_type in default_accounts:
@@ -518,14 +520,14 @@ def record_supplier_payment_journal_entry(organization, supplier_payment, user, 
     Contabiliza la liquidación de un Comprobante de Egreso (EGR) en el Libro Diario (PAYMENTS).
     Idempotente: si el pago ya posee póliza de egreso, retorna la existente sin duplicar.
     Blindado contra condiciones de carrera concurrentes mediante manejo atómico de IntegrityError.
-    Convierte importes a Córdobas (NIO) si el pago fue aplicado a una orden en divisa extranjera (USD) a la tasa oficial.
-
-    Asiento Contable Cuadrado:
-    - DEBE: Proveedores Nacionales (CxP) (Cuenta '2101-01') por el monto aplicado en NIO.
-    - HABER: Bancos Institucionales ('1102-01') o Caja General ('1101-01') por el monto desembolsado en NIO.
+    Reconoce de forma segura y exacta el Diferencial Cambiario Realizado (Fase 1C.6):
+    - Cuentas por Pagar (2101-01) se amortiza al valor contable histórico en NIO.
+      En la última liquidación que extingue la obligación, extingue exactamente el saldo contable residual remanente.
+    - Tesorería (1102-01 / 1101-01) se acredita al valor real desembolsado en NIO a la tasa de liquidación.
+    - La diferencia resultante se reconoce como Pérdida por Diferencial Cambiario (DEBE 6201-01) o Ganancia por Diferencial Cambiario (HABER 4201-01).
     """
     from decimal import Decimal, ROUND_HALF_UP
-    from django.db import IntegrityError, transaction
+    from django.db import IntegrityError, transaction, models
     from apps.finance.models import JournalEntry, JournalEntryLine
 
     existing = supplier_payment.journal_entries.filter(entry_type=JournalEntry.EntryType.PAYMENTS).first()
@@ -536,17 +538,37 @@ def record_supplier_payment_journal_entry(organization, supplier_payment, user, 
         accounts = ensure_default_chart_of_accounts(organization)
 
     po = supplier_payment.purchase_order
-    if po.currency_code != 'NIO':
-        if supplier_payment.exchange_rate_applied != po.exchange_rate:
-            raise ValidationError(
-                f"Operación cambiaria no soportada: La orden {po.number} fue reconocida contablemente a una tasa de {po.exchange_rate:.4f}. "
-                f"El egreso {supplier_payment.number} posee una tasa diferente ({supplier_payment.exchange_rate_applied:.4f}), "
-                f"lo cual generaría un descuadre en Cuentas por Pagar sin política de diferencial cambiario."
-            )
-        rate = supplier_payment.exchange_rate_applied
+    is_foreign_currency = (po.currency_code != 'NIO')
+
+    # 1. Determinar el valor de la deuda que se cancela en NIO (CxP 2101-01)
+    if is_foreign_currency:
+        hist_rate = po.exchange_rate
+        total_hist_nio = (po.net_payable * hist_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        if po.balance_due <= Decimal('0.00'):
+            # Última liquidación: extinguir exactamente el saldo contable residual
+            prev_amortizations_nio = JournalEntryLine.objects.filter(
+                entry__organization=organization,
+                entry__source_purchase_order=po,
+                entry__entry_type=JournalEntry.EntryType.PAYMENTS,
+                account=accounts['2101-01'],
+            ).exclude(entry__source_supplier_payment=supplier_payment).aggregate(t=models.Sum('debit'))['t'] or Decimal('0.00')
+            cxp_nio = (total_hist_nio - prev_amortizations_nio).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        else:
+            cxp_nio = (supplier_payment.amount_applied_to_order * hist_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     else:
-        rate = Decimal('1.0')
-    applied_nio = (supplier_payment.amount_applied_to_order * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        cxp_nio = supplier_payment.amount_applied_to_order.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    # 2. Determinar el desembolso real en NIO (Bancos / Caja)
+    settlement_rate = supplier_payment.exchange_rate_applied or Decimal('1.0')
+    if supplier_payment.currency_paid == 'USD':
+        disbursement_nio = (supplier_payment.amount_in_payment_currency * settlement_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    elif supplier_payment.currency_paid == 'NIO':
+        disbursement_nio = supplier_payment.amount_in_payment_currency.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    else:
+        disbursement_nio = (supplier_payment.amount_in_payment_currency * settlement_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    # 3. Determinar diferencial cambiario
+    fx_diff = disbursement_nio - cxp_nio
 
     # Determinar cuenta de tesorería contra la que se desembolsó
     if supplier_payment.bank_account_id:
@@ -575,24 +597,47 @@ def record_supplier_payment_journal_entry(organization, supplier_payment, user, 
                 created_by=user,
             )
 
-            # 1. DEBE: Proveedores Nacionales (CxP) (Disminución de pasivo)
+            # 1. DEBE: Proveedores Nacionales (CxP) por el valor histórico cancelado
             JournalEntryLine.objects.create(
                 organization=organization,
                 entry=entry,
                 account=accounts['2101-01'],
                 concept=f"Amortización CxP {po.number} - {supplier_payment.number}",
-                debit=applied_nio,
+                debit=cxp_nio,
                 credit=Decimal('0.00'),
             )
 
-            # 2. HABER: Bancos Institucionales o Caja (Disminución de activo)
+            # 2. Diferencial Cambiario
+            if fx_diff > Decimal('0.00'):
+                # Pérdida cambiaria (DEBE 6201-01)
+                JournalEntryLine.objects.create(
+                    organization=organization,
+                    entry=entry,
+                    account=accounts['6201-01'],
+                    concept=f"Pérdida por Diferencial Cambiario - {supplier_payment.number}",
+                    debit=fx_diff,
+                    credit=Decimal('0.00'),
+                )
+            elif fx_diff < Decimal('0.00'):
+                # Ganancia cambiaria (HABER 4201-01)
+                gain_amt = abs(fx_diff)
+                JournalEntryLine.objects.create(
+                    organization=organization,
+                    entry=entry,
+                    account=accounts['4201-01'],
+                    concept=f"Ganancia por Diferencial Cambiario - {supplier_payment.number}",
+                    debit=Decimal('0.00'),
+                    credit=gain_amt,
+                )
+
+            # 3. HABER: Bancos Institucionales o Caja por el desembolso real
             JournalEntryLine.objects.create(
                 organization=organization,
                 entry=entry,
                 account=cash_or_bank_account,
                 concept=credit_concept,
                 debit=Decimal('0.00'),
-                credit=applied_nio,
+                credit=disbursement_nio,
             )
 
             entry.verify_and_save_balance()
@@ -620,28 +665,48 @@ def record_client_collection(
     notes: str = '',
     payment_date=None,
     idempotency_key: str = None,
+    exchange_rate_applied: Decimal = None,
 ):
     """
     Orquesta atómicamente el ciclo completo de cobranza:
     1. Valida pertenencia de la factura y estado cobrable.
-    2. Valida la cuenta bancaria (misma organización y activa si el método es bancario).
+    2. Valida la cuenta bancaria (misma organización, activa y con moneda compatible).
     3. Maneja Idempotencia estricta vía PaymentIdempotencyRecord (token SHA-256 de parámetros).
     4. Bloquea pesimísticamente la factura y la cuenta bancaria (select_for_update).
     5. Valida importes y previene cobros excedentes al saldo pendiente.
     6. Valida unicidad de referencia bancaria por cuenta y organización.
     7. Emite el Recibo Oficial de Caja (PaymentReceipt).
     8. Si es bancario, incrementa BankAccount.current_balance y asienta FinancialTransaction.
-    9. Asegura la póliza de ventas (SALES) y genera la póliza de cobranza cuadrada (COLLECTIONS).
+    9. Asegura la póliza de ventas (SALES) y genera la póliza de cobranza cuadrada (COLLECTIONS)
+       reconociendo ganancias (4201-01) o pérdidas (6201-01) cambiarias realizadas de forma exacta.
     """
     import hashlib
     from decimal import Decimal, ROUND_HALF_UP
-    from django.db import IntegrityError
+    from django.db import IntegrityError, models
     from django.core.exceptions import ValidationError
     from apps.billing.models import PaymentReceipt, Invoice, PaymentIdempotencyRecord
     from apps.finance.models import BankAccount, FinancialTransaction, JournalEntry, JournalEntryLine
 
     if invoice.organization_id != organization.id:
         raise ValidationError("La factura no pertenece a la organización actual.")
+
+    amt = Decimal(str(amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    if amt <= Decimal('0.00'):
+        raise ValidationError("El monto recaudado debe ser estrictamente mayor a 0.00.")
+
+    clean_ref = (reference_number or '').strip()
+    clean_idempotency_key = (idempotency_key or '').strip()
+    curr = (currency_paid or invoice.currency_code).strip().upper()
+
+    if exchange_rate_applied is not None:
+        rate_to_apply = Decimal(str(exchange_rate_applied))
+        if rate_to_apply <= Decimal('0.0000'):
+            raise ValidationError("La tasa de cambio aplicada debe ser un valor positivo estrictamente mayor a 0.")
+    else:
+        rate_to_apply = invoice.exchange_rate if invoice.exchange_rate and invoice.exchange_rate > Decimal('0.0000') else Decimal('1.0')
+
+    if rate_to_apply <= Decimal('0.0000'):
+        raise ValidationError("La tasa de cambio aplicada debe ser un valor positivo estrictamente mayor a 0.")
 
     is_bank_method = payment_method in [
         PaymentReceipt.PaymentMethod.TRANSFER_BAC,
@@ -658,18 +723,15 @@ def record_client_collection(
             raise ValidationError("La cuenta bancaria no pertenece a la organización de la factura.")
         if not bank_account.is_active:
             raise ValidationError("La cuenta bancaria seleccionada se encuentra inactiva.")
+        if bank_account.currency != curr and not (set([bank_account.currency, curr]) <= {'NIO', 'USD'}):
+            raise ValidationError(
+                f"La moneda de la cuenta bancaria ({bank_account.currency}) es incompatible con la moneda de recaudación ({curr})."
+            )
 
-    amt = Decimal(str(amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-    if amt <= Decimal('0.00'):
-        raise ValidationError("El monto recaudado debe ser estrictamente mayor a 0.00.")
-
-    clean_ref = (reference_number or '').strip()
-    clean_idempotency_key = (idempotency_key or '').strip()
-    curr = (currency_paid or invoice.currency_code).strip().upper()
     bank_id_str = str(bank_account.pk if bank_account else '')
 
     # 1. Comprobación y Replay de Idempotencia de Solicitud
-    req_payload_str = f"{organization.id}:{invoice.pk}:{amt}:{curr}:{payment_method}:{bank_id_str}:{clean_ref}"
+    req_payload_str = f"{organization.id}:{invoice.pk}:{amt}:{curr}:{payment_method}:{bank_id_str}:{clean_ref}:{rate_to_apply}"
     req_hash = hashlib.sha256(req_payload_str.encode('utf-8')).hexdigest()
 
     if clean_idempotency_key:
@@ -702,14 +764,18 @@ def record_client_collection(
     locked_bank = None
     if bank_account:
         locked_bank = BankAccount.objects.select_for_update().get(pk=bank_account.pk, organization=organization)
+        if locked_bank.currency != curr and not (set([locked_bank.currency, curr]) <= {'NIO', 'USD'}):
+            raise ValidationError(
+                f"La moneda de la cuenta bancaria ({locked_bank.currency}) es incompatible con la moneda de recaudación ({curr})."
+            )
 
     # 4. Conversión bimonetaria a la moneda de la factura
     if curr == locked_inv.currency_code:
         applied_to_inv = amt
     elif curr == 'USD' and locked_inv.currency_code == 'NIO':
-        applied_to_inv = (amt * locked_inv.exchange_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        applied_to_inv = (amt * rate_to_apply).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     elif curr == 'NIO' and locked_inv.currency_code == 'USD':
-        applied_to_inv = (amt / locked_inv.exchange_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        applied_to_inv = (amt / rate_to_apply).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     else:
         applied_to_inv = amt
 
@@ -753,12 +819,12 @@ def record_client_collection(
             reference_number=clean_ref,
             currency_paid=curr,
             amount_in_payment_currency=amt,
-            exchange_rate_applied=locked_inv.exchange_rate,
+            exchange_rate_applied=rate_to_apply,
             amount_applied_to_invoice=applied_to_inv,
             received_by=user,
             notes=notes,
         )
-    except IntegrityError as e:
+    except IntegrityError:
         raise ValidationError(f"Conflicto de integridad: La referencia bancaria '{clean_ref}' ya fue registrada concurrentemente.")
 
     # 7. Movimiento de Tesorería (BankAccount y FinancialTransaction)
@@ -767,9 +833,9 @@ def record_client_collection(
         if locked_bank.currency == curr:
             bank_amt = amt
         elif locked_bank.currency == 'NIO' and curr == 'USD':
-            bank_amt = (amt * locked_inv.exchange_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            bank_amt = (amt * rate_to_apply).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         elif locked_bank.currency == 'USD' and curr == 'NIO':
-            bank_amt = (amt / locked_inv.exchange_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            bank_amt = (amt / rate_to_apply).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         else:
             bank_amt = amt
 
@@ -793,8 +859,37 @@ def record_client_collection(
     # Garantizar que exista el asiento de venta previo
     record_invoice_sales_journal_entry(organization, locked_inv, user, accounts=accounts)
 
-    rate_nio = locked_inv.exchange_rate if locked_inv.currency_code == 'USD' else Decimal('1.0')
-    amt_nio = (applied_to_inv * rate_nio).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    is_foreign_currency = (locked_inv.currency_code != 'NIO')
+    locked_inv.refresh_from_db()
+
+    # 1. Determinar el valor del derecho que se cancela en NIO (CxC 1103-01)
+    if is_foreign_currency:
+        hist_rate = locked_inv.exchange_rate
+        total_hist_nio = (locked_inv.net_receivable * hist_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        if locked_inv.balance_due <= Decimal('0.00'):
+            # Última liquidación: extinguir exactamente el saldo contable residual
+            prev_credits_nio = JournalEntryLine.objects.filter(
+                entry__organization=organization,
+                entry__source_invoice=locked_inv,
+                entry__entry_type=JournalEntry.EntryType.COLLECTIONS,
+                account=accounts['1103-01'],
+            ).exclude(entry__source_payment_receipt=receipt).aggregate(t=models.Sum('credit'))['t'] or Decimal('0.00')
+            cxc_nio = (total_hist_nio - prev_credits_nio).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        else:
+            cxc_nio = (applied_to_inv * hist_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    else:
+        cxc_nio = applied_to_inv.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    # 2. Determinar el valor real recaudado en NIO (Bancos / Caja)
+    if curr == 'USD':
+        received_nio = (amt * rate_to_apply).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    elif curr == 'NIO':
+        received_nio = amt.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    else:
+        received_nio = (amt * rate_to_apply).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    # 3. Determinar diferencial cambiario en Cobranza
+    fx_diff = received_nio - cxc_nio
 
     existing_col = JournalEntry.objects.filter(
         organization=organization,
@@ -818,21 +913,48 @@ def record_client_collection(
             )
 
             acc_debit = accounts['1102-01'] if locked_bank else accounts['1101-01']
+
+            # 1. DEBE: Bancos o Caja por el valor real recaudado en NIO
             JournalEntryLine.objects.create(
                 organization=organization,
                 entry=collection_entry,
                 account=acc_debit,
                 concept=f"Ingreso {receipt.get_payment_method_display()} {receipt.number}",
-                debit=amt_nio,
+                debit=received_nio,
                 credit=Decimal('0.00'),
             )
+
+            # 2. Diferencial Cambiario
+            if fx_diff > Decimal('0.00'):
+                # Ganancia cambiaria (HABER 4201-01)
+                JournalEntryLine.objects.create(
+                    organization=organization,
+                    entry=collection_entry,
+                    account=accounts['4201-01'],
+                    concept=f"Ganancia por Diferencial Cambiario - {receipt.number}",
+                    debit=Decimal('0.00'),
+                    credit=fx_diff,
+                )
+            elif fx_diff < Decimal('0.00'):
+                # Pérdida cambiaria (DEBE 6201-01)
+                loss_amt = abs(fx_diff)
+                JournalEntryLine.objects.create(
+                    organization=organization,
+                    entry=collection_entry,
+                    account=accounts['6201-01'],
+                    concept=f"Pérdida por Diferencial Cambiario - {receipt.number}",
+                    debit=loss_amt,
+                    credit=Decimal('0.00'),
+                )
+
+            # 3. HABER: Clientes / CxC (1103-01) por el valor histórico cancelado
             JournalEntryLine.objects.create(
                 organization=organization,
                 entry=collection_entry,
                 account=accounts['1103-01'],
                 concept=f"Abono CxC Factura {locked_inv.number}",
                 debit=Decimal('0.00'),
-                credit=amt_nio,
+                credit=cxc_nio,
             )
 
             collection_entry.verify_and_save_balance()

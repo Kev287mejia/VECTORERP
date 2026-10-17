@@ -206,6 +206,7 @@ def record_supplier_disbursement(
             'payment_method': payment_method,
             'bank_account_id': str(bank_account.id) if bank_account else '',
             'reference_number': clean_ref,
+            'exchange_rate_applied': str(exchange_rate_applied) if exchange_rate_applied else '',
         }
         computed_hash = hashlib.sha256(json.dumps(payload_data, sort_keys=True).encode('utf-8')).hexdigest()
 
@@ -313,27 +314,22 @@ def record_supplier_disbursement(
                 f"Disponible: {locked_bank.currency} {locked_bank.current_balance:,.2f}, Requerido: {locked_bank.currency} {amt:,.2f}."
             )
 
-    # 5. Contención de diferencial cambiario y conversión bimonetaria a la moneda de la Orden de Compra
-    if (
-        locked_po.currency_code != 'NIO'
-        and exchange_rate_applied
-        and exchange_rate_applied != locked_po.exchange_rate
-    ):
-        raise ValidationError(
-            f"Operación cambiaria no soportada: La orden de compra {locked_po.number} está denominada en moneda extranjera "
-            f"({locked_po.currency_code}) y fue reconocida contablemente a una tasa de {locked_po.exchange_rate:.4f}. "
-            f"No se permite liquidar a una tasa diferente ({exchange_rate_applied:.4f}) porque no existe una política contable "
-            f"aprobada para el diferencial cambiario (ganancia/pérdida en cambio). Debe utilizar la tasa de reconocimiento oficial "
-            f"({locked_po.exchange_rate:.4f}) o liquidar sin alterar la tasa contable registrada."
-        )
+    # 5. Validación de tasa de cambio y conversión bimonetaria a la moneda de la Orden de Compra
+    if exchange_rate_applied is not None:
+        if exchange_rate_applied <= Decimal('0.0000'):
+            raise ValidationError("La tasa de cambio aplicada debe ser un valor positivo estrictamente mayor a 0.")
+        tc = exchange_rate_applied
+    else:
+        tc = locked_po.exchange_rate
+
+    if tc <= Decimal('0.0000'):
+        raise ValidationError("La tasa de cambio aplicada debe ser un valor positivo estrictamente mayor a 0.")
 
     if locked_inv and locked_po.currency_code != 'NIO' and locked_inv.exchange_rate != locked_po.exchange_rate:
         raise ValidationError(
             f"Incompatibilidad cambiaria: La tasa de cambio de la factura ({locked_inv.exchange_rate:.4f}) "
             f"difiere de la tasa de reconocimiento contable de la orden de compra ({locked_po.exchange_rate:.4f})."
         )
-
-    tc = exchange_rate_applied or locked_po.exchange_rate
     if curr == locked_po.currency_code:
         applied_to_po = amt
     elif curr == 'USD' and locked_po.currency_code == 'NIO':

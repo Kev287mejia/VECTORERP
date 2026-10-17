@@ -49,12 +49,37 @@ def compute_line_hash(
     amount: Decimal,
     reference: str,
     description: str,
+    occurrence: int = 1,
 ) -> str:
-    """Calcula un hash determinista para identificar de forma unívoca una línea de extracto."""
+    """
+    Calcula un hash determinista para identificar de forma unívoca una línea de extracto.
+    Incorpora la ocurrencia del movimiento para soportar legítimamente operaciones repetidas
+    con idéntica fecha, monto y concepto dentro de un extracto bancario.
+    """
     clean_ref = (reference or '').strip().upper()
     clean_desc = (description or '').strip().upper()
-    payload = f"{org_id}:{bank_account_id}:{post_date.isoformat()}:{movement_type}:{amount:.2f}:{clean_ref}:{clean_desc}"
+    payload = f"{org_id}:{bank_account_id}:{post_date.isoformat()}:{movement_type}:{amount:.2f}:{clean_ref}:{clean_desc}:{occurrence}"
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def normalize_reference(ref: str | None) -> str:
+    """
+    Normaliza una referencia bancaria para comparación determinista:
+    - Remueve espacios, guiones y caracteres no alfanuméricos.
+    - Convierte a mayúsculas.
+    """
+    if not ref:
+        return ''
+    cleaned = str(ref).strip().upper()
+    return re.sub(r'[^A-Z0-9]', '', cleaned)
+
+
+# Referencias genéricas que no aportan especificidad suficiente para una coincidencia exacta automática
+GENERIC_REFERENCES = {
+    '', '0', '00', '000', '0000', 'NA', 'SINREF', 'PAGO', 'TRANSF',
+    'TRANSFERENCIA', 'DEPOSITO', 'CHEQUE', 'NOTA', 'ND', 'NC', 'TRX',
+    'REF', 'BANCO', 'CARGO', 'ABONO', 'MOVIMIENTO',
+}
 
 
 def _parse_date(raw_date_str: str) -> date:
@@ -151,13 +176,18 @@ def parse_and_validate_bank_statement_csv(
 
     file_hash = hashlib.sha256(raw_bytes).hexdigest()
 
-    # Detectar dialecto y delimitador
-    sample = text[:2048]
+    # Detectar dialecto y delimitador de forma robusta (soporta comas, punto y coma, tabulador y barra vertical)
+    sample = text[:4096]
     delimiter = ','
-    for candidate in [',', ';', '\t']:
-        if candidate in sample:
-            delimiter = candidate
-            break
+    try:
+        sniffer = csv.Sniffer()
+        dialect = sniffer.sniff(sample, delimiters=',;\t|')
+        delimiter = dialect.delimiter
+    except Exception:
+        first_line = next((l for l in sample.splitlines() if l.strip()), '')
+        counts = {d: first_line.count(d) for d in [';', '\t', '|', ',']}
+        best_del = max(counts, key=counts.get)
+        delimiter = best_del if counts[best_del] > 0 else ','
 
     f_stream = io.StringIO(text)
     reader = csv.reader(f_stream, delimiter=delimiter)
@@ -212,7 +242,7 @@ def parse_and_validate_bank_statement_csv(
         )
 
     parsed_lines = []
-    seen_intrafile_hashes = set()
+    intrafile_sig_counts = {}
     total_debits = Decimal('0.00')
     total_credits = Decimal('0.00')
     min_date = None
@@ -336,7 +366,20 @@ def parse_and_validate_bank_statement_csv(
         if amount is None or amount <= Decimal('0.00'):
             raise ValidationError(f"Línea {row_idx}: El importe debe ser un valor positivo mayor a 0.00.")
 
-        # Calcular hash de línea determinista
+        # Rastrear ocurrencias de movimientos idénticos en el archivo para permitir operaciones legítimamente repetidas
+        line_sig = (
+            bank_account.organization_id,
+            bank_account.id,
+            line_date,
+            movement_type,
+            amount,
+            (line_ref or '').strip().upper(),
+            (line_desc or '').strip().upper(),
+        )
+        occurrence_in_file = intrafile_sig_counts.get(line_sig, 0) + 1
+        intrafile_sig_counts[line_sig] = occurrence_in_file
+
+        # Calcular hash de línea determinista incorporando la ocurrencia
         l_hash = compute_line_hash(
             org_id=bank_account.organization_id,
             bank_account_id=bank_account.id,
@@ -345,14 +388,8 @@ def parse_and_validate_bank_statement_csv(
             amount=amount,
             reference=line_ref,
             description=line_desc,
+            occurrence=occurrence_in_file,
         )
-
-        if l_hash in seen_intrafile_hashes:
-            raise ValidationError(
-                f"Línea {row_idx}: Movimiento duplicado dentro del mismo archivo: "
-                f"Fecha {line_date}, {movement_type}, {amount} {bank_account.currency}, Ref: '{line_ref}'."
-            )
-        seen_intrafile_hashes.add(l_hash)
 
         if movement_type == BankStatementLine.MovementType.DEBIT:
             total_debits += amount
@@ -526,7 +563,7 @@ def run_reconciliation_matching(
     for line in unreconciled_lines:
         expected_types = INFLOW_TYPES if line.movement_type == BankStatementLine.MovementType.CREDIT else OUTFLOW_TYPES
         
-        # Filtrar candidatos en ERP
+        # Filtrar candidatos en ERP que coincidan en cuenta, moneda, sentido, importe exacto y ventana de 15 días
         candidates = [
             tx for tx in unreconciled_txs
             if tx.id not in matched_tx_ids
@@ -535,36 +572,60 @@ def run_reconciliation_matching(
             and abs((line.post_date - tx.created_at.date()).days) <= 15
         ]
 
-        # Verificar si hay coincidencia exacta
-        line_ref_norm = (line.reference or '').strip().upper()
+        line_ref_norm = normalize_reference(line.reference)
+        is_line_ref_specific = bool(
+            line_ref_norm
+            and len(line_ref_norm) >= 3
+            and line_ref_norm not in GENERIC_REFERENCES
+        )
+
         exact_candidate = None
+        exact_reject_reason = None
 
-        if len(candidates) == 1:
-            cand = candidates[0]
-            cand_ref_norm = (cand.reference_code or '').strip().upper()
-            date_diff = abs((line.post_date - cand.created_at.date()).days)
-
-            # Si la referencia coincide (o una contiene a la otra con min 4 caracteres) y fecha <= 5 días
-            ref_match = (
-                line_ref_norm
-                and cand_ref_norm
-                and (line_ref_norm == cand_ref_norm or (len(line_ref_norm) >= 4 and line_ref_norm in cand_ref_norm) or (len(cand_ref_norm) >= 4 and cand_ref_norm in line_ref_norm))
-            )
-
-            if ref_match and date_diff <= 5:
-                exact_candidate = cand
-            elif date_diff <= 3 and (not line_ref_norm or not cand_ref_norm):
-                # Si una de las referencias está vacía pero la fecha es casi idéntica (<=3 días) y único candidato
-                exact_candidate = cand
-
-        elif len(candidates) > 1 and line_ref_norm:
-            # Buscar si exactamente uno coincide por referencia
-            ref_matches = [
+        if candidates:
+            # Buscar candidatos cuya referencia normalizada sea EXACTAMENTE idéntica a la del extracto
+            exact_ref_candidates = [
                 cand for cand in candidates
-                if (cand.reference_code or '').strip().upper() == line_ref_norm
+                if is_line_ref_specific
+                and normalize_reference(cand.reference_code) == line_ref_norm
+                and abs((line.post_date - cand.created_at.date()).days) <= 5
             ]
-            if len(ref_matches) == 1:
-                exact_candidate = ref_matches[0]
+
+            if len(exact_ref_candidates) == 1:
+                # Coincidencia unívoca y estricta:
+                # - Misma cuenta bancaria y organización
+                # - Misma moneda
+                # - Importe idéntico con precisión de centavos
+                # - Sentido contable compatible
+                # - Ventana de fecha <= 5 días
+                # - Referencia normalizada EXACTA, no genérica y longitud >= 3
+                # - Un único candidato ERP con esa referencia
+                exact_candidate = exact_ref_candidates[0]
+            elif len(exact_ref_candidates) > 1:
+                # Ambigüedad: Múltiples transacciones ERP con la misma referencia exacta
+                exact_reject_reason = (
+                    f"Múltiples transacciones ERP ({len(exact_ref_candidates)}) comparten la referencia '{line.reference}'. "
+                    f"Requiere desambiguación humana."
+                )
+            else:
+                # No hay coincidencia exacta de referencia.
+                # Explicar con transparencia por qué no es exacta y pasa a revisión manual
+                if not is_line_ref_specific:
+                    if not line_ref_norm:
+                        exact_reject_reason = "El movimiento del extracto carece de referencia bancaria unívoca."
+                    elif len(line_ref_norm) < 3:
+                        exact_reject_reason = f"La referencia del extracto '{line.reference}' es demasiado corta para desambiguación automática."
+                    else:
+                        exact_reject_reason = f"La referencia del extracto '{line.reference}' es genérica o ambigua."
+                elif len(candidates) == 1:
+                    cand_ref = candidates[0].reference_code or 'N/A'
+                    cand_ref_norm = normalize_reference(candidates[0].reference_code)
+                    if cand_ref_norm and (line_ref_norm in cand_ref_norm or cand_ref_norm in line_ref_norm):
+                        exact_reject_reason = f"Coincidencia parcial de referencia ('{line.reference}' vs ERP '{cand_ref}'). Requiere validación humana."
+                    else:
+                        exact_reject_reason = f"Las referencias difieren (Extracto '{line.reference}' vs ERP '{cand_ref}'). Requiere revisión manual."
+                else:
+                    exact_reject_reason = f"Existen {len(candidates)} transacciones ERP del mismo importe sin coincidencia unívoca de referencia."
 
         if exact_candidate:
             exact_matches.append({
@@ -574,7 +635,7 @@ def run_reconciliation_matching(
                     f"Importe exacto: {line.amount} {line.currency}",
                     f"Sentido coincidente: {line.get_movement_type_display()}",
                     f"Fecha con diferencia de {abs((line.post_date - exact_candidate.created_at.date()).days)} día(s)",
-                    f"Referencia banco '{line.reference or 'N/A'}' vs ERP '{exact_candidate.reference_code or 'N/A'}'",
+                    f"Referencia exacta normalizada: '{line.reference}' <-> '{exact_candidate.reference_code}'",
                 ],
             })
             matched_tx_ids.add(exact_candidate.id)
@@ -584,16 +645,18 @@ def run_reconciliation_matching(
                 'candidate_transactions': candidates,
                 'reasons': [
                     f"Importe coincidente: {line.amount} {line.currency}",
-                    f"{len(candidates)} transacción(es) candidata(s) en ventana de fecha",
-                    "Requiere confirmación manual por discrepancia o ausencia de referencia unívoca",
+                    f"Candidatos disponibles en ventana de fechas: {len(candidates)}",
+                    exact_reject_reason or "Requiere confirmación manual por ausencia de coincidencia unívoca de referencia.",
                 ],
             })
         else:
-            # Comprobar si hay discrepancia de importe con misma referencia
+            # Comprobar si hay discrepancia de importe con misma referencia exacta
             ref_same_diff_amt = None
-            if line_ref_norm:
+            if is_line_ref_specific:
                 ref_same_diff_amt = next(
-                    (tx for tx in unreconciled_txs if tx.id not in matched_tx_ids and (tx.reference_code or '').strip().upper() == line_ref_norm),
+                    (tx for tx in unreconciled_txs
+                     if tx.id not in matched_tx_ids
+                     and normalize_reference(tx.reference_code) == line_ref_norm),
                     None
                 )
 
@@ -602,7 +665,7 @@ def run_reconciliation_matching(
                     'statement_line': line,
                     'financial_transaction': ref_same_diff_amt,
                     'reasons': [
-                        f"Referencia idéntica '{line_ref_norm}', pero los montos difieren:",
+                        f"Referencia idéntica '{line.reference}', pero los montos difieren:",
                         f"Extracto={line.amount} {line.currency} vs ERP={ref_same_diff_amt.amount} {line.currency}",
                     ],
                 })
@@ -659,9 +722,9 @@ def confirm_reconciliation_match(
         raise ValidationError("La línea del extracto y la transacción ERP pertenecen a cuentas bancarias diferentes.")
 
     # 2. Validación de estado no conciliado previo
-    if statement_line.status == BankStatementLine.LineStatus.RECONCILED:
+    if statement_line.status == BankStatementLine.LineStatus.RECONCILED or statement_line.matched_transaction_id is not None:
         raise ValidationError("Esta línea del extracto bancario ya se encuentra conciliada.")
-    if financial_transaction.is_reconciled:
+    if financial_transaction.is_reconciled or (hasattr(financial_transaction, 'reconciled_statement_line') and financial_transaction.reconciled_statement_line is not None):
         raise ValidationError(f"La transacción {financial_transaction.number} ya fue conciliada previamente.")
 
     # 3. Validación de importe

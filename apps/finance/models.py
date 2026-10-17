@@ -509,9 +509,16 @@ class FinancialTransaction(TenantScopedModel):
     def is_reconciled(self) -> bool:
         """Indica si la transacción fue conciliada con una línea de extracto bancario."""
         try:
-            return self.reconciliation_match is not None
+            if hasattr(self, 'reconciliation_match') and self.reconciliation_match is not None:
+                return True
         except Exception:
-            return False
+            pass
+        try:
+            if hasattr(self, 'reconciled_statement_line') and self.reconciled_statement_line is not None:
+                return True
+        except Exception:
+            pass
+        return False
 
 
 class AccountingAccount(TenantScopedModel):
@@ -1272,6 +1279,16 @@ class BankStatementLine(TenantScopedModel):
             ),
         ]
 
+    def clean(self):
+        super().clean()
+        if self.matched_transaction_id:
+            if self.matched_transaction.organization_id != self.organization_id:
+                raise ValidationError("La transacción emparejada no pertenece a la misma organización.")
+            if self.matched_transaction.bank_account_id != self.bank_account_id:
+                raise ValidationError("La transacción emparejada no pertenece a la misma cuenta bancaria.")
+            if self.matched_transaction.amount != self.amount:
+                raise ValidationError("El importe de la transacción emparejada difiere del importe de la línea.")
+
     def __str__(self) -> str:
         return f"Línea {self.line_number} [{self.post_date}] {self.get_movement_type_display()}: {self.amount} {self.currency} - {self.description[:30]}"
 
@@ -1325,6 +1342,20 @@ class BankReconciliationMatch(TenantScopedModel):
         verbose_name = "Conciliación Bancaria (Emparejamiento)"
         verbose_name_plural = "Conciliaciones Bancarias (Emparejamientos)"
         ordering = ['-reconciled_at']
+
+    def clean(self):
+        super().clean()
+        if self.statement_line_id and self.financial_transaction_id:
+            if self.statement_line.organization_id != self.financial_transaction.organization_id:
+                raise ValidationError("Aislamiento multiempresa violado: La línea y la transacción pertenecen a organizaciones distintas.")
+            if self.statement_line.bank_account_id != self.financial_transaction.bank_account_id:
+                raise ValidationError("La línea del extracto y la transacción ERP deben pertenecer a la misma cuenta bancaria.")
+            if self.statement_line.amount != self.financial_transaction.amount:
+                raise ValidationError(f"Discrepancia de importe: {self.statement_line.amount} != {self.financial_transaction.amount}.")
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
 
     def __str__(self) -> str:
         return f"Match [{self.get_match_type_display()}]: Line {self.statement_line_id} <-> TRX {self.financial_transaction.number}"

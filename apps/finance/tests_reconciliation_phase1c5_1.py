@@ -316,28 +316,12 @@ class BankReconciliationTestCase(TestCase):
         self.assertIn("ya fue importado previamente", str(ctx.exception).lower())
         self.assertEqual(BankStatement.objects.filter(bank_account=self.bank_a).count(), 1)
 
-    def test_04_duplicate_bank_lines_within_and_across_files_rejected(self):
+    def test_04_duplicate_bank_lines_and_reimport_idempotency(self):
         """
-        4. Detección estricta de líneas duplicadas:
-        - Fila duplicada idéntica dentro del mismo archivo CSV.
-        - Movimiento duplicado que ya fue importado en un extracto previo de la cuenta.
+        4. Detección estricta de líneas duplicadas e idempotencia:
+        - Movimiento duplicado que ya fue importado en un extracto previo de la cuenta es rechazado.
+        - Reimportar el mismo archivo es rechazado por idempotencia de lote.
         """
-        # Duplicado intra-archivo
-        csv_intra_dup = (
-            "fecha,referencia,descripcion,monto,tipo\n"
-            "2026-10-01,REF-DUP-01,PAGO SERVICIO AGUA,500.00,DEBIT\n"
-            "2026-10-01,REF-DUP-01,PAGO SERVICIO AGUA,500.00,DEBIT\n"
-        )
-        with self.assertRaises(ValidationError) as ctx_intra:
-            import_bank_statement(
-                organization=self.org_a,
-                bank_account=self.bank_a,
-                file_content=csv_intra_dup,
-                file_name='intra_dup.csv',
-            )
-        self.assertIn("duplicado", str(ctx_intra.exception).lower())
-
-        # Duplicado entre extractos diferentes
         csv_file1 = (
             "fecha,referencia,descripcion,monto,tipo\n"
             "2026-10-01,REF-CROSS-01,PAGO ENERGIA ELECTRICA,800.00,DEBIT\n"
@@ -349,6 +333,17 @@ class BankReconciliationTestCase(TestCase):
             file_name='lote1.csv',
         )
 
+        # Intento de reimportar el mismo archivo
+        with self.assertRaises(ValidationError) as ctx_reimport:
+            import_bank_statement(
+                organization=self.org_a,
+                bank_account=self.bank_a,
+                file_content=csv_file1,
+                file_name='lote1_copia.csv',
+            )
+        self.assertIn("ya fue importado previamente", str(ctx_reimport.exception).lower())
+
+        # Archivo nuevo con una línea que ya fue importada en el lote anterior
         csv_file2 = (
             "fecha,referencia,descripcion,monto,tipo\n"
             "2026-10-01,REF-CROSS-01,PAGO ENERGIA ELECTRICA,800.00,DEBIT\n"
@@ -914,3 +909,259 @@ class BankReconciliationTestCase(TestCase):
         self.assertTrue(tx_card.is_reconciled)
         tx_vendor.refresh_from_db()
         self.assertTrue(tx_vendor.is_reconciled)
+
+    def test_15_short_reference_and_partial_substring_classified_as_potential(self):
+        """
+        15. Auditoría de referencias cortas y coincidencias parciales de subcadena:
+        - Referencias de menos de 3 caracteres alfanuméricos (ej. '12', 'AB') o genéricas.
+        - Subcadenas parciales (ej. 'CHQ' en 'CHQ-9999').
+        - El motor DEBE clasificar como POTENTIAL_MATCH (NO EXACT_MATCH) para revisión humana.
+        """
+        tx = FinancialTransaction.objects.create(
+            organization=self.org_a,
+            transaction_type=FinancialTransaction.TransactionType.BANK_TRANSFER,
+            bank_account=self.bank_a,
+            amount=Decimal('600.00'),
+            balance_after=self.bank_a.current_balance - Decimal('600.00'),
+            concept="Pago a Contratista",
+            reference_code="CHQ-9999",
+            performed_by=self.user_coord_a,
+        )
+
+        # Extracto con subcadena parcial de 4 caracteres 'CHQ' pero no idéntica
+        csv_data = (
+            "fecha,referencia,descripcion,monto,tipo\n"
+            f"{timezone.now().date().isoformat()},CHQ,COBRO DE CHEQUE,600.00,DEBIT\n"
+        )
+        stmt = import_bank_statement(
+            organization=self.org_a,
+            bank_account=self.bank_a,
+            file_content=csv_data,
+            file_name='stmt_short_ref.csv',
+        )
+
+        report = run_reconciliation_matching(self.org_a, self.bank_a, statement=stmt)
+        self.assertEqual(len(report['exact_matches']), 0)
+        self.assertEqual(len(report['potential_matches']), 1)
+        # Verificar que auto_confirm_exact_matches NO concilia coincidencias parciales
+        confirmed = auto_confirm_exact_matches(self.org_a, self.bank_a, statement=stmt, user=self.user_coord_a)
+        self.assertEqual(len(confirmed), 0)
+        tx.refresh_from_db()
+        self.assertFalse(tx.is_reconciled)
+
+    def test_16_shared_reference_across_multiple_candidates_potential_match(self):
+        """
+        16. Referencia compartida por varios movimientos ERP:
+        - Dos transacciones ERP asentadas con el mismo importe y la misma referencia (ej. ref genérica).
+        - Una línea de extracto con esa misma referencia.
+        - Ambigüedad material: NO debe auto-confirmar ni clasificar como exacta.
+        """
+        FinancialTransaction.objects.create(
+            organization=self.org_a,
+            transaction_type=FinancialTransaction.TransactionType.VENDOR_DISBURSEMENT,
+            bank_account=self.bank_a,
+            amount=Decimal('2200.00'),
+            balance_after=self.bank_a.current_balance - Decimal('2200.00'),
+            concept="Pago Proveedor Factura A",
+            reference_code="REF-SHARED-888",
+            performed_by=self.user_coord_a,
+        )
+        FinancialTransaction.objects.create(
+            organization=self.org_a,
+            transaction_type=FinancialTransaction.TransactionType.VENDOR_DISBURSEMENT,
+            bank_account=self.bank_a,
+            amount=Decimal('2200.00'),
+            balance_after=self.bank_a.current_balance - Decimal('4400.00'),
+            concept="Pago Proveedor Factura B",
+            reference_code="REF-SHARED-888",
+            performed_by=self.user_coord_a,
+        )
+
+        csv_data = (
+            "fecha,referencia,descripcion,monto,tipo\n"
+            f"{timezone.now().date().isoformat()},REF-SHARED-888,TRANSFERENCIA ELECTRONICA,2200.00,DEBIT\n"
+        )
+        stmt = import_bank_statement(
+            organization=self.org_a,
+            bank_account=self.bank_a,
+            file_content=csv_data,
+            file_name='stmt_shared_ref.csv',
+        )
+
+        report = run_reconciliation_matching(self.org_a, self.bank_a, statement=stmt)
+        self.assertEqual(len(report['exact_matches']), 0)
+        self.assertEqual(len(report['potential_matches']), 1)
+        self.assertIn("Múltiples transacciones ERP", report['potential_matches'][0]['reasons'][2])
+
+    def test_17_multiple_candidates_same_amount_without_unique_ref(self):
+        """
+        17. Múltiples candidatos del mismo importe sin referencia unívoca:
+        - Tres transacciones ERP del mismo monto ($350.00).
+        - Extracto con débito de $350.00 sin referencia.
+        - Debe requerir selección humana y clasificar como POTENTIAL_MATCH.
+        """
+        for i in range(3):
+            FinancialTransaction.objects.create(
+                organization=self.org_a,
+                transaction_type=FinancialTransaction.TransactionType.PETTY_CASH_REPLENISH,
+                bank_account=self.bank_a,
+                amount=Decimal('350.00'),
+                balance_after=self.bank_a.current_balance - Decimal('350.00'),
+                concept=f"Reposición Caja {i+1}",
+                reference_code="",
+                performed_by=self.user_coord_a,
+            )
+
+        csv_data = (
+            "fecha,referencia,descripcion,monto,tipo\n"
+            f"{timezone.now().date().isoformat()},,RETIRO DE EFECTIVO SUCURSAL,350.00,DEBIT\n"
+        )
+        stmt = import_bank_statement(
+            organization=self.org_a,
+            bank_account=self.bank_a,
+            file_content=csv_data,
+            file_name='stmt_mult_cand.csv',
+        )
+
+        report = run_reconciliation_matching(self.org_a, self.bank_a, statement=stmt)
+        self.assertEqual(len(report['exact_matches']), 0)
+        self.assertEqual(len(report['potential_matches']), 1)
+        self.assertEqual(len(report['potential_matches'][0]['candidate_transactions']), 3)
+
+    def test_18_close_dates_with_different_references_classified_as_potential(self):
+        """
+        18. Fechas próximas con referencias diferentes:
+        - Mismo importe ($1,800.00) y fecha contigua (diferencia de 1 día).
+        - Referencia ERP 'REF-ERP-X1' vs Referencia Banco 'REF-BANK-Y2'.
+        - NO debe considerarse exacta; clasifica como POTENTIAL_MATCH para revisión.
+        """
+        FinancialTransaction.objects.create(
+            organization=self.org_a,
+            transaction_type=FinancialTransaction.TransactionType.CLIENT_COLLECTION,
+            bank_account=self.bank_a,
+            amount=Decimal('1800.00'),
+            balance_after=self.bank_a.current_balance + Decimal('1800.00'),
+            concept="Cobro Factura 880",
+            reference_code="REF-ERP-X1",
+            performed_by=self.user_coord_a,
+        )
+
+        csv_data = (
+            "fecha,referencia,descripcion,monto,tipo\n"
+            f"{timezone.now().date().isoformat()},REF-BANK-Y2,DEPOSITO EN EFECTIVO,1800.00,CREDIT\n"
+        )
+        stmt = import_bank_statement(
+            organization=self.org_a,
+            bank_account=self.bank_a,
+            file_content=csv_data,
+            file_name='stmt_diff_refs.csv',
+        )
+
+        report = run_reconciliation_matching(self.org_a, self.bank_a, statement=stmt)
+        self.assertEqual(len(report['exact_matches']), 0)
+        self.assertEqual(len(report['potential_matches']), 1)
+        self.assertIn("difieren", report['potential_matches'][0]['reasons'][2].lower())
+
+    def test_19_legitimate_repeated_lines_in_single_statement(self):
+        """
+        19. Operaciones legítimamente repetidas dentro del extracto:
+        - Un extracto bancario real contiene 3 comisiones idénticas en el mismo día ($2.50 cada una).
+        - Las restricciones de unicidad NO deben bloquear la importación.
+        - Se crean 3 registros distintos con números de línea correlativos y hashes únicos (occ_1, occ_2, occ_3).
+        - Reimportar el extracto completo se rechaza por file_hash.
+        """
+        today_str = timezone.now().date().isoformat()
+        csv_repeated = (
+            "fecha,referencia,descripcion,monto,tipo\n"
+            f"{today_str},,COMISION CONSULTA SALDO ATM,2.50,DEBIT\n"
+            f"{today_str},,COMISION CONSULTA SALDO ATM,2.50,DEBIT\n"
+            f"{today_str},,COMISION CONSULTA SALDO ATM,2.50,DEBIT\n"
+        )
+        stmt = import_bank_statement(
+            organization=self.org_a,
+            bank_account=self.bank_a,
+            file_content=csv_repeated,
+            file_name='comisiones_atm.csv',
+        )
+        self.assertEqual(stmt.lines.count(), 3)
+        line_numbers = list(stmt.lines.values_list('line_number', flat=True))
+        self.assertEqual(line_numbers, [1, 2, 3])
+        hashes = set(stmt.lines.values_list('line_hash', flat=True))
+        self.assertEqual(len(hashes), 3)
+
+        # Reimportación del mismo archivo se rechaza
+        with self.assertRaises(ValidationError) as ctx:
+            import_bank_statement(
+                organization=self.org_a,
+                bank_account=self.bank_a,
+                file_content=csv_repeated,
+                file_name='comisiones_atm.csv',
+            )
+        self.assertIn("ya fue importado previamente", str(ctx.exception).lower())
+
+    def test_20_semicolon_delimiter_and_commas_in_description(self):
+        """
+        20. Soporte de delimitador punto y coma con comas en el texto:
+        - Detecta automáticamente el delimitador ';' cuando el texto contiene comas.
+        """
+        csv_semi = (
+            "fecha;referencia;descripcion;monto;tipo\n"
+            f"{timezone.now().date().isoformat()};REF-SEMI-01;PAGO, MATERIALES Y SUMINISTROS;3500.00;DEBIT\n"
+        )
+        stmt = import_bank_statement(
+            organization=self.org_a,
+            bank_account=self.bank_a,
+            file_content=csv_semi,
+            file_name='extracto_punto_coma.csv',
+        )
+        line = stmt.lines.first()
+        self.assertEqual(line.reference, 'REF-SEMI-01')
+        self.assertEqual(line.description, 'PAGO, MATERIALES Y SUMINISTROS')
+        self.assertEqual(line.amount, Decimal('3500.00'))
+        self.assertEqual(line.movement_type, BankStatementLine.MovementType.DEBIT)
+
+    def test_21_model_level_clean_invariants(self):
+        """
+        21. Invariantes a nivel de modelo en BankReconciliationMatch.clean():
+        - Rechaza emparejamiento entre diferentes organizaciones.
+        - Rechaza emparejamiento entre diferentes cuentas bancarias.
+        - Rechaza discrepancia de importe.
+        """
+        bank_b = BankAccount.objects.create(
+            organization=self.org_b,
+            bank_name=BankAccount.BankName.BANPRO,
+            account_number="9988776655",
+            currency='NIO',
+            current_balance=Decimal('1000.00'),
+            is_active=True,
+        )
+        tx_org_b = FinancialTransaction.objects.create(
+            organization=self.org_b,
+            transaction_type=FinancialTransaction.TransactionType.BANK_TRANSFER,
+            bank_account=bank_b,
+            amount=Decimal('500.00'),
+            balance_after=Decimal('500.00'),
+            concept="Trx Org B",
+            reference_code="REF-B-01",
+        )
+
+        csv_data = (
+            "fecha,referencia,descripcion,monto,tipo\n"
+            f"{timezone.now().date().isoformat()},REF-A-01,Prueba Org A,500.00,DEBIT\n"
+        )
+        stmt_a = import_bank_statement(
+            organization=self.org_a,
+            bank_account=self.bank_a,
+            file_content=csv_data,
+            file_name='stmt_org_a.csv',
+        )
+        line_a = stmt_a.lines.first()
+
+        # Intento de violar aislamiento multi-tenant
+        with self.assertRaises(ValidationError) as ctx_org:
+            BankReconciliationMatch.objects.create(
+                organization=self.org_a,
+                statement_line=line_a,
+                financial_transaction=tx_org_b,
+            )
+        self.assertIn("Aislamiento multiempresa violado", str(ctx_org.exception))

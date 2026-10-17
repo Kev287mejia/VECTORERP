@@ -780,6 +780,9 @@ class SupplierPayment(TenantScopedModel):
                 f"Incompatibilidad monetaria: La moneda de la factura ({self.supplier_invoice.currency_code}) "
                 f"no coincide con la moneda de la orden de compra ({self.purchase_order.currency_code})."
             )
+        if self.currency_paid != 'NIO' and (self.purchase_order_id and self.purchase_order.currency_code != self.currency_paid):
+            if self.exchange_rate_applied is None:
+                raise ValidationError("La tasa de cambio oficial de liquidación es obligatoria para conversiones entre monedas distintas.")
         if self.exchange_rate_applied is not None and self.exchange_rate_applied <= Decimal('0.0000'):
             raise ValidationError("La tasa de cambio aplicada debe ser un valor positivo estrictamente mayor a 0.")
 

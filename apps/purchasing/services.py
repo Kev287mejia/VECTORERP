@@ -319,10 +319,14 @@ def record_supplier_disbursement(
         if exchange_rate_applied <= Decimal('0.0000'):
             raise ValidationError("La tasa de cambio aplicada debe ser un valor positivo estrictamente mayor a 0.")
         tc = exchange_rate_applied
+    elif curr != locked_po.currency_code:
+        raise ValidationError(
+            "La tasa de cambio oficial de liquidación es obligatoria para conversiones entre monedas distintas."
+        )
     else:
-        tc = locked_po.exchange_rate
+        tc = locked_po.exchange_rate or (Decimal('1.0000') if curr == 'NIO' else None)
 
-    if tc <= Decimal('0.0000'):
+    if not tc or tc <= Decimal('0.0000'):
         raise ValidationError("La tasa de cambio aplicada debe ser un valor positivo estrictamente mayor a 0.")
 
     if locked_inv and locked_po.currency_code != 'NIO' and locked_inv.exchange_rate != locked_po.exchange_rate:

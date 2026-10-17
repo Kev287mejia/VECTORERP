@@ -38,6 +38,12 @@ def allocate_petty_cash_fund(
             f"Disponible: C$ {bank.current_balance:,.2f}, Requerido: C$ {amt:,.2f}."
         )
 
+    if caja.current_balance + amt > caja.allocated_amount:
+        raise ValidationError(
+            f"La dotación de C$ {amt:,.2f} excede el monto máximo autorizado del fondo "
+            f"({caja.code} - C$ {caja.allocated_amount:,.2f}). Saldo actual: C$ {caja.current_balance:,.2f}."
+        )
+
     # 1. Descuento bancario
     bank.current_balance -= amt
     bank.save(update_fields=['current_balance', 'updated_at'])
@@ -559,13 +565,17 @@ def record_supplier_payment_journal_entry(organization, supplier_payment, user, 
         cxp_nio = supplier_payment.amount_applied_to_order.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     # 2. Determinar el desembolso real en NIO (Bancos / Caja)
-    settlement_rate = supplier_payment.exchange_rate_applied or Decimal('1.0')
-    if supplier_payment.currency_paid == 'USD':
+    if supplier_payment.currency_paid != 'NIO':
+        if not supplier_payment.exchange_rate_applied or supplier_payment.exchange_rate_applied <= Decimal('0.0000'):
+            raise ValidationError(
+                f"Se requiere una tasa de cambio oficial válida y estrictamente positiva (> 0) "
+                f"para registrar egresos en moneda extranjera ({supplier_payment.currency_paid})."
+            )
+        settlement_rate = supplier_payment.exchange_rate_applied
         disbursement_nio = (supplier_payment.amount_in_payment_currency * settlement_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-    elif supplier_payment.currency_paid == 'NIO':
-        disbursement_nio = supplier_payment.amount_in_payment_currency.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     else:
-        disbursement_nio = (supplier_payment.amount_in_payment_currency * settlement_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        settlement_rate = supplier_payment.exchange_rate_applied or Decimal('1.0')
+        disbursement_nio = supplier_payment.amount_in_payment_currency.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     # 3. Determinar diferencial cambiario
     fx_diff = disbursement_nio - cxp_nio

@@ -155,7 +155,7 @@ class PettyCashFundCreateView(ModuleAccessRequiredMixin, View):
         if form.is_valid():
             fund = form.save(commit=False)
             fund.organization = org
-            fund.current_balance = fund.allocated_amount
+            fund.current_balance = Decimal('0.00')
             fund.save()
             messages.success(
                 request,

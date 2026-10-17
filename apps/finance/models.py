@@ -144,7 +144,15 @@ class PettyCashFund(TenantScopedModel):
             models.UniqueConstraint(
                 fields=['organization', 'code'],
                 name='unique_petty_cash_code_per_tenant',
-            )
+            ),
+            models.CheckConstraint(
+                check=models.Q(current_balance__lte=models.F('allocated_amount')),
+                name='petty_cash_fund_balance_lte_allocated',
+            ),
+            models.CheckConstraint(
+                check=models.Q(current_balance__gte=Decimal('0.00')),
+                name='petty_cash_fund_balance_gte_zero',
+            ),
         ]
 
     def __str__(self) -> str:
@@ -733,7 +741,25 @@ class JournalEntry(TenantScopedModel):
         )
         return self.is_balanced
 
+    def delete(self, *args, **kwargs):
+        if self.pk:
+            in_db = JournalEntry.objects.filter(pk=self.pk).values('is_balanced').first()
+            if (in_db and in_db['is_balanced']) or self.is_balanced or self.lines.exists():
+                raise ValidationError(
+                    "Las pólizas contables registradas en el Libro Diario son inmutables. "
+                    "Prohibido eliminar asientos contables asentados. Utilice pólizas de reversión o ajuste."
+                )
+        super().delete(*args, **kwargs)
+
     def save(self, *args, **kwargs):
+        if not self._state.adding and self.pk:
+            in_db = JournalEntry.objects.filter(pk=self.pk).values('is_balanced').first()
+            if in_db and in_db['is_balanced']:
+                raise ValidationError(
+                    "Las pólizas contables cuadradas y asentadas son inmutables. "
+                    "Prohibido modificar una póliza contable cerrada."
+                )
+
         if not self.number and self.organization_id:
             year = self.date.year if self.date else timezone.now().year
             prefix = f"POL-{year}-"
@@ -761,7 +787,7 @@ class JournalEntryLine(TenantScopedModel):
     """
     entry = models.ForeignKey(
         JournalEntry,
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         related_name='lines',
         verbose_name="Póliza Contable",
     )
@@ -796,6 +822,30 @@ class JournalEntryLine(TenantScopedModel):
 
     def __str__(self) -> str:
         return f"{self.entry.number} · {self.account.code} | D:{self.debit} C:{self.credit}"
+
+    def delete(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError(
+                "Las líneas de póliza contable son inmutables. Prohibido eliminar partidas asentadas."
+            )
+        super().delete(*args, **kwargs)
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding and self.pk:
+            raise ValidationError(
+                "Las líneas de póliza contable son inmutables. Prohibido modificar partidas contables asentadas."
+            )
+        if self.entry_id:
+            entry_balanced = False
+            if hasattr(self, 'entry') and self.entry and self.entry.is_balanced:
+                entry_balanced = True
+            else:
+                entry_balanced = JournalEntry.objects.filter(pk=self.entry_id, is_balanced=True).exists()
+            if entry_balanced:
+                raise ValidationError(
+                    "No se pueden agregar partidas contables a una póliza que ya ha sido cuadrada y asentada."
+                )
+        super().save(*args, **kwargs)
 
 
 class CardBatchSettlement(TenantScopedModel):

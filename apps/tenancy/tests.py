@@ -1131,5 +1131,139 @@ class SaasHqGovernanceAndHardeningTestSuite(TestCase):
         self.assertIn('timestamp', data)
 
 
+class D01DashboardAndSwitchOrgTestCase(TestCase):
+    """
+    Casos de prueba de regresión para Defecto D-01:
+    Verifica que el renderizado del dashboard (incluyendo templates/dashboard/index.html y
+    el switcher de organizaciones de la topbar) funcione correctamente sin errores NoReverseMatch,
+    genere los enlaces correctos para tenancy:switch_org y mantenga la seguridad del endpoint.
+    """
 
+    def setUp(self):
+        self.country_ni, _ = CountryConfig.objects.get_or_create(
+            code='NI',
+            defaults={
+                'name': 'Nicaragua',
+                'flag_emoji': '🇳🇮',
+                'primary_currency_code': 'NIO',
+                'primary_currency_symbol': 'C$',
+                'is_active': True,
+            }
+        )
+        self.user = User.objects.create_user(
+            email='multiempresa@eternallabs.ni',
+            full_name='Usuario Multiempresa',
+            password='Password123*',
+        )
+        self.org1 = Organization.objects.create(
+            name="Empresa Primaria S.A.",
+            slug="empresa-primaria-d01",
+            tax_id="J0310000888111",
+            country=self.country_ni,
+            currency=Organization.Currency.NIO,
+            enabled_modules=['crm', 'operations', 'billing', 'finance'],
+        )
+        self.membership1 = OrganizationMembership.objects.create(
+            user=self.user,
+            organization=self.org1,
+            role_level=RoleLevel.OWNER_ADMIN,
+            is_active=True,
+            is_default_org=True,
+        )
 
+    def test_d01_01_user_with_single_organization(self):
+        """1. Usuario con 1 organización: el dashboard renderiza HTTP 200 sin colisión."""
+        self.client.force_login(self.user)
+        session = self.client.session
+        session['active_org_id'] = str(self.org1.id)
+        session.save()
+
+        response = self.client.get(reverse('tenancy:dashboard'))
+        self.assertEqual(response.status_code, 200)
+
+        # Probar renderizado directo de templates/dashboard/index.html con 1 membresía
+        from django.template.loader import render_to_string
+        html = render_to_string('dashboard/index.html', {
+            'user_memberships': OrganizationMembership.objects.filter(user=self.user),
+            'current_organization': self.org1,
+            'metrics': {},
+            'sample_work_orders': [],
+        }, request=response.wsgi_request)
+        self.assertNotIn("Organizaciones Asociadas a su Cuenta", html)
+
+    def test_d01_02_user_with_two_or_more_organizations_renders_correct_switch_links(self):
+        """2. Usuario con 2 o más organizaciones activas: el selector genera enlaces válidos a tenancy:switch_org sin NoReverseMatch."""
+        org2 = Organization.objects.create(
+            name="Empresa Secundaria S.A.",
+            slug="empresa-secundaria-d01",
+            tax_id="J0310000888222",
+            country=self.country_ni,
+            currency=Organization.Currency.NIO,
+            enabled_modules=['crm', 'billing'],
+        )
+        membership2 = OrganizationMembership.objects.create(
+            user=self.user,
+            organization=org2,
+            role_level=RoleLevel.COMMERCIAL_MGR,
+            is_active=True,
+        )
+
+        self.client.force_login(self.user)
+        session = self.client.session
+        session['active_org_id'] = str(self.org1.id)
+        session.save()
+
+        # Renderizado de la consola operativa principal (que incluye base_erp.html)
+        response = self.client.get(reverse('tenancy:dashboard'))
+        self.assertEqual(response.status_code, 200)
+
+        # Renderizado específico de templates/dashboard/index.html donde residía D-01
+        from django.template.loader import render_to_string
+        memberships_qs = OrganizationMembership.objects.filter(user=self.user).order_by('created_at')
+        html = render_to_string('dashboard/index.html', {
+            'user_memberships': memberships_qs,
+            'current_organization': self.org1,
+            'metrics': {},
+            'sample_work_orders': [],
+        }, request=response.wsgi_request)
+        self.assertIn("Organizaciones Asociadas a su Cuenta", html)
+        expected_url_org1 = reverse('tenancy:switch_org', args=[self.org1.id])
+        expected_url_org2 = reverse('tenancy:switch_org', args=[org2.id])
+        self.assertIn(f'href="{expected_url_org1}"', html)
+        self.assertIn(f'href="{expected_url_org2}"', html)
+
+    def test_d01_03_user_without_active_membership_redirects_to_onboarding(self):
+        """3. Usuario sin membresías activas: middleware redirige a onboarding."""
+        user_no_org = User.objects.create_user(
+            email='huerfano@eternallabs.ni',
+            full_name='Usuario Sin Tenant',
+            password='Password123*',
+        )
+        self.client.force_login(user_no_org)
+        response = self.client.get(reverse('tenancy:dashboard'))
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse('tenancy:onboarding'), response.url)
+
+    def test_d01_04_switch_organization_security_and_authorization(self):
+        """4. Endpoint tenancy:switch_org exige autenticación y membresía activa (404 ante organizaciones ajenas o inactivas)."""
+        anon_client = Client()
+        res_anon = anon_client.get(reverse('tenancy:switch_org', args=[self.org1.id]))
+        self.assertEqual(res_anon.status_code, 302)
+        self.assertIn(reverse('accounts_auth:login'), res_anon.url)
+
+        # Intento de conmutar a organización ajena
+        foreign_org = Organization.objects.create(
+            name="Empresa Ajena S.A.",
+            slug="empresa-ajena-d01",
+            tax_id="J0310000999999",
+            country=self.country_ni,
+            currency=Organization.Currency.NIO,
+        )
+        self.client.force_login(self.user)
+        res_foreign = self.client.get(reverse('tenancy:switch_org', args=[foreign_org.id]))
+        self.assertEqual(res_foreign.status_code, 404)
+
+        # Conmutación legítima mediante GET
+        res_switch = self.client.get(reverse('tenancy:switch_org', args=[self.org1.id]), follow=True)
+        self.assertEqual(res_switch.status_code, 200)
+        self.assertEqual(self.client.session.get('active_org_id'), str(self.org1.id))

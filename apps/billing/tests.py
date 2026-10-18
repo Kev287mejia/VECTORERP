@@ -10,6 +10,8 @@ from django.utils import timezone
 from apps.billing.models import Invoice, InvoiceItem, PaymentReceipt, PosRegisterShift
 from apps.billing.services_pos_shift import open_pos_shift, compute_shift_x_cut_metrics, close_pos_shift_z_cut
 from apps.billing.services import execute_pos_sale
+from apps.finance.models import BankAccount, FinancialTransaction, JournalEntry
+from apps.finance.services import ensure_default_chart_of_accounts
 from apps.inventory.models import InventoryItem, Warehouse, StockBalance
 from apps.core.models import CountryConfig
 from apps.crm.models import Account, Quote, QuoteItem
@@ -854,3 +856,262 @@ class PosRegisterShiftAndPwaTestCase(TestCase):
         self.assertEqual(resp_offline.status_code, 200)
         self.assertIn('Modo Contingencia Offline', resp_offline.content.decode('utf-8'))
         self.assertIn('Ley 618', resp_offline.content.decode('utf-8'))
+
+
+class D02ClientCollectionBankIsolationTestCase(TestCase):
+    """
+    Casos de prueba de regresión para Defecto D-02:
+    Verifica que InvoiceRegisterPaymentView restrinja estrictamente la cuenta bancaria
+    a la organización activa mediante BankAccount.objects.for_org(request.organization),
+    habiendo eliminado el fallback global (BankAccount.objects.filter(pk=bank_account_id).first()).
+
+    Garantiza:
+    1. Cobro legítimo con cuenta bancaria válida de la organización activa.
+    2. Rechazo ante cuenta bancaria inexistente con ValidationError ("La cuenta bancaria seleccionada no es válida.").
+    3. Rechazo estricto ante cuenta perteneciente a otra organización (cero fuga de datos ni confirmación de existencia).
+    4. Bloqueo para usuario sin contexto de organización activa.
+    5. Cero creación de cobros (PaymentReceipt), transacciones (FinancialTransaction) ni pólizas
+       (JournalEntry) ante entradas inválidas (atomicidad garantizada).
+    """
+
+    def setUp(self):
+        self.country_ni, _ = CountryConfig.objects.get_or_create(
+            code='NI',
+            defaults={
+                'name': 'Nicaragua',
+                'flag_emoji': '🇳🇮',
+                'primary_currency_code': 'NIO',
+                'primary_currency_symbol': 'C$',
+                'secondary_currency_code': 'USD',
+                'secondary_currency_symbol': '$',
+                'tax_id_label': 'RUC',
+                'default_tax_name': 'IVA',
+                'default_tax_rate': Decimal('15.00'),
+                'is_active': True,
+            }
+        )
+
+        # Organización A (Activa)
+        self.org_a = Organization.objects.create(
+            name="Corporación Constructora S.A.",
+            legal_name="Corporación Constructora de Nicaragua S.A.",
+            slug="corp-constructora-ni",
+            tax_id="J0310000777111",
+            country=self.country_ni,
+            currency=Organization.Currency.NIO,
+            enabled_modules=['crm', 'billing', 'finance'],
+            is_active=True,
+        )
+
+        # Organización B (Invasora / Externa)
+        self.org_b = Organization.objects.create(
+            name="Entidad Externa S.A.",
+            legal_name="Entidad Externa Multiempresa S.A.",
+            slug="entidad-externa-ni",
+            tax_id="J0310000777222",
+            country=self.country_ni,
+            currency=Organization.Currency.NIO,
+            enabled_modules=['crm', 'billing', 'finance'],
+            is_active=True,
+        )
+
+        ensure_default_chart_of_accounts(self.org_a)
+        ensure_default_chart_of_accounts(self.org_b)
+
+        # Usuario Comercial en Org A
+        self.user_commercial = User.objects.create_user(
+            email='comercial@constructora.ni',
+            full_name='Lic. Roberto Blandón',
+            password='TestPassword2026*',
+        )
+        self.membership_a = OrganizationMembership.objects.create(
+            user=self.user_commercial,
+            organization=self.org_a,
+            role_level=RoleLevel.COMMERCIAL_MGR,
+            is_active=True,
+            is_default_org=True,
+        )
+
+        # Usuario sin organización
+        self.user_no_org = User.objects.create_user(
+            email='huerfano@constructora.ni',
+            full_name='Usuario Sin Tenant',
+            password='TestPassword2026*',
+        )
+
+        # Cuentas bancarias
+        self.bank_org_a = BankAccount.objects.create(
+            organization=self.org_a,
+            bank_name=BankAccount.BankName.BAC,
+            account_number='001-998877-01',
+            currency='NIO',
+            current_balance=Decimal('10000.00'),
+            is_active=True,
+        )
+
+        self.bank_org_b = BankAccount.objects.create(
+            organization=self.org_b,
+            bank_name=BankAccount.BankName.BANPRO,
+            account_number='002-334455-02',
+            currency='NIO',
+            current_balance=Decimal('50000.00'),
+            is_active=True,
+        )
+
+        # Cliente y Factura en Org A
+        self.client_account = Account.objects.create(
+            organization=self.org_a,
+            code='CLI-D02-001',
+            commercial_name='Cliente Obras Civiles S.A.',
+            tax_id='J0310000555444',
+            is_tax_exempt=False,
+        )
+
+        self.invoice = Invoice.objects.create(
+            organization=self.org_a,
+            account=self.client_account,
+            status=Invoice.Status.ISSUED,
+            created_by=self.user_commercial,
+            currency_code='NIO',
+        )
+        InvoiceItem.objects.create(
+            organization=self.org_a,
+            invoice=self.invoice,
+            description="Supervisión Técnica de Obras Civiles",
+            quantity=Decimal('1.00'),
+            unit_price=Decimal('2000.00'),
+        )
+        self.invoice.recalculate_totals()
+        self.invoice.save()
+
+    def test_d02_01_valid_bank_account_of_active_org_succeeds(self):
+        """1. Cuenta bancaria válida de la organización activa: registra cobro exitosamente."""
+        self.client.force_login(self.user_commercial)
+        session = self.client.session
+        session['active_org_id'] = str(self.org_a.id)
+        session.save()
+
+        payment_url = reverse('billing:register_payment', kwargs={'pk': self.invoice.pk})
+        response = self.client.post(payment_url, {
+            'amount': '1000.00',
+            'currency_paid': 'NIO',
+            'payment_method': PaymentReceipt.PaymentMethod.TRANSFER_BAC,
+            'bank_account_id': str(self.bank_org_a.id),
+            'reference_number': 'TRX-BAC-2026-001',
+            'notes': 'Cobro parcial legítimo',
+        }, follow=True)
+
+        self.assertEqual(response.status_code, 200)
+
+        # Verificar emisión del Recibo Oficial de Caja
+        receipt = PaymentReceipt.objects.filter(organization=self.org_a, invoice=self.invoice).first()
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt.amount_in_payment_currency, Decimal('1000.00'))
+        self.assertEqual(receipt.amount_applied_to_invoice, Decimal('1000.00'))
+
+        # Verificar incremento en saldo de la cuenta bancaria de la organización activa
+        self.bank_org_a.refresh_from_db()
+        self.assertEqual(self.bank_org_a.current_balance, Decimal('11000.00'))
+
+        # Verificar transacción bancaria y actualización de saldo en factura
+        trx = FinancialTransaction.objects.filter(organization=self.org_a, bank_account=self.bank_org_a).first()
+        self.assertIsNotNone(trx)
+        self.assertEqual(trx.amount, Decimal('1000.00'))
+
+        self.invoice.refresh_from_db()
+        self.assertEqual(self.invoice.amount_paid, Decimal('1000.00'))
+
+    def test_d02_02_inexistent_bank_account_fails_validation_no_partial_entries(self):
+        """2. Cuenta bancaria inexistente: falla validación y no crea cobros ni asientos parciales."""
+        self.client.force_login(self.user_commercial)
+        session = self.client.session
+        session['active_org_id'] = str(self.org_a.id)
+        session.save()
+
+        initial_receipts = PaymentReceipt.objects.count()
+        initial_trxs = FinancialTransaction.objects.count()
+        initial_entries = JournalEntry.objects.count()
+        initial_balance = self.bank_org_a.current_balance
+
+        payment_url = reverse('billing:register_payment', kwargs={'pk': self.invoice.pk})
+        response = self.client.post(payment_url, {
+            'amount': '500.00',
+            'currency_paid': 'NIO',
+            'payment_method': PaymentReceipt.PaymentMethod.TRANSFER_BAC,
+            'bank_account_id': '00000000-0000-0000-0000-000000000000',
+            'reference_number': 'TRX-FAIL-001',
+        }, follow=True)
+
+        self.assertEqual(response.status_code, 200)
+
+        # Comprobar mensaje de error en la sesión/respuesta
+        messages = list(response.context['messages']) if (hasattr(response, 'context') and response.context and 'messages' in response.context) else []
+        self.assertTrue(any("La cuenta bancaria seleccionada no es válida." in str(m) for m in messages))
+
+        # Integridad transaccional: cero registros parciales creados
+        self.assertEqual(PaymentReceipt.objects.count(), initial_receipts)
+        self.assertEqual(FinancialTransaction.objects.count(), initial_trxs)
+        self.assertEqual(JournalEntry.objects.count(), initial_entries)
+
+        self.bank_org_a.refresh_from_db()
+        self.assertEqual(self.bank_org_a.current_balance, initial_balance)
+
+        self.invoice.refresh_from_db()
+        self.assertEqual(self.invoice.amount_paid, Decimal('0.00'))
+
+    def test_d02_03_foreign_organization_bank_account_rejected_without_leakage(self):
+        """3. Cuenta perteneciente a otra organización: rechazada estrictamente sin revelar existencia."""
+        self.client.force_login(self.user_commercial)
+        session = self.client.session
+        session['active_org_id'] = str(self.org_a.id)
+        session.save()
+
+        initial_receipts = PaymentReceipt.objects.count()
+        initial_trxs = FinancialTransaction.objects.count()
+        initial_entries = JournalEntry.objects.count()
+        foreign_initial_balance = self.bank_org_b.current_balance
+
+        payment_url = reverse('billing:register_payment', kwargs={'pk': self.invoice.pk})
+        response = self.client.post(payment_url, {
+            'amount': '500.00',
+            'currency_paid': 'NIO',
+            'payment_method': PaymentReceipt.PaymentMethod.TRANSFER_BAC,
+            'bank_account_id': str(self.bank_org_b.id),
+            'reference_number': 'TRX-EXPLOIT-001',
+        }, follow=True)
+
+        self.assertEqual(response.status_code, 200)
+
+        # El mensaje no debe confirmar ni revelar existencia de la cuenta ajena
+        messages = list(response.context['messages']) if (hasattr(response, 'context') and response.context and 'messages' in response.context) else []
+        self.assertTrue(any("La cuenta bancaria seleccionada no es válida." in str(m) for m in messages))
+        # Garantizar que no se utilizó el fallback global ni se expusieron detalles del otro tenant
+        for m in messages:
+            self.assertNotIn("Entidad Externa", str(m))
+            self.assertNotIn(str(self.org_b.id), str(m))
+
+        # Integridad transaccional y financiera: saldo de cuenta ajena intocado
+        self.assertEqual(PaymentReceipt.objects.count(), initial_receipts)
+        self.assertEqual(FinancialTransaction.objects.count(), initial_trxs)
+        self.assertEqual(JournalEntry.objects.count(), initial_entries)
+
+        self.bank_org_b.refresh_from_db()
+        self.assertEqual(self.bank_org_b.current_balance, foreign_initial_balance)
+
+        self.invoice.refresh_from_db()
+        self.assertEqual(self.invoice.amount_paid, Decimal('0.00'))
+
+    def test_d02_04_user_without_active_organization_blocked(self):
+        """4. Usuario sin organización activa es bloqueado antes de procesar cobros."""
+        self.client.force_login(self.user_no_org)
+        payment_url = reverse('billing:register_payment', kwargs={'pk': self.invoice.pk})
+        response = self.client.post(payment_url, {
+            'amount': '500.00',
+            'currency_paid': 'NIO',
+            'payment_method': PaymentReceipt.PaymentMethod.TRANSFER_BAC,
+            'bank_account_id': str(self.bank_org_a.id),
+            'reference_number': 'TRX-ORPHAN-001',
+        })
+        # Middleware o mixin redirige al onboarding/403
+        self.assertIn(response.status_code, [302, 403])
+        self.assertEqual(PaymentReceipt.objects.filter(invoice=self.invoice).count(), 0)

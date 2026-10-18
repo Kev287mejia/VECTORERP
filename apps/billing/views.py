@@ -302,7 +302,7 @@ class InvoiceRegisterPaymentView(ModuleAccessRequiredMixin, View):
             if bank_account_id:
                 bank_account = BankAccount.objects.for_org(request.organization).filter(pk=bank_account_id).first()
                 if not bank_account:
-                    bank_account = BankAccount.objects.filter(pk=bank_account_id).first()
+                    raise ValidationError("La cuenta bancaria seleccionada no es válida.")
 
             receipt, trx, entry = record_client_collection(
                 organization=request.organization,

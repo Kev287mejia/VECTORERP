@@ -1267,3 +1267,56 @@ class D01DashboardAndSwitchOrgTestCase(TestCase):
         res_switch = self.client.get(reverse('tenancy:switch_org', args=[self.org1.id]), follow=True)
         self.assertEqual(res_switch.status_code, 200)
         self.assertEqual(self.client.session.get('active_org_id'), str(self.org1.id))
+
+    def test_d04_sales_advisor_module_access_and_isolation(self):
+        """Verifica aislamiento estricto de RoleLevel.SALES_ADVISOR (15) y context processor."""
+        user_adv = User.objects.create_user(
+            email='advisor_test@sermansa.ni',
+            password='Password123!',
+            full_name='Asesor Test (15)',
+        )
+        mem_adv = OrganizationMembership.objects.create(
+            organization=self.org1,
+            user=user_adv,
+            role_level=RoleLevel.SALES_ADVISOR,
+            is_active=True,
+        )
+
+        # 1. Acceso a CRM permitido
+        self.assertTrue(mem_adv.has_module_access('crm'))
+
+        # 2. Acceso denegado a módulos operativos y financieros
+        self.assertFalse(mem_adv.has_module_access('operations'))
+        self.assertFalse(mem_adv.has_module_access('sst'))
+        self.assertFalse(mem_adv.has_module_access('inventory'))
+        self.assertFalse(mem_adv.has_module_access('finance'))
+        self.assertFalse(mem_adv.has_module_access('billing'))
+        self.assertFalse(mem_adv.has_module_access('purchasing'))
+        self.assertFalse(mem_adv.has_module_access('payroll'))
+
+        # 3. Roles técnicos excluidos de CRM
+        user_eng = User.objects.create_user(
+            email='eng_crm_test@sermansa.ni',
+            password='Password123!',
+            full_name='Ingeniero Test (50)',
+        )
+        mem_eng = OrganizationMembership.objects.create(
+            organization=self.org1,
+            user=user_eng,
+            role_level=RoleLevel.ENGINEER,
+            is_active=True,
+        )
+        self.assertFalse(mem_eng.has_module_access('crm'))
+
+        user_tech = User.objects.create_user(
+            email='tech_crm_test@sermansa.ni',
+            password='Password123!',
+            full_name='Técnico Test (20)',
+        )
+        mem_tech = OrganizationMembership.objects.create(
+            organization=self.org1,
+            user=user_tech,
+            role_level=RoleLevel.TECHNICIAN,
+            is_active=True,
+        )
+        self.assertFalse(mem_tech.has_module_access('crm'))

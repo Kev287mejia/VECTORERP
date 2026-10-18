@@ -10,7 +10,7 @@ ERP_MODULES_CATALOG = [
         'name': 'Gestión Comercial & Cotizaciones',
         'badge': 'RECOMENDADO',
         'description': 'Pipeline de licitaciones corporativas, directorio de clientes y cotizador bimonetario con desglose de impuestos.',
-        'min_role_level': 80,
+        'min_role_level': 15,
         'default_enabled': True,
     },
     {

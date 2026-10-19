@@ -418,6 +418,8 @@ class QuoteDetailView(ModuleAccessRequiredMixin, DetailView):
             (quote.created_by_id != self.request.user.id or role_level >= RoleLevel.OWNER_ADMIN)
         )
 
+        existing_work_order = quote.work_orders.filter(organization=self.request.organization).first()
+
         context.update({
             'items': items,
             'services': services,
@@ -426,6 +428,7 @@ class QuoteDetailView(ModuleAccessRequiredMixin, DetailView):
             'item_form': QuoteItemForm(),
             'can_edit': quote.status in [Quote.Status.DRAFT, Quote.Status.SENT],
             'can_approve': can_approve,
+            'existing_work_order': existing_work_order,
         })
         return context
 

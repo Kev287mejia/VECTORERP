@@ -253,7 +253,12 @@ class WorkOrder(TenantScopedModel):
             models.UniqueConstraint(
                 fields=['organization', 'number'],
                 name='unique_work_order_number_per_tenant',
-            )
+            ),
+            models.UniqueConstraint(
+                fields=['source_quote'],
+                condition=models.Q(source_quote__isnull=False),
+                name='unique_work_order_per_source_quote',
+            ),
         ]
 
     def __str__(self) -> str:

@@ -722,12 +722,13 @@
                 {% endif %}
 
                 <!-- Gobierno Corporativo -->
-                {% if nav_access.can_manage_org %}
+                {% if nav_access.can_manage_org or request.user.is_superuser %}
                 <div>
                     <div class="text-[11px] font-medium text-zinc-400 px-3 mb-1">
                         Administración
                     </div>
                     <ul class="space-y-0.5">
+                        {% if nav_access.can_manage_org %}
                         <li>
                             <a href="{% url 'tenancy:team_management' %}" class="h-8 px-3 rounded-md text-[13px] flex items-center gap-2.5 transition-colors font-sans {% if 'team' in request.path %}nav-item-active{% else %}text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900{% endif %}">
                                 <svg class="w-4 h-4 text-zinc-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
@@ -736,6 +737,8 @@
                                 <span>Equipo y Roles</span>
                             </a>
                         </li>
+                        {% endif %}
+                        {% if request.user.is_superuser %}
                         <li>
                             <a href="{% url 'tenancy:saas_hq' %}" class="h-8 px-3 rounded-md text-[13px] flex items-center gap-2.5 transition-colors font-sans {% if 'saas-hq' in request.path %}nav-item-active{% else %}text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900{% endif %}">
                                 <svg class="w-4 h-4 text-zinc-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
@@ -744,6 +747,7 @@
                                 <span>Gobierno SaaS</span>
                             </a>
                         </li>
+                        {% endif %}
                     </ul>
                 </div>
                 {% endif %}

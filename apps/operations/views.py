@@ -2,7 +2,7 @@ import json
 from decimal import Decimal
 from django.contrib import messages
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.db.models import Q, Count
 from django.http import HttpResponse, HttpResponseForbidden, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -37,19 +37,46 @@ class ConvertQuoteToWorkOrderView(ModuleAccessRequiredMixin, View):
     """
     Convierte una Cotización formal aprobada en una Orden de Trabajo operativa.
     Copia los ítems comerciales como partidas técnicas (BOM) SIN PRECIOS NI DESCUENTOS.
+    Garantiza estricta idempotencia y unicidad 1:1 entre Quote y WorkOrder.
     Registra el evento de apertura en la bitácora inmutable.
     Exige min_role_level = RoleLevel.OPERATIONS_COORD (80).
     """
     required_module = 'operations'
     min_role_level = RoleLevel.OPERATIONS_COORD
 
+    def get(self, request, quote_pk):
+        """
+        Manejo controlado de peticiones directas vía GET.
+        Si la OT ya existe, redirige a su detalle informando al usuario.
+        Si aún no existe, redirige a la cotización con mensaje informativo.
+        """
+        quote = get_object_or_404(
+            Quote.objects.for_org(request.organization),
+            pk=quote_pk
+        )
+        existing_wo = WorkOrder.objects.for_org(request.organization).filter(source_quote=quote).first()
+        if existing_wo:
+            messages.info(
+                request,
+                f"La cotización {quote.number} ya cuenta con la Orden de Trabajo {existing_wo.number}."
+            )
+            return redirect('operations:workorder_detail', pk=existing_wo.pk)
+
+        messages.info(
+            request,
+            f"Para generar la Orden de Trabajo de la cotización {quote.number}, confirme la conversión desde el detalle comercial."
+        )
+        return redirect('crm:quote_detail', pk=quote.pk)
+
     @transaction.atomic
     def post(self, request, quote_pk):
+        # 1. Bloqueo de fila para serializar solicitudes concurrentes en la cotización
         quote = get_object_or_404(
-            Quote.objects.for_org(request.organization).select_related('account'),
+            Quote.objects.for_org(request.organization).select_for_update().select_related('account'),
             pk=quote_pk
         )
 
+        # 2. Validación de estado APROBADA
         if quote.status != Quote.Status.APPROVED:
             messages.error(
                 request,
@@ -58,52 +85,73 @@ class ConvertQuoteToWorkOrderView(ModuleAccessRequiredMixin, View):
             )
             return redirect('crm:quote_detail', pk=quote.pk)
 
-        # 1. Crear Orden de Trabajo principal vinculada
-        work_order = WorkOrder.objects.create(
-            organization=request.organization,
-            account=quote.account,
-            source_quote=quote,
-            title=quote.title,
-            technical_scope=quote.notes or f"Alcance según Cotización {quote.number}.",
-            site_address=quote.account.address or quote.account.city,
-            priority=WorkOrder.Priority.NORMAL,
-            phase=WorkOrder.Phase.DRAFT,
-            created_by=request.user,
-        )
+        # 3. Verificación de idempotencia previa
+        existing_wo = WorkOrder.objects.for_org(request.organization).filter(source_quote=quote).first()
+        if existing_wo:
+            messages.warning(
+                request,
+                f"La cotización {quote.number} ya posee la Orden de Trabajo {existing_wo.number} generada previamente."
+            )
+            return redirect('operations:workorder_detail', pk=existing_wo.pk)
 
-        # 2. Copiar partidas comerciales a partidas técnicas (BOM SIN PRECIOS)
-        quote_items = quote.items.all().order_by('created_at')
-        items_to_create = []
-        for item in quote_items:
-            items_to_create.append(
-                WorkOrderItem(
+        # 4. Creación atómica protegida contra colisiones concurrentes (IntegrityError)
+        try:
+            with transaction.atomic():
+                work_order = WorkOrder.objects.create(
+                    organization=request.organization,
+                    account=quote.account,
+                    source_quote=quote,
+                    title=quote.title,
+                    technical_scope=quote.notes or f"Alcance según Cotización {quote.number}.",
+                    site_address=quote.account.address or quote.account.city,
+                    priority=WorkOrder.Priority.NORMAL,
+                    phase=WorkOrder.Phase.DRAFT,
+                    created_by=request.user,
+                )
+
+                # 5. Copiar partidas comerciales a partidas técnicas (BOM SIN PRECIOS)
+                quote_items = quote.items.all().order_by('created_at')
+                items_to_create = []
+                for item in quote_items:
+                    items_to_create.append(
+                        WorkOrderItem(
+                            organization=request.organization,
+                            work_order=work_order,
+                            item_type=item.item_type,
+                            code=item.code or '',
+                            description=item.description,
+                            unit=item.unit or 'UND',
+                            planned_quantity=item.quantity,
+                            executed_quantity=Decimal('0.00'),
+                            is_completed=False,
+                        )
+                    )
+
+                if items_to_create:
+                    WorkOrderItem.objects.bulk_create(items_to_create)
+
+                # 6. Registrar primer evento en la bitácora cronológica inmutable
+                WorkOrderTimelineLog.objects.create(
                     organization=request.organization,
                     work_order=work_order,
-                    item_type=item.item_type,
-                    code=item.code or '',
-                    description=item.description,
-                    unit=item.unit or 'UND',
-                    planned_quantity=item.quantity,
-                    executed_quantity=Decimal('0.00'),
-                    is_completed=False,
+                    event_type='FROM_QUOTE',
+                    summary=f"Orden de Trabajo generada desde Cotización {quote.number}",
+                    details=(
+                        f"Apertura formal de OT a partir de propuesta comercial aprobada. "
+                        f"Se importaron {len(items_to_create)} partidas técnicas al BOM de ingeniería."
+                    ),
+                    actor=request.user,
                 )
-            )
-
-        if items_to_create:
-            WorkOrderItem.objects.bulk_create(items_to_create)
-
-        # 3. Registrar primer evento en la bitácora cronológica inmutable
-        WorkOrderTimelineLog.objects.create(
-            organization=request.organization,
-            work_order=work_order,
-            event_type='FROM_QUOTE',
-            summary=f"Orden de Trabajo generada desde Cotización {quote.number}",
-            details=(
-                f"Apertura formal de OT a partir de propuesta comercial aprobada. "
-                f"Se importaron {len(items_to_create)} partidas técnicas al BOM de ingeniería."
-            ),
-            actor=request.user,
-        )
+        except IntegrityError:
+            # En caso de colisión concurrente en la restricción de base de datos
+            existing_wo = WorkOrder.objects.for_org(request.organization).filter(source_quote=quote).first()
+            if existing_wo:
+                messages.warning(
+                    request,
+                    f"La cotización {quote.number} ya posee la Orden de Trabajo {existing_wo.number} generada previamente."
+                )
+                return redirect('operations:workorder_detail', pk=existing_wo.pk)
+            raise
 
         messages.success(
             request,

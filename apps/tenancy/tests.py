@@ -976,6 +976,42 @@ class SaasHqGovernanceAndHardeningTestSuite(TestCase):
         res_20 = self.client_tech20.get(reverse('tenancy:saas_hq'))
         self.assertEqual(res_20.status_code, 403)
 
+    def test_saas_hq_template_link_visibility_alignment_with_permissions(self):
+        """
+        DEF-14: Verifica que el enlace 'Gobierno SaaS' en base_erp.html sea visible
+        exclusivamente para superusuarios globales de plataforma y permanezca oculto
+        para administradores de organización (Nivel 100) sin privilegios de superusuario.
+        """
+        # 1. Superusuario global: Enlace 'Gobierno SaaS' presente en la barra lateral
+        res_super = self.client_superadmin.get(reverse('tenancy:team_management'))
+        self.assertEqual(res_super.status_code, 200)
+        self.assertContains(res_super, 'Gobierno SaaS')
+        self.assertContains(res_super, reverse('tenancy:saas_hq'))
+
+        # 2. Administrador / Propietario de Tenant (Nivel 100, no superusuario):
+        # Enlace 'Gobierno SaaS' ausente en la interfaz, pero conserva 'Equipo y Roles'
+        res_owner = self.client_owner.get(reverse('tenancy:team_management'))
+        self.assertEqual(res_owner.status_code, 200)
+        self.assertNotContains(res_owner, 'Gobierno SaaS')
+        self.assertNotContains(res_owner, reverse('tenancy:saas_hq'))
+        self.assertContains(res_owner, 'Equipo y Roles')
+
+        # 3. Coordinador (Nivel 80): Enlace ausente
+        res_80 = self.client_coord80.get(reverse('tenancy:dashboard'))
+        self.assertEqual(res_80.status_code, 200)
+        self.assertNotContains(res_80, 'Gobierno SaaS')
+        self.assertNotContains(res_80, reverse('tenancy:saas_hq'))
+
+        # 4. Solicitud anónima al endpoint: Redirección 302 a login
+        client_anon = Client()
+        res_anon = client_anon.get(reverse('tenancy:saas_hq'))
+        self.assertEqual(res_anon.status_code, 302)
+        self.assertIn('/login/', res_anon.url)
+
+        # 5. Solicitud directa POST no autorizada: 403 Forbidden
+        res_owner_post = self.client_owner.post(reverse('tenancy:saas_hq'), {'action': 'noop'})
+        self.assertEqual(res_owner_post.status_code, 403)
+
     def test_suspension_status_blocks_operations_and_restores_on_active(self):
         """
         Verifica bloqueo operativo cuando subscription_status = 'SUSPENDED'

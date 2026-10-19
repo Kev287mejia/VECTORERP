@@ -125,6 +125,7 @@ La plataforma contempla un modelo en el que cada empresa o entidad legal adminis
 - **Separación de información:** Cada organización administra de manera autónoma sus clientes, órdenes de trabajo, inventarios, compras, cuentas bancarias y registros contables. La información de una empresa no es accesible ni visible para los colaboradores de otra.
 - **Membresías y accesos diferenciados:** Un usuario puede pertenecer a una o más organizaciones según su rol laboral, pero en cada una de ellas opera estrictamente con el nivel de permisos y las atribuciones que le hayan sido concedidas para esa entidad específica.
 - **Supervisión directiva controlada:** La dirección corporativa cuenta con vistas consolidadas de seguimiento general cuando así lo amerite su esquema de gobierno, respetando siempre las reglas de autorización interna.
+- **Arquitectura de Tenancy y Razón Social (SEC-06):** La razón social, identificación tributaria (RUC/NIT), régimen fiscal, moneda y catálogo contable están unificados directamente en el modelo `Organization` (`apps.tenancy.models.Organization`). El diseño del sistema prescinde intencionalmente de una entidad separada `LegalEntity` para evitar redundancias relacionales y garantizar atomicidad en las consultas operativas multiempresa.
 
 ---
 

@@ -11,11 +11,21 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-erp-sas-central-ameri
 # Modo de depuración configurable por entorno
 DEBUG = os.environ.get('DEBUG', 'True').lower() in ('true', '1', 'yes')
 
-# Hosts autorizados y orígenes confiables para CSRF y túneles seguros
+# Entornos y Organizaciones Sandbox Autorizados (SEC-01 & SEC-03)
+ENABLE_SANDBOX = os.environ.get('ENABLE_SANDBOX', 'False').lower() in ('true', '1', 'yes')
+sandbox_orgs_env = os.environ.get('SANDBOX_ORGANIZATION_SLUGS', '')
+SANDBOX_ORGANIZATION_SLUGS = [s.strip() for s in sandbox_orgs_env.split(',') if s.strip()]
+
+# Hosts autorizados configurados por entorno (SEC-02: eliminación estricta de comodín '*')
 allowed_hosts_env = os.environ.get('ALLOWED_HOSTS')
-ALLOWED_HOSTS = [h.strip() for h in allowed_hosts_env.split(',') if h.strip()] if allowed_hosts_env else ['*']
-if '*' not in ALLOWED_HOSTS:
-    ALLOWED_HOSTS.append('*')
+if allowed_hosts_env:
+    ALLOWED_HOSTS = [h.strip() for h in allowed_hosts_env.split(',') if h.strip()]
+elif DEBUG:
+    # En desarrollo local seguro, permitir únicamente localhost, loopback y testserver
+    ALLOWED_HOSTS = ['localhost', '127.0.0.1', '[::1]', 'testserver']
+else:
+    # En producción sin ALLOWED_HOSTS explícito, lista vacía para rechazo seguro estricto
+    ALLOWED_HOSTS = []
 
 DEFAULT_CSRF_TRUSTED_ORIGINS = [
     'https://*.trycloudflare.com',
@@ -147,4 +157,12 @@ LOGOUT_REDIRECT_URL = 'accounts_auth:login'
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = 'SAMEORIGIN'
 REFERRER_POLICY = 'strict-origin-when-cross-origin'
+
+# Políticas de Cookies Seguras (SEC-05)
+# En producción (DEBUG=False), las cookies de sesión y CSRF exigen transporte HTTPS.
+# En desarrollo local (DEBUG=True), se permite transporte HTTP para testing local.
+SESSION_COOKIE_SECURE = os.environ.get('SESSION_COOKIE_SECURE', str(not DEBUG)).lower() in ('true', '1', 'yes')
+CSRF_COOKIE_SECURE = os.environ.get('CSRF_COOKIE_SECURE', str(not DEBUG)).lower() in ('true', '1', 'yes')
+SESSION_COOKIE_HTTPONLY = True
+CSRF_COOKIE_HTTPONLY = False  # Permitir lectura en cliente para inyección en cabeceras X-CSRFToken
 

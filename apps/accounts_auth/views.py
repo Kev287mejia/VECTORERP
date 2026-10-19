@@ -83,7 +83,9 @@ def logout_view(request):
     return redirect('accounts_auth:login')
 
 
+from django.conf import settings
 from django.contrib import messages
+from django.http import Http404
 from apps.core.models import CountryConfig
 from apps.core.services.sandbox_seeder import SandboxScenarioSeeder
 from apps.crm.models import Account
@@ -98,7 +100,18 @@ class QuickSandboxLoginView(View):
     Acceso directo en 1 clic para evaluadores de Producto, Marketing y UX.
     Autentica al usuario evaluador@eternallabs.ni, asegura la existencia de la
     organización demo IMESA INGENIERÍA S.A. y siembra el escenario completo si no existe.
+
+    Protección de seguridad estricta (SEC-01):
+    Inaccesible a menos que settings.DEBUG sea True Y settings.ENABLE_SANDBOX sea True.
+    En cualquier otro entorno o configuración ausente/inválida, despacha Http404.
     """
+    def dispatch(self, request, *args, **kwargs):
+        is_debug = getattr(settings, 'DEBUG', False)
+        is_sandbox_enabled = getattr(settings, 'ENABLE_SANDBOX', False)
+        if not (is_debug and is_sandbox_enabled):
+            raise Http404("El acceso directo a sandbox se encuentra deshabilitado en este entorno.")
+        return super().dispatch(request, *args, **kwargs)
+
     def post(self, request, *args, **kwargs):
         country_ni = CountryConfig.objects.filter(code='NI').first()
         if not country_ni:

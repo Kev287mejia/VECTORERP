@@ -2,7 +2,7 @@ import hashlib
 import json
 from decimal import Decimal
 from django.contrib.auth import get_user_model
-from django.test import TestCase, Client
+from django.test import TestCase, Client, override_settings
 from django.urls import reverse
 
 from apps.core.models import CountryConfig
@@ -533,6 +533,7 @@ class SandboxViewControlsTestCase(TestCase):
             industry=Organization.Industry.CONSTRUCTION,
             accounting_template=Organization.AccountingTemplate.NIIF_PYMES,
             enabled_modules=['crm', 'operations', 'sst', 'inventory', 'finance'],
+            slug='construcciones-sa',
         )
         OrganizationMembership.objects.create(
             user=self.owner,
@@ -574,6 +575,7 @@ class SandboxViewControlsTestCase(TestCase):
         response = self.client.post(reverse('tenancy:sandbox_load'))
         self.assertEqual(response.status_code, 403)
 
+    @override_settings(DEBUG=True, ENABLE_SANDBOX=True, SANDBOX_ORGANIZATION_SLUGS=['construcciones-sa', 'imesa-ingenieria'])
     def test_reset_sandbox_data_allowed_for_owner(self):
         """Verifica que el Owner pueda vaciar el escenario mediante POST a /settings/sandbox/reset/."""
         self.client.force_login(self.owner)

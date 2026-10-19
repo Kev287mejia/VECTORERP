@@ -1,4 +1,5 @@
 from django.contrib import admin
+from apps.core.admin_mixins import TenantAdminMixin
 from apps.billing.models import Invoice, InvoiceItem, PaymentReceipt, PaymentIdempotencyRecord
 
 
@@ -28,7 +29,7 @@ class PaymentReceiptInline(admin.TabularInline):
 
 
 @admin.register(Invoice)
-class InvoiceAdmin(admin.ModelAdmin):
+class InvoiceAdmin(TenantAdminMixin, admin.ModelAdmin):
     list_display = ('number', 'account', 'status', 'issue_date', 'currency_code', 'gross_total', 'net_receivable', 'balance_due')
     list_filter = ('status', 'currency_code', 'payment_condition', 'issue_date')
     search_fields = ('number', 'account__commercial_name', 'account__tax_id')
@@ -36,7 +37,7 @@ class InvoiceAdmin(admin.ModelAdmin):
 
 
 @admin.register(PaymentReceipt)
-class PaymentReceiptAdmin(admin.ModelAdmin):
+class PaymentReceiptAdmin(TenantAdminMixin, admin.ModelAdmin):
     """
     Consola de Auditoría y Consulta de Recibos Oficiales de Caja (ROC).
     Impedida la creación, edición o eliminación administrativa directa para salvaguardar
@@ -58,7 +59,7 @@ class PaymentReceiptAdmin(admin.ModelAdmin):
 
 
 @admin.register(PaymentIdempotencyRecord)
-class PaymentIdempotencyRecordAdmin(admin.ModelAdmin):
+class PaymentIdempotencyRecordAdmin(TenantAdminMixin, admin.ModelAdmin):
     """
     Auditoría de Claves de Idempotencia y Reintentos Transaccionales.
     Modo estrictamente de solo lectura.

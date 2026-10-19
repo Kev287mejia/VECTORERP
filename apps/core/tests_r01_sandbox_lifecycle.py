@@ -10,7 +10,7 @@ Verifica:
 from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.db import connection, IntegrityError
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
@@ -71,6 +71,7 @@ class SandboxLifecycleRegressionTestCase(TestCase):
             industry=Organization.Industry.SERVICES,
             accounting_template=Organization.AccountingTemplate.NIIF_PYMES,
             enabled_modules=['crm', 'operations', 'sst', 'inventory', 'finance', 'purchasing', 'billing', 'payroll'],
+            slug='soluciones-sandbox-r01-sa',
         )
         self.membership = OrganizationMembership.objects.create(
             organization=self.organization,
@@ -181,6 +182,7 @@ class SandboxLifecycleRegressionTestCase(TestCase):
                 with connection.cursor() as cursor:
                     cursor.execute("DELETE FROM finance_journalentry WHERE id = %s", [str(entry.id)])
 
+    @override_settings(DEBUG=True, ENABLE_SANDBOX=True, SANDBOX_ORGANIZATION_SLUGS=['soluciones-sandbox-r01-sa', 'imesa-ingenieria'])
     def test_r01_05_interactive_reset_view_owner_succeeds(self):
         """5. La vista interactiva de reseteo sandbox vía HTTP POST se ejecuta sin errores para el Owner."""
         self.client.force_login(self.owner)

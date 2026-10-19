@@ -23,3 +23,6 @@ gunicorn>=22.0.0
 # Utilidades de Zona Horaria y Tipado
 tzdata>=2025.1
 typing-extensions>=4.12.0
+
+# Procesamiento de Imágenes (Requerido por ImageField en accounts_auth.User)
+Pillow>=10.4.0

@@ -338,6 +338,7 @@ class RoleLevel(models.IntegerChoices):
     Previene inversiones o colisiones entre roles operativos.
     """
     OBSERVER = 10, 'Observador / Auditor'
+    SALES_ADVISOR = 15, 'Asesor Comercial'
     TECHNICIAN = 20, 'Técnico de Campo'
     ENGINEER = 50, 'Ingeniero Residente / Supervisor'
     SST_OFFICER = 70, 'Oficial SST (Seguridad y Salud)'
@@ -528,9 +529,17 @@ class OrganizationMembership(TimeStampedModel):
         if eval_role_level >= RoleLevel.OWNER_ADMIN:
             return True
 
-        min_required_role = MODULE_THRESHOLD_MAP.get(module_code.lower().strip())
+        mod = module_code.lower().strip()
+        min_required_role = MODULE_THRESHOLD_MAP.get(mod)
         if min_required_role is None:
             return False
+
+        # Excepción localizada para CRM:
+        # Los roles autorizados son SALES_ADVISOR (15) y roles de coordinación/gerencia >= 80.
+        # Roles técnicos operativos (TECHNICIAN 20, ENGINEER 50, SST_OFFICER 70) y observadores (10)
+        # no poseen acceso al módulo comercial.
+        if mod == 'crm':
+            return eval_role_level == RoleLevel.SALES_ADVISOR or eval_role_level >= RoleLevel.OPERATIONS_COORD
 
         return eval_role_level >= min_required_role
 

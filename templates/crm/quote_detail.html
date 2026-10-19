@@ -31,7 +31,9 @@
         </button>
         {% endif %}
     </form>
+    {% endif %}
 
+    {% if can_approve and can_edit %}
     <form method="POST" action="{% url 'crm:quote_status_transition' pk=quote.pk %}" class="inline-flex items-center gap-1">
         {% csrf_token %}
         <input type="hidden" name="status" value="APPROVED">

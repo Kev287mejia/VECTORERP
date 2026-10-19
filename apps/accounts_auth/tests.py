@@ -1,5 +1,5 @@
 from django.contrib.auth import get_user_model
-from django.test import Client, TestCase
+from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 
 User = get_user_model()
@@ -73,8 +73,9 @@ class QuickSandboxLoginTestCase(TestCase):
     def setUp(self):
         self.client = Client()
 
+    @override_settings(DEBUG=True, ENABLE_SANDBOX=True)
     def test_quick_sandbox_login_post_authenticates_and_redirects(self):
-        """Verifica que POST a sandbox_login cree o autentique al usuario demo y redirija al dashboard."""
+        """Verifica que POST a sandbox_login cree o autentique al usuario demo y redirija al dashboard cuando sandbox está habilitado."""
         response = self.client.post(reverse('accounts_auth:sandbox_login'))
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response.url, reverse('tenancy:dashboard'))
@@ -89,4 +90,71 @@ class QuickSandboxLoginTestCase(TestCase):
         org = Organization.objects.filter(slug='imesa-ingenieria').first()
         self.assertIsNotNone(org)
         self.assertEqual(self.client.session.get('active_org_id'), str(org.id))
+
+
+class QuickSandboxSecurityTestCase(TestCase):
+    """
+    Suite de pruebas de seguridad para SEC-01 (QuickSandboxLoginView).
+    Verifica los 5 escenarios obligatorios de blindaje:
+    1. Con sandbox deshabilitado (ENABLE_SANDBOX=False), POST anónimo no obtiene autenticación (404).
+    2. Con DEBUG=False, endpoint permanece inaccesible aunque ENABLE_SANDBOX esté True (404).
+    3. Con entorno local expresamente habilitado (DEBUG=True, ENABLE_SANDBOX=True), funciona (302).
+    4. Con configuración ausente o inválida, falla de forma segura (404).
+    5. La protección de sandbox no afecta en absoluto al inicio de sesión normal.
+    """
+
+    def setUp(self):
+        self.client = Client()
+
+    @override_settings(DEBUG=True, ENABLE_SANDBOX=False)
+    def test_01_sandbox_disabled_post_anonymous_rejected_404(self):
+        """1. Con sandbox deshabilitado (ENABLE_SANDBOX=False), un POST anónimo devuelve 404 y no crea sesión."""
+        response = self.client.post(reverse('accounts_auth:sandbox_login'))
+        self.assertEqual(response.status_code, 404)
+        self.assertIsNone(self.client.session.get('_auth_user_id'))
+
+    @override_settings(DEBUG=False, ENABLE_SANDBOX=True)
+    def test_02_production_debug_false_endpoint_inaccessible_404(self):
+        """2. Con DEBUG=False (producción), el endpoint permanece inaccesible (404) aun con ENABLE_SANDBOX=True."""
+        response = self.client.post(reverse('accounts_auth:sandbox_login'))
+        self.assertEqual(response.status_code, 404)
+        self.assertIsNone(self.client.session.get('_auth_user_id'))
+
+    @override_settings(DEBUG=True, ENABLE_SANDBOX=True)
+    def test_03_authorized_local_environment_works_as_expected(self):
+        """3. Con entorno local expresamente habilitado (DEBUG=True y ENABLE_SANDBOX=True), funciona normalmente."""
+        response = self.client.post(reverse('accounts_auth:sandbox_login'))
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, reverse('tenancy:dashboard'))
+        user = User.objects.filter(email='evaluador@eternallabs.ni').first()
+        self.assertIsNotNone(user)
+        self.assertEqual(self.client.session.get('_auth_user_id'), str(user.pk))
+
+    @override_settings(DEBUG=False, ENABLE_SANDBOX=False)
+    def test_04_default_or_absent_config_fails_safely_404(self):
+        """4. Configuración predeterminada o ausente (producción por omisión) rechaza con 404 de forma segura."""
+        response = self.client.post(reverse('accounts_auth:sandbox_login'))
+        self.assertEqual(response.status_code, 404)
+        self.assertIsNone(self.client.session.get('_auth_user_id'))
+
+    @override_settings(DEBUG=False, ENABLE_SANDBOX=False)
+    def test_05_protection_does_not_affect_normal_login(self):
+        """5. La protección de sandbox no afecta al inicio de sesión normal."""
+        # GET /auth/login/ renderiza normalmente el formulario corporativo
+        get_res = self.client.get(reverse('accounts_auth:login'))
+        self.assertEqual(get_res.status_code, 200)
+        self.assertContains(get_res, "Iniciar sesión")
+
+        # POST /auth/login/ autentica al usuario normal con credenciales válidas
+        user = User.objects.create_user(
+            email='regular.user@empresa.ni',
+            password='Password123!',
+            full_name='Usuario Normal',
+        )
+        post_res = self.client.post(reverse('accounts_auth:login'), {
+            'email': 'regular.user@empresa.ni',
+            'password': 'Password123!',
+        })
+        self.assertEqual(post_res.status_code, 302)
+        self.assertEqual(self.client.session.get('_auth_user_id'), str(user.pk))
 

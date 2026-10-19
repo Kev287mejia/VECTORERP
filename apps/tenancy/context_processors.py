@@ -69,7 +69,8 @@ def tenancy_context(request):
     # reaccionen inmediatamente cuando el Owner simula otro rol operativo.
     nav_access = {
         'can_view_crm': membership.has_module_access('crm', effective_role_level=role_level) if membership else False,
-        'can_manage_crm': (role_level >= RoleLevel.COMMERCIAL_MGR) if membership else False,
+        'can_manage_crm': (role_level in [RoleLevel.SALES_ADVISOR, RoleLevel.COMMERCIAL_MGR, RoleLevel.OWNER_ADMIN]) if membership else False,
+        'can_approve_quotes': (role_level >= RoleLevel.COMMERCIAL_MGR) if membership else False,
         'can_view_billing': membership.has_module_access('billing', effective_role_level=role_level) if membership else False,
         'can_manage_billing': (role_level >= RoleLevel.COMMERCIAL_MGR) if membership else False,
         'can_view_purchasing': membership.has_module_access('purchasing', effective_role_level=role_level) if membership else False,

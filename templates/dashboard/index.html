@@ -265,7 +265,7 @@
         </h3>
         <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5">
             {% for m in user_memberships %}
-            <a href="{% url 'switch_organization' m.organization.id %}"
+            <a href="{% url 'tenancy:switch_org' m.organization.id %}"
                class="p-3 border rounded-lg flex items-center justify-between transition-colors shadow-xs {% if m.organization.id == current_organization.id %}border-blue-600 bg-blue-50/30{% else %}border-slate-200 hover:bg-slate-50{% endif %}">
                 <div class="flex items-center gap-2.5 truncate">
                     <span class="fi fi-{{ m.organization.country.code|lower }} border border-slate-200 rounded-xs"></span>

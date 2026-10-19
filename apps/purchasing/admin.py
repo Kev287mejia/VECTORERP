@@ -1,4 +1,5 @@
 from django.contrib import admin
+from apps.core.admin_mixins import TenantAdminMixin
 from apps.purchasing.models import (
     Supplier,
     PurchaseOrder,
@@ -34,14 +35,14 @@ class SupplierPaymentInline(admin.TabularInline):
 
 
 @admin.register(Supplier)
-class SupplierAdmin(admin.ModelAdmin):
+class SupplierAdmin(TenantAdminMixin, admin.ModelAdmin):
     list_display = ('code', 'commercial_name', 'tax_id', 'contact_name', 'phone', 'city', 'credit_days', 'is_active')
     search_fields = ('code', 'commercial_name', 'tax_id', 'contact_name')
     list_filter = ('is_active', 'city')
 
 
 @admin.register(PurchaseOrder)
-class PurchaseOrderAdmin(admin.ModelAdmin):
+class PurchaseOrderAdmin(TenantAdminMixin, admin.ModelAdmin):
     list_display = ('number', 'supplier', 'target_warehouse', 'status', 'issue_date', 'gross_total', 'net_payable', 'amount_paid', 'balance_due', 'stock_received')
     search_fields = ('number', 'supplier__commercial_name', 'supplier_invoice_number', 'withholding_certificate_number')
     list_filter = ('status', 'target_warehouse', 'currency_code', 'stock_received')
@@ -55,7 +56,7 @@ class PurchaseOrderAdmin(admin.ModelAdmin):
 
 
 @admin.register(SupplierInvoice)
-class SupplierInvoiceAdmin(admin.ModelAdmin):
+class SupplierInvoiceAdmin(TenantAdminMixin, admin.ModelAdmin):
     list_display = ('invoice_number', 'supplier', 'purchase_order', 'issue_date', 'due_date', 'gross_total', 'net_payable', 'amount_paid', 'balance_due', 'status')
     search_fields = ('invoice_number', 'supplier__commercial_name', 'purchase_order__number')
     list_filter = ('status', 'currency_code', 'issue_date')
@@ -67,7 +68,7 @@ class SupplierInvoiceAdmin(admin.ModelAdmin):
 
 
 @admin.register(SupplierPayment)
-class SupplierPaymentAdmin(admin.ModelAdmin):
+class SupplierPaymentAdmin(TenantAdminMixin, admin.ModelAdmin):
     list_display = ('number', 'purchase_order', 'supplier_invoice', 'bank_account', 'payment_date', 'payment_method', 'currency_paid', 'amount_in_payment_currency', 'amount_applied_to_order')
     search_fields = ('number', 'purchase_order__number', 'supplier_invoice__invoice_number', 'reference_number')
     list_filter = ('payment_method', 'currency_paid')
@@ -89,7 +90,7 @@ class SupplierPaymentAdmin(admin.ModelAdmin):
 
 
 @admin.register(SupplierDisbursementIdempotencyRecord)
-class SupplierDisbursementIdempotencyRecordAdmin(admin.ModelAdmin):
+class SupplierDisbursementIdempotencyRecordAdmin(TenantAdminMixin, admin.ModelAdmin):
     list_display = ('idempotency_key', 'purchase_order', 'supplier_payment', 'status', 'created_at')
     search_fields = ('idempotency_key', 'purchase_order__number', 'request_hash')
     list_filter = ('status', 'created_at')

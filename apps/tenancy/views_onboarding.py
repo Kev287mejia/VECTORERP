@@ -15,9 +15,10 @@ from apps.crm.models import Quote
 from apps.operations.models import WorkOrder
 from apps.sst.models import SafetyChecklist, LeaveRequest
 from apps.tenancy.constants import BusinessVertical, ERP_MODULES_CATALOG, VERTICAL_PRESETS_CONFIG
+from django.conf import settings
 from apps.tenancy.forms import OrganizationOnboardingForm
 from apps.tenancy.models import Organization, OrganizationMembership, RoleLevel
-from apps.tenancy.permissions import RoleLevelRequiredMixin
+from apps.tenancy.permissions import RoleLevelRequiredMixin, render_403_rbac
 
 
 class OnboardingWizardView(LoginRequiredMixin, View):
@@ -538,15 +539,43 @@ class ResetSandboxDataView(RoleLevelRequiredMixin, View):
     """
     Vaciado de datos de prueba del tenant para pruebas en blanco.
     Exclusivo para Owner / Administrador General (Nivel 100).
+
+    Salvaguarda estricta de seguridad multiempresa (SEC-03):
+    1. El entorno debe tener DEBUG=True y ENABLE_SANDBOX=True.
+    2. La organización debe estar expresamente listada en settings.SANDBOX_ORGANIZATION_SLUGS.
+       Cualquier organización no listada es considerada estrictamente productiva y su reinicio es rechazado con HTTP 403.
+    3. El usuario debe poseer autoridad real OWNER_ADMIN (Nivel 100).
     """
     min_role_level = RoleLevel.OWNER_ADMIN
 
     def post(self, request, *args, **kwargs):
-        if getattr(request, 'real_role_level', 0) < RoleLevel.OWNER_ADMIN:
-            messages.error(request, "Solo el Administrador General puede reiniciar los datos del tenant.")
-            return redirect('tenancy:dashboard')
+        # 1. Comprobación del entorno de ejecución
+        is_debug = getattr(settings, 'DEBUG', False)
+        is_sandbox_enabled = getattr(settings, 'ENABLE_SANDBOX', False)
+        if not (is_debug and is_sandbox_enabled):
+            return render_403_rbac(
+                request,
+                reason="El reinicio de datos sandbox está estrictamente deshabilitado en este entorno de producción."
+            )
 
-        SandboxScenarioSeeder.reset_organization_data(request.organization)
+        # 2. Comprobación de que la organización esté explícitamente autorizada como sandbox
+        sandbox_slugs = getattr(settings, 'SANDBOX_ORGANIZATION_SLUGS', ['imesa-ingenieria'])
+        org = getattr(request, 'organization', None)
+        if not org or org.slug not in sandbox_slugs:
+            return render_403_rbac(
+                request,
+                reason="La organización es de carácter productivo. El reinicio masivo de datos está terminantemente prohibido."
+            )
+
+        # 3. Comprobación de autoridad real Nivel 100
+        if getattr(request, 'real_role_level', 0) < RoleLevel.OWNER_ADMIN:
+            return render_403_rbac(
+                request,
+                min_role_level=RoleLevel.OWNER_ADMIN,
+                reason="Solo el Administrador General (Owner) puede solicitar el reinicio de datos del tenant."
+            )
+
+        SandboxScenarioSeeder.reset_organization_data(org)
         messages.warning(
             request,
             "Datos operativos de prueba vaciados. La organización y su usuario administrador se conservan limpios."

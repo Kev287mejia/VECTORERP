@@ -8,8 +8,8 @@ from django.utils import timezone
 from django.views import View
 from django.views.generic import ListView, DetailView, CreateView, TemplateView
 
-from apps.tenancy.models import RoleLevel
-from apps.tenancy.permissions import ModuleAccessRequiredMixin
+from apps.tenancy.models import RoleLevel, OrganizationMembership
+from apps.tenancy.permissions import ModuleAccessRequiredMixin, render_403_rbac
 from apps.crm.models import Account, AccountContact, Opportunity, Quote, QuoteItem
 from apps.crm.forms import (
     AccountForm,
@@ -19,6 +19,49 @@ from apps.crm.forms import (
     QuoteItemForm,
 )
 
+CRM_WRITE_ROLES = (RoleLevel.SALES_ADVISOR, RoleLevel.COMMERCIAL_MGR, RoleLevel.OWNER_ADMIN)
+
+
+class CrmWriteRequiredMixin(ModuleAccessRequiredMixin):
+    """
+    Guardián de operaciones de creación y mutación en CRM.
+    Autoriza exclusivamente a:
+    - SALES_ADVISOR (15): Creación de cuentas, oportunidades, cotizaciones borrador y partidas propias.
+    - COMMERCIAL_MGR (85): Creación y administración comercial general.
+    - OWNER_ADMIN (100): Control total.
+    Bloquea con HTTP 403 Forbidden a OPERATIONS_COORD (80), roles técnicos (<=70) y observadores.
+    """
+    required_module = 'crm'
+    min_role_level = RoleLevel.SALES_ADVISOR
+
+    def dispatch(self, request, *args, **kwargs):
+        # 1. Validar tenancy y autenticación antes de evaluar membresía o role_level
+        tenant_error = self.check_tenant_requirements(request)
+        if tenant_error:
+            return tenant_error
+
+        # 2. Validar que la organización tenga CRM habilitado y la membresía tenga acceso
+        membership = getattr(request, 'membership', None)
+        role_level = getattr(request, 'role_level', 0)
+        if not membership or not membership.has_module_access('crm', effective_role_level=role_level):
+            return render_403_rbac(
+                request,
+                required_module='crm',
+                min_role_level=RoleLevel.SALES_ADVISOR,
+                reason="El módulo de Gestión Comercial no está habilitado o autorizado para su membresía."
+            )
+
+        # 3. Validar rol de escritura ANTES de delegar la ejecución al handler (evita mutaciones fantasma)
+        if role_level not in CRM_WRITE_ROLES:
+            return render_403_rbac(
+                request,
+                required_module='crm',
+                min_role_level=RoleLevel.COMMERCIAL_MGR,
+                reason="Las operaciones de registro o modificación en CRM requieren rol de Asesor Comercial o Gerencia."
+            )
+
+        return super().dispatch(request, *args, **kwargs)
+
 
 # ==============================================================================
 # 1. DIRECTORIO DE CLIENTES (ACCOUNTS)
@@ -27,14 +70,14 @@ from apps.crm.forms import (
 class AccountListView(ModuleAccessRequiredMixin, ListView):
     """
     Directorio Unificado de Cuentas / Clientes B2B con aislamiento multi-tenant.
-    Lectura permitida desde Nivel 80 (OPERATIONS_COORD).
+    Lectura permitida para Asesor Comercial (15) y roles de coordinación/gerencia (>=80).
     """
     model = Account
     template_name = 'crm/account_list.html'
     context_object_name = 'accounts'
     paginate_by = 25
     required_module = 'crm'
-    min_role_level = RoleLevel.OPERATIONS_COORD
+    min_role_level = RoleLevel.SALES_ADVISOR
 
     def get_queryset(self):
         org = self.request.organization
@@ -78,16 +121,14 @@ class AccountListView(ModuleAccessRequiredMixin, ListView):
         return context
 
 
-class AccountCreateView(ModuleAccessRequiredMixin, CreateView):
+class AccountCreateView(CrmWriteRequiredMixin, CreateView):
     """
     Alta de nuevo cliente comercial.
-    Exige min_role_level = RoleLevel.COMMERCIAL_MGR (85).
+    Permitido para Asesor Comercial (15), Gerente Comercial (85) y Owner (100).
     """
     model = Account
     form_class = AccountForm
     template_name = 'crm/account_form.html'
-    required_module = 'crm'
-    min_role_level = RoleLevel.COMMERCIAL_MGR
 
     def get_form_kwargs(self):
         kwargs = super().get_form_kwargs()
@@ -97,6 +138,14 @@ class AccountCreateView(ModuleAccessRequiredMixin, CreateView):
     def form_valid(self, form):
         account = form.save(commit=False)
         account.organization = self.request.organization
+        # Validar que assigned_to pertenezca a la organización activa si fue asignado
+        if account.assigned_to and not OrganizationMembership.objects.filter(
+            user=account.assigned_to,
+            organization=self.request.organization,
+            is_active=True
+        ).exists():
+            messages.error(self.request, "El usuario asignado no pertenece a esta organización o está inactivo.")
+            return self.form_invalid(form)
         account.save()
         messages.success(self.request, f"Cliente {account.code} ({account.commercial_name}) creado exitosamente.")
         return redirect('crm:account_detail', pk=account.pk)
@@ -105,13 +154,13 @@ class AccountCreateView(ModuleAccessRequiredMixin, CreateView):
 class AccountDetailView(ModuleAccessRequiredMixin, DetailView):
     """
     Ficha Técnica Integral del Cliente: Contactos, Oportunidades y Cotizaciones.
-    Lectura permitida desde Nivel 80 (OPERATIONS_COORD).
+    Lectura permitida para Asesor Comercial (15) y roles de coordinación/gerencia (>=80).
     """
     model = Account
     template_name = 'crm/account_detail.html'
     context_object_name = 'account'
     required_module = 'crm'
-    min_role_level = RoleLevel.OPERATIONS_COORD
+    min_role_level = RoleLevel.SALES_ADVISOR
 
     def get_queryset(self):
         return Account.objects.for_org(self.request.organization).select_related('assigned_to')
@@ -126,14 +175,11 @@ class AccountDetailView(ModuleAccessRequiredMixin, DetailView):
         return context
 
 
-class AccountContactCreateView(ModuleAccessRequiredMixin, View):
+class AccountContactCreateView(CrmWriteRequiredMixin, View):
     """
     Creación inline de contacto técnico/comercial para una cuenta.
-    Exige min_role_level = RoleLevel.COMMERCIAL_MGR (85).
+    Permitido para Asesor Comercial (15), Gerente Comercial (85) y Owner (100).
     """
-    required_module = 'crm'
-    min_role_level = RoleLevel.COMMERCIAL_MGR
-
     def post(self, request, pk):
         account = get_object_or_404(Account.objects.for_org(request.organization), pk=pk)
         form = AccountContactForm(request.POST)
@@ -155,11 +201,11 @@ class AccountContactCreateView(ModuleAccessRequiredMixin, View):
 class OpportunityKanbanView(ModuleAccessRequiredMixin, TemplateView):
     """
     Tablero Kanban de Pipeline de Ventas e Ingeniería B2B en 6 etapas.
-    Lectura permitida desde Nivel 80 (OPERATIONS_COORD).
+    Lectura permitida para Asesor Comercial (15) y roles de coordinación/gerencia (>=80).
     """
     template_name = 'crm/opportunity_kanban.html'
     required_module = 'crm'
-    min_role_level = RoleLevel.OPERATIONS_COORD
+    min_role_level = RoleLevel.SALES_ADVISOR
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -190,16 +236,14 @@ class OpportunityKanbanView(ModuleAccessRequiredMixin, TemplateView):
         return context
 
 
-class OpportunityCreateView(ModuleAccessRequiredMixin, CreateView):
+class OpportunityCreateView(CrmWriteRequiredMixin, CreateView):
     """
     Alta de nueva oportunidad comercial.
-    Exige min_role_level = RoleLevel.COMMERCIAL_MGR (85).
+    Permitido para Asesor Comercial (15), Gerente Comercial (85) y Owner (100).
     """
     model = Opportunity
     form_class = OpportunityForm
     template_name = 'crm/opportunity_form.html'
-    required_module = 'crm'
-    min_role_level = RoleLevel.COMMERCIAL_MGR
 
     def get_form_kwargs(self):
         kwargs = super().get_form_kwargs()
@@ -209,19 +253,28 @@ class OpportunityCreateView(ModuleAccessRequiredMixin, CreateView):
     def form_valid(self, form):
         opp = form.save(commit=False)
         opp.organization = self.request.organization
+        # Validar cuenta de la organización
+        if opp.account.organization_id != self.request.organization.id:
+            messages.error(self.request, "La cuenta especificada no pertenece a su organización.")
+            return self.form_invalid(form)
+        # Validar asignado
+        if opp.assigned_to and not OrganizationMembership.objects.filter(
+            user=opp.assigned_to,
+            organization=self.request.organization,
+            is_active=True
+        ).exists():
+            messages.error(self.request, "El responsable asignado no pertenece a esta organización o está inactivo.")
+            return self.form_invalid(form)
         opp.save()
         messages.success(self.request, f"Oportunidad {opp.code} registrada con éxito.")
         return redirect('crm:opportunity_kanban')
 
 
-class OpportunityStageUpdateView(ModuleAccessRequiredMixin, View):
+class OpportunityStageUpdateView(CrmWriteRequiredMixin, View):
     """
     Actualización rápida de etapa Kanban vía POST / HTMX.
-    Exige min_role_level = RoleLevel.COMMERCIAL_MGR (85).
+    Permitido para Asesor Comercial (15), Gerente Comercial (85) y Owner (100).
     """
-    required_module = 'crm'
-    min_role_level = RoleLevel.COMMERCIAL_MGR
-
     def post(self, request, pk):
         opp = get_object_or_404(Opportunity.objects.for_org(request.organization), pk=pk)
         new_stage = request.POST.get('stage')
@@ -243,14 +296,14 @@ class OpportunityStageUpdateView(ModuleAccessRequiredMixin, View):
 class QuoteListView(ModuleAccessRequiredMixin, ListView):
     """
     Listado y consola de Cotizaciones Formales.
-    Lectura permitida desde Nivel 80 (OPERATIONS_COORD).
+    Lectura permitida para Asesor Comercial (15) y roles de coordinación/gerencia (>=80).
     """
     model = Quote
     template_name = 'crm/quote_list.html'
     context_object_name = 'quotes'
     paginate_by = 25
     required_module = 'crm'
-    min_role_level = RoleLevel.OPERATIONS_COORD
+    min_role_level = RoleLevel.SALES_ADVISOR
 
     def get_queryset(self):
         org = self.request.organization
@@ -288,16 +341,14 @@ class QuoteListView(ModuleAccessRequiredMixin, ListView):
         return context
 
 
-class QuoteCreateView(ModuleAccessRequiredMixin, CreateView):
+class QuoteCreateView(CrmWriteRequiredMixin, CreateView):
     """
     Creación de nueva Cotización Formal.
-    Exige min_role_level = RoleLevel.COMMERCIAL_MGR (85).
+    Permitido para Asesor Comercial (15), Gerente Comercial (85) y Owner (100).
     """
     model = Quote
     form_class = QuoteCreateForm
     template_name = 'crm/quote_form.html'
-    required_module = 'crm'
-    min_role_level = RoleLevel.COMMERCIAL_MGR
 
     def get_form_kwargs(self):
         kwargs = super().get_form_kwargs()
@@ -311,6 +362,16 @@ class QuoteCreateView(ModuleAccessRequiredMixin, CreateView):
         quote = form.save(commit=False)
         quote.organization = org
         quote.created_by = self.request.user
+        quote.status = Quote.Status.DRAFT
+
+        # Validar pertenencia de cuenta y oportunidad al tenant
+        if quote.account.organization_id != org.id:
+            messages.error(self.request, "El cliente especificado no pertenece a su organización.")
+            return self.form_invalid(form)
+
+        if quote.opportunity and quote.opportunity.organization_id != org.id:
+            messages.error(self.request, "La oportunidad especificada no pertenece a su organización.")
+            return self.form_invalid(form)
 
         # Asignar símbolo monetario adecuado
         if country:
@@ -328,13 +389,13 @@ class QuoteDetailView(ModuleAccessRequiredMixin, DetailView):
     """
     Consola técnica de armado de cotización.
     Desglose por partidas, cálculo de impuestos DGI y control de estados.
-    Lectura permitida desde Nivel 80 (OPERATIONS_COORD).
+    Lectura permitida para Asesor Comercial (15) y roles de coordinación/gerencia (>=80).
     """
     model = Quote
     template_name = 'crm/quote_detail.html'
     context_object_name = 'quote'
     required_module = 'crm'
-    min_role_level = RoleLevel.OPERATIONS_COORD
+    min_role_level = RoleLevel.SALES_ADVISOR
 
     def get_queryset(self):
         return Quote.objects.for_org(self.request.organization).select_related(
@@ -345,10 +406,17 @@ class QuoteDetailView(ModuleAccessRequiredMixin, DetailView):
         context = super().get_context_data(**kwargs)
         quote = self.object
         items = list(quote.items.all().order_by('created_at'))
+        role_level = getattr(self.request, 'role_level', 0)
 
         services = [i for i in items if i.item_type == QuoteItem.ItemType.SERVICE]
         materials = [i for i in items if i.item_type == QuoteItem.ItemType.MATERIAL]
         equipments = [i for i in items if i.item_type == QuoteItem.ItemType.EQUIPMENT]
+
+        # Condición de aprobación SoD para frontend
+        can_approve = (
+            role_level >= RoleLevel.COMMERCIAL_MGR and
+            (quote.created_by_id != self.request.user.id or role_level >= RoleLevel.OWNER_ADMIN)
+        )
 
         context.update({
             'items': items,
@@ -357,24 +425,34 @@ class QuoteDetailView(ModuleAccessRequiredMixin, DetailView):
             'equipments': equipments,
             'item_form': QuoteItemForm(),
             'can_edit': quote.status in [Quote.Status.DRAFT, Quote.Status.SENT],
+            'can_approve': can_approve,
         })
         return context
 
 
-class QuoteAddItemView(ModuleAccessRequiredMixin, View):
+class QuoteAddItemView(CrmWriteRequiredMixin, View):
     """
     Agregado de partida a la cotización con recálculo dinámico.
-    Exige min_role_level = RoleLevel.COMMERCIAL_MGR (85).
+    Permitido para Asesor Comercial (15), Gerente Comercial (85) y Owner (100).
+    Reglas de seguridad:
+    - Las cotizaciones en estado APPROVED son inmutables.
+    - Un Asesor Comercial solo puede agregar partidas a cotizaciones elaboradas por él mismo.
     """
-    required_module = 'crm'
-    min_role_level = RoleLevel.COMMERCIAL_MGR
-
     def post(self, request, pk):
         quote = get_object_or_404(Quote.objects.for_org(request.organization), pk=pk)
 
+        # Inmutabilidad de cotización aprobada o cerrada
         if quote.status not in [Quote.Status.DRAFT, Quote.Status.SENT]:
             messages.error(request, "No se pueden modificar partidas en una cotización aprobada o cerrada.")
             return redirect('crm:quote_detail', pk=quote.pk)
+
+        # Regla de autor para SALES_ADVISOR
+        if request.role_level == RoleLevel.SALES_ADVISOR and quote.created_by_id != request.user.id:
+            return render_403_rbac(
+                request,
+                required_module='crm',
+                reason="Un Asesor Comercial solo puede agregar partidas a cotizaciones elaboradas por él mismo."
+            )
 
         form = QuoteItemForm(request.POST)
         if form.is_valid():
@@ -389,20 +467,29 @@ class QuoteAddItemView(ModuleAccessRequiredMixin, View):
         return redirect('crm:quote_detail', pk=quote.pk)
 
 
-class QuoteRemoveItemView(ModuleAccessRequiredMixin, View):
+class QuoteRemoveItemView(CrmWriteRequiredMixin, View):
     """
     Eliminación de partida de la cotización con recálculo dinámico.
-    Exige min_role_level = RoleLevel.COMMERCIAL_MGR (85).
+    Permitido para Asesor Comercial (15), Gerente Comercial (85) y Owner (100).
+    Reglas de seguridad:
+    - Las cotizaciones en estado APPROVED son inmutables.
+    - Un Asesor Comercial solo puede eliminar partidas de cotizaciones elaboradas por él mismo.
     """
-    required_module = 'crm'
-    min_role_level = RoleLevel.COMMERCIAL_MGR
-
     def post(self, request, quote_pk, item_pk):
         quote = get_object_or_404(Quote.objects.for_org(request.organization), pk=quote_pk)
 
+        # Inmutabilidad de cotización aprobada o cerrada
         if quote.status not in [Quote.Status.DRAFT, Quote.Status.SENT]:
             messages.error(request, "No se pueden modificar partidas en una cotización aprobada o cerrada.")
             return redirect('crm:quote_detail', pk=quote.pk)
+
+        # Regla de autor para SALES_ADVISOR
+        if request.role_level == RoleLevel.SALES_ADVISOR and quote.created_by_id != request.user.id:
+            return render_403_rbac(
+                request,
+                required_module='crm',
+                reason="Un Asesor Comercial solo puede eliminar partidas de cotizaciones elaboradas por él mismo."
+            )
 
         item = get_object_or_404(quote.items.all(), pk=item_pk)
         item.delete()  # delete() recalcula automáticamente quote.recalculate_totals()
@@ -411,18 +498,17 @@ class QuoteRemoveItemView(ModuleAccessRequiredMixin, View):
         return redirect('crm:quote_detail', pk=quote.pk)
 
 
-class QuoteStatusTransitionView(ModuleAccessRequiredMixin, View):
+class QuoteStatusTransitionView(CrmWriteRequiredMixin, View):
     """
-    Transición de estado de la cotización (Aprobar, Enviar, Rechazar).
-    Exige min_role_level = RoleLevel.COMMERCIAL_MGR (85).
-    Al Aprobar:
-    - Marca approved_by y approved_at.
-    - Pasa el Account a ACTIVE.
-    - Pasa la Opportunity vinculada a WON.
+    Transición de estado de la cotización (Aprobar, Enviar, Rechazar, Vencer).
+    Aplica Segregación de Funciones (SoD) y Máquina de Estados Estricta:
+    - SALES_ADVISOR: Solo puede transicionar a SENT, REJECTED, EXPIRED.
+    - APPROVED: Exige RoleLevel >= COMMERCIAL_MGR (85).
+    - SoD: COMMERCIAL_MGR (85) NO puede autoaprobar cotizaciones creadas por él mismo.
+           Excepción concedida exclusivamente a OWNER_ADMIN (100).
+    - Inmutabilidad: Una cotización APPROVED no puede cambiar de estado vía POST.
+    - Condiciones de negocio: La aprobación exige partidas existentes y estado DRAFT o SENT.
     """
-    required_module = 'crm'
-    min_role_level = RoleLevel.COMMERCIAL_MGR
-
     @transaction.atomic
     def post(self, request, pk):
         quote = get_object_or_404(Quote.objects.for_org(request.organization), pk=pk)
@@ -432,7 +518,49 @@ class QuoteStatusTransitionView(ModuleAccessRequiredMixin, View):
             messages.error(request, "Estado de transición inválido.")
             return redirect('crm:quote_detail', pk=quote.pk)
 
+        # Inmutabilidad de cotización ya aprobada
+        if quote.status == Quote.Status.APPROVED:
+            messages.error(request, "Una cotización formalmente aprobada es inmutable y no puede cambiar de estado.")
+            return redirect('crm:quote_detail', pk=quote.pk)
+
+        # Regla de autoría para SALES_ADVISOR (REV-03):
+        # Un Asesor Comercial solo puede gestionar el ciclo de vida de cotizaciones elaboradas por él mismo.
+        if request.role_level == RoleLevel.SALES_ADVISOR and quote.created_by_id != request.user.id:
+            return render_403_rbac(
+                request,
+                required_module='crm',
+                reason="Un Asesor Comercial solo puede modificar el estado de cotizaciones elaboradas por él mismo."
+            )
+
         if new_status == Quote.Status.APPROVED:
+            # 1. Validación de rol mínimo (COMMERCIAL_MGR 85)
+            if request.role_level < RoleLevel.COMMERCIAL_MGR:
+                return render_403_rbac(
+                    request,
+                    required_module='crm',
+                    min_role_level=RoleLevel.COMMERCIAL_MGR,
+                    reason="La aprobación formal de cotizaciones requiere nivel Gerente Comercial o Administrador General."
+                )
+
+            # 2. Segregación de Funciones (SoD): No autoaprobación salvo OWNER_ADMIN
+            if quote.created_by_id == request.user.id and request.role_level < RoleLevel.OWNER_ADMIN:
+                return render_403_rbac(
+                    request,
+                    required_module='crm',
+                    min_role_level=RoleLevel.OWNER_ADMIN,
+                    reason="Segregación de Funciones (SoD): Un Gerente Comercial no puede autoaprobar cotizaciones elaboradas por él mismo. Requiere la autorización de otro Gerente Comercial o del Administrador General."
+                )
+
+            # 3. Validación de estado origen (solo DRAFT o SENT)
+            if quote.status not in [Quote.Status.DRAFT, Quote.Status.SENT]:
+                messages.error(request, f"No se puede aprobar una cotización en estado '{quote.get_status_display()}'.")
+                return redirect('crm:quote_detail', pk=quote.pk)
+
+            # 4. Validación de existencia de partidas técnicas/comerciales
+            if not quote.items.exists():
+                messages.error(request, "No se puede aprobar una cotización que no posee partidas registradas.")
+                return redirect('crm:quote_detail', pk=quote.pk)
+
             quote.status = Quote.Status.APPROVED
             quote.approved_by = request.user
             quote.approved_at = timezone.now()
@@ -459,6 +587,10 @@ class QuoteStatusTransitionView(ModuleAccessRequiredMixin, View):
             )
 
         elif new_status == Quote.Status.SENT:
+            if quote.status != Quote.Status.DRAFT:
+                messages.error(request, "Solo cotizaciones en borrador pueden ser marcadas como enviadas.")
+                return redirect('crm:quote_detail', pk=quote.pk)
+
             quote.status = Quote.Status.SENT
             quote.save(update_fields=['status', 'updated_at'])
             messages.info(request, f"Cotización {quote.number} marcada como ENVIADA al cliente.")
@@ -483,13 +615,13 @@ class QuotePrintView(ModuleAccessRequiredMixin, DetailView):
     """
     Vista de Impresión / Hoja Técnica Oficial DGI Nicaragua.
     Formato limpio sin sidebar ni navegación, listo para window.print() a PDF.
-    Lectura permitida desde Nivel 80 (OPERATIONS_COORD).
+    Lectura permitida para Asesor Comercial (15) y roles de coordinación/gerencia (>=80).
     """
     model = Quote
     template_name = 'crm/quote_print.html'
     context_object_name = 'quote'
     required_module = 'crm'
-    min_role_level = RoleLevel.OPERATIONS_COORD
+    min_role_level = RoleLevel.SALES_ADVISOR
 
     def get_queryset(self):
         return Quote.objects.for_org(self.request.organization).select_related(

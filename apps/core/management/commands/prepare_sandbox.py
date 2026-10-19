@@ -1,6 +1,7 @@
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
 from apps.core.models import CountryConfig
 from apps.core.services.sandbox_seeder import SandboxScenarioSeeder
@@ -20,6 +21,12 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        if not getattr(settings, 'ENABLE_SANDBOX', False):
+            raise CommandError(
+                "El sembrado del entorno sandbox está estrictamente deshabilitado en este entorno. "
+                "Para autorizar el sembrado, configure ENABLE_SANDBOX=True en la configuración del entorno."
+            )
+
         self.stdout.write("[SANDBOX] 1/4 Aplicando migraciones de base de datos...")
         call_command('migrate', interactive=False)
 

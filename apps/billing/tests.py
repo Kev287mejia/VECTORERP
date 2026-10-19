@@ -1,9 +1,13 @@
 import json
+import threading
+import time
+import uuid
 from decimal import Decimal
 import datetime
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.test import Client, TestCase
+from django.db import connection, connections, transaction
+from django.test import Client, TestCase, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
 
@@ -404,6 +408,377 @@ class BillingModuleTestSuite(TestCase):
         self.assertEqual(invoice.gross_total, Decimal('34500.00'))
         self.assertTrue(invoice.number.startswith('FAC-'))
 
+    def test_d05_convert_quote_to_invoice_rejects_draft(self):
+        """
+        [D-05] Verifica que una cotización en estado DRAFT sea rechazada en backend
+        y no genere factura fiscal ni cuenta por cobrar.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Propuesta Preliminar en Borrador",
+            status=Quote.Status.DRAFT,
+            currency_code='NIO',
+            currency_symbol='C$',
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type='SERVICE',
+            code='SRV-PRE',
+            description='Servicio preliminar',
+            quantity=Decimal('1.00'),
+            unit_price=Decimal('5000.00'),
+        )
+
+        self.client.force_login(self.commercial_mgr)
+        url = reverse('billing:from_quote', kwargs={'quote_pk': quote.pk})
+        response = self.client.post(url)
+        self.assertRedirects(response, reverse('crm:quote_detail', kwargs={'pk': quote.pk}))
+
+        self.assertFalse(Invoice.objects.filter(source_quote=quote).exists())
+
+    def test_d05_convert_quote_to_invoice_rejects_sent(self):
+        """
+        [D-05] Verifica que una cotización en estado SENT (enviada pero no aprobada)
+        sea rechazada en backend y no genere factura fiscal.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Propuesta Enviada al Cliente",
+            status=Quote.Status.SENT,
+            currency_code='NIO',
+            currency_symbol='C$',
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type='SERVICE',
+            code='SRV-SNT',
+            description='Servicio enviado',
+            quantity=Decimal('1.00'),
+            unit_price=Decimal('8000.00'),
+        )
+
+        self.client.force_login(self.commercial_mgr)
+        url = reverse('billing:from_quote', kwargs={'quote_pk': quote.pk})
+        response = self.client.post(url)
+        self.assertRedirects(response, reverse('crm:quote_detail', kwargs={'pk': quote.pk}))
+
+        self.assertFalse(Invoice.objects.filter(source_quote=quote).exists())
+
+    def test_d05_convert_quote_to_invoice_rejects_rejected(self):
+        """
+        [D-05] Verifica que una cotización en estado REJECTED sea rechazada en backend
+        y no genere factura fiscal.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Propuesta Rechazada por Cliente",
+            status=Quote.Status.REJECTED,
+            currency_code='NIO',
+            currency_symbol='C$',
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type='SERVICE',
+            code='SRV-REJ',
+            description='Servicio rechazado',
+            quantity=Decimal('1.00'),
+            unit_price=Decimal('12000.00'),
+        )
+
+        self.client.force_login(self.commercial_mgr)
+        url = reverse('billing:from_quote', kwargs={'quote_pk': quote.pk})
+        response = self.client.post(url)
+        self.assertRedirects(response, reverse('crm:quote_detail', kwargs={'pk': quote.pk}))
+
+        self.assertFalse(Invoice.objects.filter(source_quote=quote).exists())
+
+    def test_d05_convert_quote_to_invoice_rejects_expired(self):
+        """
+        [D-05] Verifica que una cotización en estado EXPIRED sea rechazada en backend
+        y no genere factura fiscal.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Propuesta Vencida",
+            status=Quote.Status.EXPIRED,
+            currency_code='NIO',
+            currency_symbol='C$',
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type='SERVICE',
+            code='SRV-EXP',
+            description='Servicio vencido',
+            quantity=Decimal('1.00'),
+            unit_price=Decimal('6000.00'),
+        )
+
+        self.client.force_login(self.commercial_mgr)
+        url = reverse('billing:from_quote', kwargs={'quote_pk': quote.pk})
+        response = self.client.post(url)
+        self.assertRedirects(response, reverse('crm:quote_detail', kwargs={'pk': quote.pk}))
+
+        self.assertFalse(Invoice.objects.filter(source_quote=quote).exists())
+
+    def test_d05_convert_quote_to_invoice_unauthorized_role_forbidden(self):
+        """
+        [D-05] Verifica que un usuario con rol inferior a COMMERCIAL_MGR (ej. Coordinador Operativo nivel 80)
+        reciba HTTP 403 Forbidden y no genere factura fiscal ni cuenta por cobrar.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Cotización Aprobada",
+            status=Quote.Status.APPROVED,
+            currency_code='NIO',
+            currency_symbol='C$',
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type='SERVICE',
+            code='SRV-SEC',
+            description='Servicio con restricción de rol',
+            quantity=Decimal('1.00'),
+            unit_price=Decimal('4000.00'),
+        )
+
+        self.client.force_login(self.ops_coord)
+        url = reverse('billing:from_quote', kwargs={'quote_pk': quote.pk})
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 403)
+
+        self.assertFalse(Invoice.objects.filter(source_quote=quote).exists())
+
+    def test_d05_convert_quote_to_invoice_tenant_isolation_404(self):
+        """
+        [D-05] Verifica que intentar convertir una cotización perteneciente a otra organización
+        retorne HTTP 404 Not Found y preserve el aislamiento multi-tenant.
+        """
+        account_other = Account.objects.create(
+            organization=self.org_other,
+            code='CLI-OTH-01',
+            commercial_name='Cliente Invasor S.A.',
+            legal_name='Cliente Invasor S.A.',
+            tax_id='J0310000888888',
+        )
+        quote_other = Quote.objects.create(
+            organization=self.org_other,
+            account=account_other,
+            title="Cotización Organización Ajena",
+            status=Quote.Status.APPROVED,
+            currency_code='NIO',
+            currency_symbol='C$',
+            created_by=self.commercial_mgr,
+        )
+
+        self.client.force_login(self.commercial_mgr)
+        url = reverse('billing:from_quote', kwargs={'quote_pk': quote_other.pk})
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 404)
+
+        self.assertFalse(Invoice.objects.filter(source_quote=quote_other).exists())
+
+    def test_d05_convert_quote_to_invoice_prevents_duplicate_active_invoice(self):
+        """
+        [D-05] Verifica que una cotización aprobada no pueda convertirse dos veces
+        en facturas activas duplicadas.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Cotización Única Aprobada",
+            status=Quote.Status.APPROVED,
+            currency_code='NIO',
+            currency_symbol='C$',
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type='SERVICE',
+            code='SRV-DUP',
+            description='Servicio único',
+            quantity=Decimal('1.00'),
+            unit_price=Decimal('10000.00'),
+        )
+
+        self.client.force_login(self.commercial_mgr)
+        url = reverse('billing:from_quote', kwargs={'quote_pk': quote.pk})
+
+        # Primera conversión: exitosa
+        resp1 = self.client.post(url)
+        self.assertEqual(resp1.status_code, 302)
+        inv1 = Invoice.objects.get(source_quote=quote)
+        self.assertRedirects(resp1, reverse('billing:invoice_detail', kwargs={'pk': inv1.pk}))
+
+        # Segunda conversión: previene duplicado y redirige a la factura existente
+        resp2 = self.client.post(url)
+        self.assertEqual(resp2.status_code, 302)
+        self.assertRedirects(resp2, reverse('billing:invoice_detail', kwargs={'pk': inv1.pk}))
+
+        # Confirmar que solo existe 1 factura en BD
+        self.assertEqual(Invoice.objects.filter(source_quote=quote).count(), 1)
+
+    def test_d05_convert_quote_to_invoice_rejects_without_items(self):
+        """
+        [D-05-B] Rechaza la conversión a factura cuando la cotización no contenga partidas facturables.
+        - No crea facturas vacías en base de datos.
+        - No genera saldos, movimientos contables ni registros parciales.
+        - Redirige al detalle de la cotización con mensaje de error informativo.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Cotización Sin Partidas",
+            status=Quote.Status.APPROVED,
+            currency_code='NIO',
+            currency_symbol='C$',
+            created_by=self.commercial_mgr,
+        )
+        self.assertEqual(quote.items.count(), 0)
+
+        initial_invoices_count = Invoice.objects.count()
+        initial_items_count = InvoiceItem.objects.count()
+
+        self.client.force_login(self.commercial_mgr)
+        url = reverse('billing:from_quote', kwargs={'quote_pk': quote.pk})
+        response = self.client.post(url)
+
+        self.assertRedirects(response, reverse('crm:quote_detail', kwargs={'pk': quote.pk}))
+
+        # No se creó ninguna factura ni partida en BD
+        self.assertFalse(Invoice.objects.filter(source_quote=quote).exists())
+        self.assertEqual(Invoice.objects.count(), initial_invoices_count)
+        self.assertEqual(InvoiceItem.objects.count(), initial_items_count)
+
+    def test_d05_convert_quote_to_invoice_allows_reinvoicing_after_void(self):
+        """
+        [D-05-C] Permite una nueva facturación cuando la factura anterior vinculada
+        a la cotización esté en estado VOID, siempre que la cotización continúe aprobada.
+        - Una factura activa previa impide la conversión.
+        - Al anularse (VOID), la cotización aprobada puede volver a convertirse.
+        - Si la cotización no está aprobada (ej. REJECTED), la presencia de VOID no permite facturar.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Cotización para Refacturación",
+            status=Quote.Status.APPROVED,
+            currency_code='NIO',
+            currency_symbol='C$',
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type='SERVICE',
+            code='SRV-REINV',
+            description='Servicio para ciclo de anulación y refacturación',
+            quantity=Decimal('1.00'),
+            unit_price=Decimal('15000.00'),
+        )
+
+        self.client.force_login(self.commercial_mgr)
+        url = reverse('billing:from_quote', kwargs={'quote_pk': quote.pk})
+
+        # Paso 1: Primera conversión exitosa -> Factura 1 (ISSUED)
+        resp1 = self.client.post(url)
+        self.assertEqual(resp1.status_code, 302)
+        inv1 = Invoice.objects.get(source_quote=quote)
+        self.assertEqual(inv1.status, Invoice.Status.ISSUED)
+
+        # Paso 2: Mientras inv1 esté activa (ISSUED), un segundo intento es bloqueado y redirige a inv1
+        resp_blocked = self.client.post(url)
+        self.assertRedirects(resp_blocked, reverse('billing:invoice_detail', kwargs={'pk': inv1.pk}))
+        self.assertEqual(Invoice.objects.filter(source_quote=quote).count(), 1)
+
+        # Paso 3: Se anula la factura inicial (cambio legítimo de estado a VOID)
+        inv1.status = Invoice.Status.VOID
+        inv1.save(update_fields=['status'])
+
+        # Paso 4: Con la cotización aún APROBADA y la factura anterior en VOID,
+        # se permite la refacturación creando una nueva Factura 2 activa (ISSUED)
+        resp2 = self.client.post(url)
+        self.assertEqual(resp2.status_code, 302)
+
+        # En BD existen ahora 2 facturas vinculadas a la cotización: 1 VOID y 1 ISSUED
+        all_invoices = Invoice.objects.filter(source_quote=quote).order_by('created_at')
+        self.assertEqual(all_invoices.count(), 2)
+
+        inv2 = all_invoices.last()
+        self.assertNotEqual(inv1.pk, inv2.pk)
+        self.assertEqual(inv2.status, Invoice.Status.ISSUED)
+        self.assertRedirects(resp2, reverse('billing:invoice_detail', kwargs={'pk': inv2.pk}))
+
+        # Exactamente 1 factura activa (ISSUED, PARTIAL o PAID)
+        active_invoices = Invoice.objects.filter(
+            source_quote=quote,
+            status__in=[Invoice.Status.ISSUED, Invoice.Status.PARTIAL, Invoice.Status.PAID]
+        )
+        self.assertEqual(active_invoices.count(), 1)
+        self.assertEqual(active_invoices.first().pk, inv2.pk)
+
+        # Paso 5: Caso negativo: si se anula la 2da factura pero la cotización pasa a REJECTED,
+        # la conversión es rechazada independientemente del historial VOID
+        inv2.status = Invoice.Status.VOID
+        inv2.save(update_fields=['status'])
+        quote.status = Quote.Status.REJECTED
+        quote.save(update_fields=['status'])
+
+        resp3 = self.client.post(url)
+        self.assertRedirects(resp3, reverse('crm:quote_detail', kwargs={'pk': quote.pk}))
+        self.assertEqual(Invoice.objects.filter(source_quote=quote).count(), 2)
+
+    def test_d05_convert_quote_to_invoice_atomic_rollback_on_failure(self):
+        """
+        [D-05] Verifica que un fallo durante la conversión ejecute un rollback atómico
+        sin dejar facturas huérfanas o registros parciales.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Cotización con Fallo Simulado",
+            status=Quote.Status.APPROVED,
+            currency_code='NIO',
+            currency_symbol='C$',
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type='SERVICE',
+            code='SRV-ERR',
+            description='Servicio con error',
+            quantity=Decimal('1.00'),
+            unit_price=Decimal('7000.00'),
+        )
+
+        self.client.force_login(self.commercial_mgr)
+        url = reverse('billing:from_quote', kwargs={'quote_pk': quote.pk})
+
+        from unittest.mock import patch
+        with patch.object(Invoice, 'recalculate_totals', side_effect=RuntimeError("Fallo simulado en motor financiero")):
+            with self.assertRaises(RuntimeError):
+                self.client.post(url)
+
+        # Confirmar que no se creó factura ni partidas en base de datos
+        self.assertFalse(Invoice.objects.filter(source_quote=quote).exists())
+        self.assertEqual(InvoiceItem.objects.filter(code='SRV-ERR').count(), 0)
+
     def test_06_convert_work_order_to_invoice_1_click(self):
         """
         Verifica la conversión en 1 clic de una Orden de Trabajo a Factura Fiscal (WorkOrder -> Invoice).
@@ -461,6 +836,293 @@ class BillingModuleTestSuite(TestCase):
         log = WorkOrderTimelineLog.objects.filter(work_order=wo, event_type='INVOICED').first()
         self.assertIsNotNone(log)
         self.assertIn(invoice.number, log.summary)
+
+    def test_d05_convert_work_order_to_invoice_prevents_duplicate_active_invoice_of_quote(self):
+        """
+        [D-05] Verifica que una orden de trabajo vinculada a una cotización que ya posee
+        una factura activa no genere una segunda factura activa y redirija a la factura existente.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Mantenimiento Subestaciones Eléctricas",
+            status=Quote.Status.APPROVED,
+            currency_code='NIO',
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type='SERVICE',
+            code='SRV-ELEC',
+            description='Servicio Eléctrico',
+            quantity=Decimal('2.00'),
+            unit_price=Decimal('10000.00'),
+        )
+
+        wo = WorkOrder.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            source_quote=quote,
+            title="OT Eléctrica",
+            phase=WorkOrder.Phase.COMPLETED,
+            created_by=self.commercial_mgr,
+        )
+        WorkOrderItem.objects.create(
+            organization=self.org,
+            work_order=wo,
+            item_type='SERVICE',
+            code='SRV-ELEC',
+            description='Servicio Eléctrico',
+            planned_quantity=Decimal('2.00'),
+            executed_quantity=Decimal('2.00'),
+        )
+
+        self.client.force_login(self.commercial_mgr)
+
+        # Paso 1: Convertir la cotización directamente -> Factura 1 (ISSUED)
+        url_quote = reverse('billing:from_quote', kwargs={'quote_pk': quote.pk})
+        resp1 = self.client.post(url_quote)
+        self.assertEqual(resp1.status_code, 302)
+        inv1 = Invoice.objects.get(source_quote=quote)
+        self.assertEqual(inv1.status, Invoice.Status.ISSUED)
+
+        # Paso 2: Intentar convertir la orden de trabajo vinculada a la misma cotización
+        url_wo = reverse('billing:from_workorder', kwargs={'wo_pk': wo.pk})
+        resp2 = self.client.post(url_wo)
+        self.assertEqual(resp2.status_code, 302)
+        self.assertRedirects(resp2, reverse('billing:invoice_detail', kwargs={'pk': inv1.pk}))
+
+        # Verificar que solo existe exactamente 1 factura para la cotización en BD
+        self.assertEqual(Invoice.objects.filter(source_quote=quote).count(), 1)
+        self.assertFalse(Invoice.objects.filter(source_work_order=wo).exists())
+
+    def test_d05_convert_work_order_to_invoice_allows_reinvoicing_after_void(self):
+        """
+        [D-05] Verifica que una orden de trabajo vinculada a una cotización cuya factura previa
+        fue anulada (VOID) pueda ser facturada exitosamente si la cotización sigue aprobada.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Proyecto Renovación Líneas",
+            status=Quote.Status.APPROVED,
+            currency_code='NIO',
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type='SERVICE',
+            code='SRV-LIN',
+            description='Tendido de líneas',
+            quantity=Decimal('5.00'),
+            unit_price=Decimal('8000.00'),
+        )
+
+        wo = WorkOrder.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            source_quote=quote,
+            title="OT Tendido de Líneas",
+            phase=WorkOrder.Phase.COMPLETED,
+            created_by=self.commercial_mgr,
+        )
+        WorkOrderItem.objects.create(
+            organization=self.org,
+            work_order=wo,
+            item_type='SERVICE',
+            code='SRV-LIN',
+            description='Tendido de líneas',
+            planned_quantity=Decimal('5.00'),
+            executed_quantity=Decimal('5.00'),
+        )
+
+        self.client.force_login(self.commercial_mgr)
+
+        # Paso 1: Emitir primera factura desde la cotización y anularla (VOID)
+        url_quote = reverse('billing:from_quote', kwargs={'quote_pk': quote.pk})
+        self.client.post(url_quote)
+        inv1 = Invoice.objects.get(source_quote=quote)
+        inv1.status = Invoice.Status.VOID
+        inv1.save(update_fields=['status'])
+
+        # Paso 2: Facturar desde la orden de trabajo con factura previa en VOID
+        url_wo = reverse('billing:from_workorder', kwargs={'wo_pk': wo.pk})
+        resp = self.client.post(url_wo)
+        self.assertEqual(resp.status_code, 302)
+
+        inv2 = Invoice.objects.get(source_work_order=wo)
+        self.assertEqual(inv2.status, Invoice.Status.ISSUED)
+        self.assertEqual(inv2.source_quote, quote)
+        self.assertRedirects(resp, reverse('billing:invoice_detail', kwargs={'pk': inv2.pk}))
+
+        # 2 facturas en total vinculadas a la cotización (1 VOID, 1 ISSUED)
+        self.assertEqual(Invoice.objects.filter(source_quote=quote).count(), 2)
+        # Exactamente 1 factura activa
+        self.assertEqual(
+            Invoice.objects.filter(
+                source_quote=quote,
+                status__in=[Invoice.Status.ISSUED, Invoice.Status.PARTIAL, Invoice.Status.PAID]
+            ).count(),
+            1
+        )
+
+    def test_d05_convert_work_order_to_invoice_rejects_unapproved_quote(self):
+        """
+        [D-05] Verifica que una orden de trabajo vinculada a una cotización no aprobada (ej. DRAFT)
+        no pueda convertirse en factura fiscal y redirija con error.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Propuesta en Borrador",
+            status=Quote.Status.DRAFT,
+            currency_code='NIO',
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type='SERVICE',
+            code='SRV-DFT',
+            description='Servicio en borrador',
+            quantity=Decimal('1.00'),
+            unit_price=Decimal('5000.00'),
+        )
+
+        wo = WorkOrder.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            source_quote=quote,
+            title="OT Vinculada a Borrador",
+            phase=WorkOrder.Phase.COMPLETED,
+            created_by=self.commercial_mgr,
+        )
+        WorkOrderItem.objects.create(
+            organization=self.org,
+            work_order=wo,
+            item_type='SERVICE',
+            code='SRV-DFT',
+            description='Servicio en borrador',
+            planned_quantity=Decimal('1.00'),
+            executed_quantity=Decimal('1.00'),
+        )
+
+        self.client.force_login(self.commercial_mgr)
+        url_wo = reverse('billing:from_workorder', kwargs={'wo_pk': wo.pk})
+        resp = self.client.post(url_wo)
+
+        self.assertRedirects(resp, reverse('operations:workorder_detail', kwargs={'pk': wo.pk}))
+        self.assertFalse(Invoice.objects.filter(source_work_order=wo).exists())
+        self.assertFalse(Invoice.objects.filter(source_quote=quote).exists())
+
+    def test_d05_convert_work_order_to_invoice_unauthorized_role_forbidden(self):
+        """
+        [D-05] Verifica que un usuario con rol inferior a COMMERCIAL_MGR (ej. Coordinador Operativo nivel 80)
+        reciba HTTP 403 Forbidden al intentar facturar una orden de trabajo.
+        """
+        wo = WorkOrder.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="OT Restringida",
+            phase=WorkOrder.Phase.COMPLETED,
+            created_by=self.commercial_mgr,
+        )
+        WorkOrderItem.objects.create(
+            organization=self.org,
+            work_order=wo,
+            item_type='SERVICE',
+            code='SRV-SEC',
+            description='Servicio con restricción',
+            planned_quantity=Decimal('1.00'),
+            executed_quantity=Decimal('1.00'),
+        )
+
+        self.client.force_login(self.ops_coord)
+        url = reverse('billing:from_workorder', kwargs={'wo_pk': wo.pk})
+        resp = self.client.post(url)
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(Invoice.objects.filter(source_work_order=wo).exists())
+
+    def test_d05_convert_work_order_to_invoice_tenant_isolation_404(self):
+        """
+        [D-05] Verifica que intentar facturar una orden de trabajo perteneciente a otra organización
+        retorne HTTP 404 Not Found.
+        """
+        account_other = Account.objects.create(
+            organization=self.org_other,
+            code='CLI-OTH-WO',
+            commercial_name='Cliente Tenant Ajeno',
+            tax_id='J0310000777000',
+        )
+        wo_other = WorkOrder.objects.create(
+            organization=self.org_other,
+            account=account_other,
+            title="OT de Otra Empresa",
+            phase=WorkOrder.Phase.COMPLETED,
+            created_by=self.commercial_mgr,
+        )
+
+        self.client.force_login(self.commercial_mgr)
+        url = reverse('billing:from_workorder', kwargs={'wo_pk': wo_other.pk})
+        resp = self.client.post(url)
+        self.assertEqual(resp.status_code, 404)
+        self.assertFalse(Invoice.objects.filter(source_work_order=wo_other).exists())
+
+    def test_d05_convert_work_order_to_invoice_atomic_rollback_on_failure(self):
+        """
+        [D-05] Verifica que un fallo durante la conversión de una orden de trabajo ejecute un rollback atómico
+        sin dejar facturas huérfanas, partidas parciales ni entradas en la bitácora de la OT.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            title="Cotización para Fallo en OT",
+            status=Quote.Status.APPROVED,
+            currency_code='NIO',
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type='SERVICE',
+            code='SRV-FAIL',
+            description='Servicio con fallo',
+            quantity=Decimal('1.00'),
+            unit_price=Decimal('12000.00'),
+        )
+
+        wo = WorkOrder.objects.create(
+            organization=self.org,
+            account=self.client_enatrel,
+            source_quote=quote,
+            title="OT para Fallo Simulado",
+            phase=WorkOrder.Phase.COMPLETED,
+            created_by=self.commercial_mgr,
+        )
+        WorkOrderItem.objects.create(
+            organization=self.org,
+            work_order=wo,
+            item_type='SERVICE',
+            code='SRV-FAIL',
+            description='Servicio con fallo',
+            planned_quantity=Decimal('1.00'),
+            executed_quantity=Decimal('1.00'),
+        )
+
+        self.client.force_login(self.commercial_mgr)
+        url = reverse('billing:from_workorder', kwargs={'wo_pk': wo.pk})
+
+        from unittest.mock import patch
+        with patch.object(Invoice, 'recalculate_totals', side_effect=RuntimeError("Fallo simulado en motor financiero de OT")):
+            with self.assertRaises(RuntimeError):
+                self.client.post(url)
+
+        self.assertFalse(Invoice.objects.filter(source_work_order=wo).exists())
+        self.assertFalse(Invoice.objects.filter(source_quote=quote).exists())
+        self.assertEqual(InvoiceItem.objects.filter(code='SRV-FAIL').count(), 0)
+        self.assertFalse(WorkOrderTimelineLog.objects.filter(work_order=wo, event_type='INVOICED').exists())
 
     def test_07_business_profile_presets(self):
         """
@@ -1115,3 +1777,437 @@ class D02ClientCollectionBankIsolationTestCase(TestCase):
         # Middleware o mixin redirige al onboarding/403
         self.assertIn(response.status_code, [302, 403])
         self.assertEqual(PaymentReceipt.objects.filter(invoice=self.invoice).count(), 0)
+
+
+class D05QuoteToInvoiceConcurrencyTestCase(TransactionTestCase):
+    """
+    [D-05-A] Pruebas de Concurrencia Real Multi-Hilo sobre PostgreSQL 14 (TransactionTestCase):
+    Verifica que dos transacciones concurrentes con conexiones independientes que intentan
+    facturar la misma cotización aprobada queden serializadas mediante `select_for_update()`
+    dentro de `transaction.atomic()`, produciendo como máximo una factura activa.
+    """
+
+    def setUp(self):
+        if connection.vendor != 'postgresql':
+            self.skipTest("Prueba de concurrencia D-05 requiere PostgreSQL para validar select_for_update()")
+
+        self.country_ni, _ = CountryConfig.objects.get_or_create(
+            code='NI',
+            defaults={
+                'name': 'Nicaragua',
+                'flag_emoji': '🇳🇮',
+                'primary_currency_code': 'NIO',
+                'primary_currency_symbol': 'C$',
+                'default_tax_rate': Decimal('15.00'),
+                'is_active': True,
+            }
+        )
+        self.org = Organization.objects.create(
+            name="Constructora Concurrente D05 S.A.",
+            legal_name="Constructora Concurrente D05 S.A.",
+            slug=f"org-conc-d05-{uuid.uuid4().hex[:6]}",
+            country=self.country_ni,
+            currency='NIO',
+            enabled_modules=['crm', 'billing', 'finance'],
+            is_active=True,
+        )
+        self.commercial_mgr = User.objects.create_user(
+            email=f'mgr_conc_{uuid.uuid4().hex[:4]}@vector.ni',
+            password='TestPassword2026*',
+            full_name='Gerente Comercial Concurrente',
+        )
+        OrganizationMembership.objects.create(
+            organization=self.org,
+            user=self.commercial_mgr,
+            role_level=RoleLevel.COMMERCIAL_MGR,
+            is_active=True,
+        )
+        self.client_account = Account.objects.create(
+            organization=self.org,
+            code=f"CLI-CONC-{uuid.uuid4().hex[:4].upper()}",
+            commercial_name='Cliente Concurrente S.A.',
+            legal_name='Cliente Concurrente S.A.',
+            tax_id='J0310000777999',
+        )
+        self.quote = Quote.objects.create(
+            organization=self.org,
+            account=self.client_account,
+            title="Licitación Electromecánica Concurrente",
+            status=Quote.Status.APPROVED,
+            currency_code='NIO',
+            currency_symbol='C$',
+            exchange_rate=Decimal('36.6243'),
+            apply_tax=True,
+            tax_name='IVA',
+            tax_rate=Decimal('15.00'),
+            created_by=self.commercial_mgr,
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=self.quote,
+            item_type='SERVICE',
+            code='SRV-CONC-01',
+            description='Montaje de transformador de potencia',
+            quantity=Decimal('1.00'),
+            unit_price=Decimal('50000.00'),
+        )
+
+    def test_d05_concurrent_quote_to_invoice_prevents_duplicate_active_invoice_in_postgresql(self):
+        """
+        Dos hilos concurrentes envían simultáneamente la solicitud POST de conversión
+        de la misma cotización aprobada bajo conexiones independientes:
+        - Se coordinan mediante un Barrier para disparar exactamente al mismo tiempo.
+        - select_for_update() serializa la sección crítica en PostgreSQL.
+        - Uno de los hilos crea la factura fiscal (ISSUED) exitosamente.
+        - El segundo hilo es retenido en DB hasta el commit del primero; al desbloquearse
+          revalida y detecta la factura activa existente, redirigiendo a ella sin duplicar.
+        - En la base de datos existe exactamente 1 factura vinculada a la cotización.
+        """
+        url = reverse('billing:from_quote', kwargs={'quote_pk': self.quote.pk})
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def worker(thread_idx):
+            connections.close_all()
+            try:
+                client = Client()
+                client.force_login(self.commercial_mgr)
+                # Sincronización explícita antes de ejecutar la conversión
+                barrier.wait(timeout=10)
+                resp = client.post(url)
+                results.append({
+                    'thread': thread_idx,
+                    'status_code': resp.status_code,
+                    'redirect_url': getattr(resp, 'url', None),
+                })
+            except Exception as exc:
+                errors.append({
+                    'thread': thread_idx,
+                    'error': str(exc),
+                })
+            finally:
+                connections.close_all()
+
+        t1 = threading.Thread(target=worker, args=(1,), name="Thread-Quote-Convert-1")
+        t2 = threading.Thread(target=worker, args=(2,), name="Thread-Quote-Convert-2")
+
+        t1.start()
+        t2.start()
+
+        t1.join(timeout=25)
+        t2.join(timeout=25)
+
+        connections.close_all()
+
+        # Comprobación 1: Sin excepciones
+        self.assertEqual(len(errors), 0, f"Errores en ejecución concurrente: {errors}")
+
+        # Comprobación 2: Ambos hilos terminaron
+        self.assertEqual(len(results), 2, "Ambos hilos debieron completar la llamada HTTP")
+
+        # Comprobación 3: Ambos recibieron HTTP 302
+        for r in results:
+            self.assertEqual(r['status_code'], 302, f"Código de estado inesperado en hilo {r['thread']}: {r['status_code']}")
+
+        # Comprobación 4: Resultado final en BD: Exactamente UNA factura creada
+        invoices = Invoice.objects.filter(source_quote=self.quote)
+        self.assertEqual(
+            invoices.count(),
+            1,
+            f"Se esperaba exactamente 1 factura en BD, se crearon {invoices.count()}"
+        )
+
+        created_invoice = invoices.first()
+        self.assertEqual(created_invoice.status, Invoice.Status.ISSUED)
+        self.assertEqual(created_invoice.items.count(), 1)
+        self.assertEqual(created_invoice.gross_total, Decimal('57500.00'))
+
+        # Comprobación 5: Ambos hilos redirigen a la misma factura activa creada
+        expected_redirect = reverse('billing:invoice_detail', kwargs={'pk': created_invoice.pk})
+        for r in results:
+            self.assertEqual(
+                r['redirect_url'],
+                expected_redirect,
+                f"El hilo {r['thread']} debió redirigir a {expected_redirect}, redirigió a {r['redirect_url']}"
+            )
+
+    def test_d05_concurrency_lock_blocks_competing_transaction_until_commit(self):
+        """
+        Demuestra explícitamente el mecanismo de bloqueo en PostgreSQL:
+        - El Hilo A adquiere select_for_update() sobre la cotización dentro de atomic()
+          y sostiene el bloqueo temporalmente.
+        - El Hilo B inicia la conversión de la cotización mediante la vista oficial
+          y queda bloqueado a nivel de PostgreSQL esperando el release del bloqueo.
+        - Al confirmarse el Hilo A, el Hilo B se desbloquea, revalida la cotización y
+          previene la duplicación de facturas activas.
+        """
+        url = reverse('billing:from_quote', kwargs={'quote_pk': self.quote.pk})
+        lock_held_event = threading.Event()
+        proceed_commit_event = threading.Event()
+        thread_b_finished_event = threading.Event()
+        results_b = []
+        errors = []
+
+        def thread_a_worker():
+            connections.close_all()
+            try:
+                with transaction.atomic():
+                    # Hilo A adquiere el bloqueo FOR UPDATE sobre la misma fila de Quote
+                    locked_quote = Quote.objects.select_for_update().get(pk=self.quote.pk)
+                    # Notificar a Hilo B que el bloqueo en BD está activo
+                    lock_held_event.set()
+                    # Esperar señal para proceder con commit
+                    proceed_commit_event.wait(timeout=10)
+            except Exception as exc:
+                errors.append(('thread_a', str(exc)))
+            finally:
+                connections.close_all()
+
+        def thread_b_worker():
+            connections.close_all()
+            try:
+                client = Client()
+                client.force_login(self.commercial_mgr)
+                # Esperar a que Hilo A tenga la fila bloqueada en BD
+                lock_held_event.wait(timeout=10)
+                # Disparar conversión: debe bloquearse en DB hasta que Hilo A libere
+                resp = client.post(url)
+                results_b.append(resp)
+            except Exception as exc:
+                errors.append(('thread_b', str(exc)))
+            finally:
+                thread_b_finished_event.set()
+                connections.close_all()
+
+        ta = threading.Thread(target=thread_a_worker, name="Thread-A-LockHolder")
+        tb = threading.Thread(target=thread_b_worker, name="Thread-B-Converter")
+
+        ta.start()
+        # Aseguramos que Hilo A adquirió el bloqueo FOR UPDATE
+        self.assertTrue(lock_held_event.wait(timeout=5), "Hilo A no pudo adquirir el bloqueo FOR UPDATE a tiempo")
+
+        tb.start()
+        # Dar tiempo a Hilo B para que alcance select_for_update() y quede bloqueado en PostgreSQL
+        time.sleep(0.3)
+        self.assertFalse(
+            thread_b_finished_event.is_set(),
+            "Hilo B debió estar bloqueado por select_for_update() en PostgreSQL mientras Hilo A retenía la transacción"
+        )
+
+        # Ahora permitir a Hilo A hacer commit y liberar el bloqueo
+        proceed_commit_event.set()
+
+        ta.join(timeout=10)
+        tb.join(timeout=10)
+        connections.close_all()
+
+        self.assertEqual(len(errors), 0, f"Errores en prueba de bloqueo: {errors}")
+        self.assertEqual(len(results_b), 1, "Hilo B debió completar tras liberación del bloqueo")
+        self.assertEqual(results_b[0].status_code, 302)
+
+        # Confirmar factura única creada por Hilo B (puesto que Hilo A solo sostuvo el bloqueo sin crear)
+        self.assertEqual(Invoice.objects.filter(source_quote=self.quote).count(), 1)
+
+    def test_d05_cross_concurrency_quote_vs_work_order_prevents_duplicate_active_invoice(self):
+        """
+        [D-05-A / Cross-Concurrency] Verifica la competencia concurrente en tiempo real
+        entre ConvertQuoteToInvoiceView y ConvertWorkOrderToInvoiceView:
+        - Dos hilos paralelos ejecutan simultáneamente con conexiones separadas a PostgreSQL:
+          * Hilo 1: POST a /billing/from-quote/<quote_pk>/
+          * Hilo 2: POST a /billing/from-workorder/<wo_pk>/
+        - Sincronizados explícitamente mediante threading.Barrier(2).
+        - Ambos intentan facturar la misma cotización aprobada.
+        - select_for_update() serializa la sección crítica en PostgreSQL.
+        - Resultado en base de datos: EXACTAMENTE UNA factura activa vinculada a la cotización.
+        - Ningún hilo falla con excepción y ambos reciben HTTP 302 redirigiendo a la factura creada.
+        """
+        wo = WorkOrder.objects.create(
+            organization=self.org,
+            account=self.client_account,
+            source_quote=self.quote,
+            title="OT Concurrente Cruzada",
+            phase=WorkOrder.Phase.COMPLETED,
+            created_by=self.commercial_mgr,
+        )
+        WorkOrderItem.objects.create(
+            organization=self.org,
+            work_order=wo,
+            item_type='SERVICE',
+            code='SRV-CONC-01',
+            description='Montaje de transformador de potencia',
+            planned_quantity=Decimal('1.00'),
+            executed_quantity=Decimal('1.00'),
+        )
+
+        url_quote = reverse('billing:from_quote', kwargs={'quote_pk': self.quote.pk})
+        url_wo = reverse('billing:from_workorder', kwargs={'wo_pk': wo.pk})
+
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def worker_quote():
+            connections.close_all()
+            try:
+                client = Client()
+                client.force_login(self.commercial_mgr)
+                barrier.wait(timeout=10)
+                resp = client.post(url_quote)
+                results.append({
+                    'source': 'quote',
+                    'status_code': resp.status_code,
+                    'redirect_url': getattr(resp, 'url', None),
+                })
+            except Exception as exc:
+                errors.append(('quote', str(exc)))
+            finally:
+                connections.close_all()
+
+        def worker_wo():
+            connections.close_all()
+            try:
+                client = Client()
+                client.force_login(self.commercial_mgr)
+                barrier.wait(timeout=10)
+                resp = client.post(url_wo)
+                results.append({
+                    'source': 'work_order',
+                    'status_code': resp.status_code,
+                    'redirect_url': getattr(resp, 'url', None),
+                })
+            except Exception as exc:
+                errors.append(('work_order', str(exc)))
+            finally:
+                connections.close_all()
+
+        t1 = threading.Thread(target=worker_quote, name="Thread-Cross-Quote")
+        t2 = threading.Thread(target=worker_wo, name="Thread-Cross-WorkOrder")
+
+        t1.start()
+        t2.start()
+
+        t1.join(timeout=25)
+        t2.join(timeout=25)
+
+        connections.close_all()
+
+        # 1. Sin excepciones
+        self.assertEqual(len(errors), 0, f"Errores en concurrencia cruzada: {errors}")
+
+        # 2. Ambos hilos completaron
+        self.assertEqual(len(results), 2, "Ambos hilos debieron completar la petición HTTP")
+
+        # 3. Ambos recibieron 302
+        for r in results:
+            self.assertEqual(r['status_code'], 302, f"Código inesperado en {r['source']}: {r['status_code']}")
+
+        # 4. En base de datos: EXACTAMENTE UNA factura vinculada a la cotización
+        invoices = Invoice.objects.filter(source_quote=self.quote)
+        self.assertEqual(
+            invoices.count(),
+            1,
+            f"Se esperaba exactamente 1 factura en BD vinculada a la cotización, se crearon {invoices.count()}"
+        )
+
+        created_invoice = invoices.first()
+        self.assertEqual(created_invoice.status, Invoice.Status.ISSUED)
+
+        # 5. Partidas creadas exactamente una vez
+        self.assertEqual(InvoiceItem.objects.filter(invoice=created_invoice).count(), 1)
+
+        # 6. Ambos hilos redirigen al detalle de la factura creada
+        expected_redirect = reverse('billing:invoice_detail', kwargs={'pk': created_invoice.pk})
+        for r in results:
+            self.assertEqual(
+                r['redirect_url'],
+                expected_redirect,
+                f"El hilo {r['source']} debió redirigir a {expected_redirect}, redirigió a {r['redirect_url']}"
+            )
+
+    def test_d05_work_order_respects_quote_lock_blocks_until_commit(self):
+        """
+        [D-05-A / Cross-Lock] Demuestra explícitamente que la conversión desde Orden de Trabajo
+        respeta el bloqueo pesimista `select_for_update()` sobre Quote cuando otra transacción
+        lo retiene, esperando a su liberación antes de proceder.
+        """
+        wo = WorkOrder.objects.create(
+            organization=self.org,
+            account=self.client_account,
+            source_quote=self.quote,
+            title="OT Bloqueo Cruzado",
+            phase=WorkOrder.Phase.COMPLETED,
+            created_by=self.commercial_mgr,
+        )
+        WorkOrderItem.objects.create(
+            organization=self.org,
+            work_order=wo,
+            item_type='SERVICE',
+            code='SRV-CONC-01',
+            description='Montaje de transformador de potencia',
+            planned_quantity=Decimal('1.00'),
+            executed_quantity=Decimal('1.00'),
+        )
+
+        url_wo = reverse('billing:from_workorder', kwargs={'wo_pk': wo.pk})
+        lock_held_event = threading.Event()
+        proceed_commit_event = threading.Event()
+        thread_wo_finished_event = threading.Event()
+        results_wo = []
+        errors = []
+
+        def lock_holder_worker():
+            connections.close_all()
+            try:
+                with transaction.atomic():
+                    # Bloquear pesimísticamente la Quote
+                    Quote.objects.select_for_update().get(pk=self.quote.pk)
+                    lock_held_event.set()
+                    proceed_commit_event.wait(timeout=10)
+            except Exception as exc:
+                errors.append(('lock_holder', str(exc)))
+            finally:
+                connections.close_all()
+
+        def wo_converter_worker():
+            connections.close_all()
+            try:
+                client = Client()
+                client.force_login(self.commercial_mgr)
+                lock_held_event.wait(timeout=10)
+                # Intenta facturar la OT vinculada a la Quote bloqueada
+                resp = client.post(url_wo)
+                results_wo.append(resp)
+            except Exception as exc:
+                errors.append(('wo_converter', str(exc)))
+            finally:
+                thread_wo_finished_event.set()
+                connections.close_all()
+
+        t_holder = threading.Thread(target=lock_holder_worker, name="Thread-Quote-LockHolder")
+        t_wo = threading.Thread(target=wo_converter_worker, name="Thread-WO-Converter")
+
+        t_holder.start()
+        self.assertTrue(lock_held_event.wait(timeout=5), "No se pudo adquirir el bloqueo de Quote a tiempo")
+
+        t_wo.start()
+        time.sleep(0.3)
+        # Comprobar que Hilo WO está bloqueado esperando el release de la Quote
+        self.assertFalse(
+            thread_wo_finished_event.is_set(),
+            "Hilo WO debió estar bloqueado por select_for_update() sobre la Quote mientras la otra transacción sostenía el bloqueo"
+        )
+
+        # Liberar la transacción
+        proceed_commit_event.set()
+
+        t_holder.join(timeout=10)
+        t_wo.join(timeout=10)
+        connections.close_all()
+
+        self.assertEqual(len(errors), 0, f"Errores en prueba de bloqueo cruzado: {errors}")
+        self.assertEqual(len(results_wo), 1, "Hilo WO debió completar tras liberación del bloqueo")
+        self.assertEqual(results_wo[0].status_code, 302)
+
+        # Factura única creada por Hilo WO
+        self.assertEqual(Invoice.objects.filter(source_quote=self.quote).count(), 1)

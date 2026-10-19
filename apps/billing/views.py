@@ -108,12 +108,39 @@ class ConvertQuoteToInvoiceView(ModuleAccessRequiredMixin, View):
     min_role_level = RoleLevel.COMMERCIAL_MGR
 
     def post(self, request, quote_pk, *args, **kwargs):
-        quote = get_object_or_404(
-            Quote.objects.for_org(request.organization),
-            pk=quote_pk
-        )
-
         with transaction.atomic():
+            quote = get_object_or_404(
+                Quote.objects.for_org(request.organization).select_for_update(),
+                pk=quote_pk
+            )
+
+            if quote.status != Quote.Status.APPROVED:
+                messages.error(
+                    request,
+                    f"La cotización {quote.number} no está aprobada. "
+                    "Solo cotizaciones en estado APROBADA pueden convertirse en Factura Fiscal."
+                )
+                return redirect('crm:quote_detail', pk=quote.pk)
+
+            existing_invoice = Invoice.objects.for_org(request.organization).filter(
+                source_quote=quote,
+                status__in=[Invoice.Status.ISSUED, Invoice.Status.PARTIAL, Invoice.Status.PAID]
+            ).first()
+            if existing_invoice:
+                messages.warning(
+                    request,
+                    f"La cotización {quote.number} ya posee una factura emitida activa: {existing_invoice.number}."
+                )
+                return redirect('billing:invoice_detail', pk=existing_invoice.pk)
+
+            quote_items = list(quote.items.all())
+            if not quote_items:
+                messages.error(
+                    request,
+                    f"La cotización {quote.number} no contiene partidas facturables para emitir una Factura Fiscal."
+                )
+                return redirect('crm:quote_detail', pk=quote.pk)
+
             invoice = Invoice.objects.create(
                 organization=request.organization,
                 account=quote.account,
@@ -129,7 +156,7 @@ class ConvertQuoteToInvoiceView(ModuleAccessRequiredMixin, View):
                 notes=quote.notes,
             )
 
-            for q_item in quote.items.all():
+            for q_item in quote_items:
                 InvoiceItem.objects.create(
                     organization=request.organization,
                     invoice=invoice,
@@ -158,18 +185,68 @@ class ConvertWorkOrderToInvoiceView(ModuleAccessRequiredMixin, View):
     Conversión 1-Clic: Factura una Orden de Trabajo con base en las partidas ejecutadas.
     Registra un evento inmutable en el historial operativo de la OT.
     Exclusivo para Gerente Comercial (85+) y Owner (100).
+    Protegido contra concurrencia cruzada con Cotizaciones mediante select_for_update().
     """
     required_module = 'billing'
     min_role_level = RoleLevel.COMMERCIAL_MGR
 
     def post(self, request, wo_pk, *args, **kwargs):
-        wo = get_object_or_404(
-            WorkOrder.objects.for_org(request.organization),
-            pk=wo_pk
-        )
-
         with transaction.atomic():
-            quote = wo.source_quote
+            # 1. Comprobar preliminarmente si la OT existe en el tenant y si tiene cotización origen
+            wo_meta = WorkOrder.objects.for_org(request.organization).filter(
+                pk=wo_pk
+            ).values('id', 'source_quote_id').first()
+            if not wo_meta:
+                get_object_or_404(WorkOrder.objects.for_org(request.organization), pk=wo_pk)
+
+            quote = None
+            if wo_meta['source_quote_id']:
+                # Bloqueo pesimista de Quote en primer lugar (orden consistente con ConvertQuoteToInvoiceView)
+                quote = Quote.objects.for_org(request.organization).select_for_update().filter(
+                    pk=wo_meta['source_quote_id']
+                ).first()
+
+                if not quote:
+                    messages.error(
+                        request,
+                        "La cotización vinculada a la orden de trabajo no es válida o pertenece a otra organización."
+                    )
+                    return redirect('operations:workorder_detail', pk=wo_pk)
+
+                if quote.status != Quote.Status.APPROVED:
+                    messages.error(
+                        request,
+                        f"La cotización {quote.number} vinculada a la orden de trabajo no está aprobada. "
+                        "Solo cotizaciones en estado APROBADA pueden facturarse."
+                    )
+                    return redirect('operations:workorder_detail', pk=wo_pk)
+
+                existing_invoice = Invoice.objects.for_org(request.organization).filter(
+                    source_quote=quote,
+                    status__in=[Invoice.Status.ISSUED, Invoice.Status.PARTIAL, Invoice.Status.PAID]
+                ).first()
+                if existing_invoice:
+                    messages.warning(
+                        request,
+                        f"La cotización {quote.number} vinculada a esta orden de trabajo ya posee una factura emitida activa: {existing_invoice.number}."
+                    )
+                    return redirect('billing:invoice_detail', pk=existing_invoice.pk)
+
+            # 2. Bloqueo pesimista de la Orden de Trabajo
+            wo = WorkOrder.objects.for_org(request.organization).select_for_update().get(pk=wo_pk)
+
+            # 3. Validar si la OT ya posee factura activa propia
+            existing_wo_invoice = Invoice.objects.for_org(request.organization).filter(
+                source_work_order=wo,
+                status__in=[Invoice.Status.ISSUED, Invoice.Status.PARTIAL, Invoice.Status.PAID]
+            ).first()
+            if existing_wo_invoice:
+                messages.warning(
+                    request,
+                    f"La orden de trabajo {wo.number} ya posee una factura emitida activa: {existing_wo_invoice.number}."
+                )
+                return redirect('billing:invoice_detail', pk=existing_wo_invoice.pk)
+
             currency_code = quote.currency_code if quote else request.organization.currency
             currency_symbol = quote.currency_symbol if quote else request.organization.currency_symbol
             exchange_rate = quote.exchange_rate if quote else Decimal('36.6243')

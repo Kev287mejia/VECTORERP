@@ -7,6 +7,7 @@ import subprocess
 from unittest.mock import patch
 from io import StringIO
 
+from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
@@ -47,8 +48,8 @@ class PrepareSandboxHardeningTestCase(TestCase):
         """3. Cuando settings.ENABLE_SANDBOX no existe como atributo, el comportamiento predeterminado es seguro."""
         out = StringIO()
         err = StringIO()
-        with patch('django.conf.settings', create=True) as mock_settings:
-            del mock_settings.ENABLE_SANDBOX
+        with override_settings():
+            delattr(settings, 'ENABLE_SANDBOX')
             with self.assertRaises(CommandError) as ctx:
                 call_command('prepare_sandbox', stdout=out, stderr=err)
             self.assertIn("estrictamente deshabilitado", str(ctx.exception))

@@ -1,0 +1,76 @@
+name: VECTOR ERP - CI & Security Gate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test Suite (Python 3.13, PostgreSQL 16)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: vector_ci_test_db
+          POSTGRES_USER: vector_ci_user
+          POSTGRES_PASSWORD: vector_ci_secure_password_2026
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://vector_ci_user:vector_ci_secure_password_2026@localhost:5432/vector_ci_test_db
+      SECRET_KEY: django-insecure-ci-workflow-temporary-key-vector-2026
+      DEBUG: "False"
+      ALLOWED_HOSTS: "localhost,127.0.0.1"
+      ENABLE_SANDBOX: "True"
+      SANDBOX_ORGANIZATION_SLUGS: "imesa-ingenieria,sandbox-demo"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Django System Check
+        run: |
+          python manage.py check
+
+      - name: Run Security, Tenancy & Hardening Tests (SEC-01..06, R-01, D-01, D-02)
+        run: |
+          python manage.py test apps.core.tests_security_remediation_phase1c11 \
+                                 apps.core.tests_r01_sandbox_lifecycle \
+                                 apps.core.tests_prepare_sandbox_hardening \
+                                 apps.tenancy.tests.D01DashboardAndSwitchOrgTestCase \
+                                 apps.billing.tests.D02ClientCollectionBankIsolationTestCase \
+                                 --noinput
+
+      - name: Run CRM Permissions, Author Rules & Segregation of Duties Tests
+        run: |
+          python manage.py test apps.crm.tests --noinput
+
+      - name: Run D-05 Quote & Work Order Conversion & Concurrency Tests
+        run: |
+          python manage.py test -k "d05" apps.billing.tests --noinput

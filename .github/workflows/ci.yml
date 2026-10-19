@@ -58,6 +58,10 @@ jobs:
         run: |
           python manage.py check
 
+      - name: Verify Migration Consistency (DEF-01 Gate)
+        run: |
+          python manage.py makemigrations --check --dry-run
+
       - name: Run Security, Tenancy & Hardening Tests (SEC-01..06, R-01, D-01, D-02)
         run: |
           python manage.py test apps.core.tests_security_remediation_phase1c11 \

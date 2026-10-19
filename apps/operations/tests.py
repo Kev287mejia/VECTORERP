@@ -1,11 +1,12 @@
 import hashlib
 import json
-import re
+import threading
 import uuid
 from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.test import TestCase, Client
+from django.db import connection, transaction, IntegrityError
+from django.test import TestCase, Client, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
 
@@ -298,6 +299,208 @@ class OperationsModuleEndToEndTestCase(TestCase):
         self.assertIn("1.00", html_content)
         self.assertIn("2.00", html_content)
         self.assertIn("MTS", html_content)
+
+    # --------------------------------------------------------------------------
+    # DEF-06: Idempotencia, Unicidad y Concurrencia de Quote -> WorkOrder
+    # --------------------------------------------------------------------------
+    def test_quote_to_workorder_idempotency_second_request_does_not_duplicate(self):
+        """
+        DEF-06: Verifica que una segunda solicitud de conversión (doble clic o reintento)
+        no cree una segunda Orden de Trabajo ni duplique las partidas técnicas del BOM.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.account,
+            title="Instalación de Paneles Solares Industriales",
+            status=Quote.Status.APPROVED,
+            approved_by=self.user_ops_coord,
+            approved_at=timezone.now(),
+        )
+        QuoteItem.objects.create(
+            organization=self.org,
+            quote=quote,
+            item_type=QuoteItem.ItemType.MATERIAL,
+            code="SOL-MOD-01",
+            description="Módulo Fotovoltaico Monocristalino 550W",
+            quantity=Decimal('20.00'),
+            unit_price=Decimal('150.00'),
+        )
+
+        client_coord = self._get_client_for_user(self.user_ops_coord)
+        url_convert = reverse('operations:convert_from_quote', kwargs={'quote_pk': quote.pk})
+
+        # Primera solicitud: Crea la OT
+        resp1 = client_coord.post(url_convert, follow=True)
+        self.assertEqual(resp1.status_code, 200)
+        self.assertEqual(WorkOrder.objects.filter(source_quote=quote).count(), 1)
+        wo1 = WorkOrder.objects.get(source_quote=quote)
+        self.assertEqual(wo1.items.count(), 1)
+        self.assertEqual(wo1.timeline_logs.filter(event_type='FROM_QUOTE').count(), 1)
+
+        # Segunda solicitud (reintento / doble clic): No duplica
+        resp2 = client_coord.post(url_convert, follow=True)
+        self.assertEqual(resp2.status_code, 200)
+        # Sigue existiendo exactamente 1 OT
+        self.assertEqual(WorkOrder.objects.filter(source_quote=quote).count(), 1)
+        self.assertEqual(wo1.items.count(), 1)
+        self.assertEqual(wo1.timeline_logs.filter(event_type='FROM_QUOTE').count(), 1)
+        # Mensaje informativo/advertencia devuelto
+        messages_list = list(resp2.context['messages'])
+        self.assertTrue(any("ya posee la Orden de Trabajo" in m.message or "ya cuenta con una Orden de Trabajo" in m.message for m in messages_list))
+
+    def test_quote_to_workorder_direct_get_request_handled_gracefully(self):
+        """
+        DEF-06: Verifica que peticiones GET directas a la URL de conversión
+        respondan de manera controlada y sin mutaciones de estado ni errores 405.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.account,
+            title="Mantenimiento de Banco de Capacitores",
+            status=Quote.Status.APPROVED,
+        )
+        client_coord = self._get_client_for_user(self.user_ops_coord)
+        url_convert = reverse('operations:convert_from_quote', kwargs={'quote_pk': quote.pk})
+
+        # Caso 1: Aún no existe OT -> redirige a crm:quote_detail con mensaje
+        resp_get1 = client_coord.get(url_convert, follow=True)
+        self.assertEqual(resp_get1.status_code, 200)
+        self.assertRedirects(resp_get1, reverse('crm:quote_detail', kwargs={'pk': quote.pk}))
+        self.assertEqual(WorkOrder.objects.filter(source_quote=quote).count(), 0)
+
+        # Crear la OT formalmente vía POST
+        client_coord.post(url_convert)
+        wo = WorkOrder.objects.get(source_quote=quote)
+
+        # Caso 2: Ya existe OT -> redirige a operations:workorder_detail con mensaje
+        resp_get2 = client_coord.get(url_convert, follow=True)
+        self.assertEqual(resp_get2.status_code, 200)
+        self.assertRedirects(resp_get2, reverse('operations:workorder_detail', kwargs={'pk': wo.pk}))
+
+    def test_quote_to_workorder_unapproved_quote_rejected(self):
+        """
+        DEF-06: Cotizaciones en DRAFT, SENT o REJECTED no pueden convertirse en OT.
+        """
+        quote_draft = Quote.objects.create(
+            organization=self.org,
+            account=self.account,
+            title="Cotización Borrador No Aprobada",
+            status=Quote.Status.DRAFT,
+        )
+        client_coord = self._get_client_for_user(self.user_ops_coord)
+        url = reverse('operations:convert_from_quote', kwargs={'quote_pk': quote_draft.pk})
+        resp = client_coord.post(url, follow=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertRedirects(resp, reverse('crm:quote_detail', kwargs={'pk': quote_draft.pk}))
+        self.assertEqual(WorkOrder.objects.filter(source_quote=quote_draft).count(), 0)
+
+    def test_quote_to_workorder_cross_tenant_isolation(self):
+        """
+        DEF-06: Un usuario de otra organización no puede convertir ni consultar
+        cotizaciones u órdenes de trabajo ajenas.
+        """
+        user_intruder = User.objects.create_user(
+            email='intruder_coord@invasora.com.ni',
+            full_name='Coordinador Invasor',
+            password='password123'
+        )
+        OrganizationMembership.objects.create(
+            user=user_intruder,
+            organization=self.org_intruder,
+            role_level=RoleLevel.OPERATIONS_COORD,
+            is_active=True,
+            is_default_org=True,
+        )
+
+        quote_org1 = Quote.objects.create(
+            organization=self.org,
+            account=self.account,
+            title="Proyecto Confidencial Vector",
+            status=Quote.Status.APPROVED,
+        )
+
+        client_intruder = self._get_client_for_user(user_intruder, org=self.org_intruder)
+        url_convert = reverse('operations:convert_from_quote', kwargs={'quote_pk': quote_org1.pk})
+
+        resp = client_intruder.post(url_convert)
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(WorkOrder.objects.filter(source_quote=quote_org1).count(), 0)
+
+    def test_quote_to_workorder_database_unique_constraint_enforcement(self):
+        """
+        DEF-06: La base de datos impide duplicados incluso si dos procesos
+        intentan insertar concurrentemente con el mismo source_quote.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.account,
+            title="Subestación Tipitapa Fase 2",
+            status=Quote.Status.APPROVED,
+        )
+
+        wo1 = WorkOrder.objects.create(
+            organization=self.org,
+            account=self.account,
+            source_quote=quote,
+            title=quote.title,
+            created_by=self.user_ops_coord,
+        )
+        self.assertIsNotNone(wo1.pk)
+
+        with transaction.atomic():
+            with self.assertRaises(IntegrityError):
+                WorkOrder.objects.create(
+                    organization=self.org,
+                    account=self.account,
+                    source_quote=quote,
+                    title="Duplicado no autorizado",
+                    created_by=self.user_ops_coord,
+                )
+
+        direct_wo1 = WorkOrder.objects.create(
+            organization=self.org,
+            account=self.account,
+            source_quote=None,
+            title="OT Directa 1",
+            created_by=self.user_ops_coord,
+        )
+        direct_wo2 = WorkOrder.objects.create(
+            organization=self.org,
+            account=self.account,
+            source_quote=None,
+            title="OT Directa 2",
+            created_by=self.user_ops_coord,
+        )
+        self.assertIsNotNone(direct_wo1.pk)
+        self.assertIsNotNone(direct_wo2.pk)
+
+    def test_quote_detail_ui_shows_link_when_workorder_exists(self):
+        """
+        DEF-06: En la interfaz quote_detail.html, si ya existe una OT asociada,
+        se oculta el botón de conversión y se muestra el enlace directo a la OT existente.
+        """
+        quote = Quote.objects.create(
+            organization=self.org,
+            account=self.account,
+            title="Reemplazo de Seccionadores 69kV",
+            status=Quote.Status.APPROVED,
+        )
+        client_owner = self._get_client_for_user(self.user_owner)
+        url_detail = reverse('crm:quote_detail', kwargs={'pk': quote.pk})
+
+        resp_before = client_owner.get(url_detail)
+        self.assertEqual(resp_before.status_code, 200)
+        self.assertContains(resp_before, "Generar Orden de Trabajo")
+
+        url_convert = reverse('operations:convert_from_quote', kwargs={'quote_pk': quote.pk})
+        client_owner.post(url_convert)
+        wo = WorkOrder.objects.get(source_quote=quote)
+
+        resp_after = client_owner.get(url_detail)
+        self.assertEqual(resp_after.status_code, 200)
+        self.assertNotContains(resp_after, "Generar Orden de Trabajo")
+        self.assertContains(resp_after, reverse('operations:workorder_detail', kwargs={'pk': wo.pk}))
+        self.assertContains(resp_after, wo.number)
 
     # --------------------------------------------------------------------------
     # TEST 2: Regla de Seguridad SST y Bloqueo en Alto Riesgo
@@ -862,3 +1065,142 @@ class OperationsModuleEndToEndTestCase(TestCase):
         self.assertIn("Lic. Marcio Blandón", html)
         self.assertIn("001-150482-0003M", html)
         self.assertIn("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", html)
+
+
+class OperationsQuoteToWorkOrderConcurrencyTestCase(TransactionTestCase):
+    """
+    Prueba de Concurrencia Real Multi-Hilo para Conversión Quote -> WorkOrder (DEF-06).
+    Ejecutada sobre PostgreSQL (TransactionTestCase):
+    Dos hilos concurrentes intentan convertir simultáneamente la misma cotización aprobada.
+    Verifica:
+    1. Exactamente una Orden de Trabajo generada en la base de datos.
+    2. Exactamente una copia de partidas de BOM (sin duplicados).
+    3. Exactamente un evento de timeline FROM_QUOTE.
+    4. Ambos hilos terminan exitosamente con respuestas controladas (302 a la OT).
+    5. Cero excepciones 500 y ninguna transacción rota.
+    """
+
+    def setUp(self):
+        if connection.vendor != 'postgresql':
+            return
+
+        self.country_ni, _ = CountryConfig.objects.get_or_create(
+            code='NI',
+            defaults={
+                'name': 'Nicaragua',
+                'flag_emoji': '🇳🇮',
+                'primary_currency_code': 'NIO',
+                'primary_currency_symbol': 'C$',
+                'is_active': True,
+            }
+        )
+        self.org = Organization.objects.create(
+            name="Vector Concurrency Test S.A.",
+            legal_name="Vector Concurrency S.A.",
+            slug=f"vector-conc-{uuid.uuid4().hex[:8]}",
+            tax_id=f"J031{uuid.uuid4().hex[:10].upper()}",
+            country=self.country_ni,
+            enabled_modules=['crm', 'operations'],
+            is_active=True,
+        )
+        self.account = Account.objects.create(
+            organization=self.org,
+            commercial_name="Cliente Concurrencia",
+        )
+        self.user_coord = User.objects.create_user(
+            email=f'coord_{uuid.uuid4().hex[:6]}@vector.com.ni',
+            full_name='Ing. Concurrente',
+            password='password123'
+        )
+        OrganizationMembership.objects.create(
+            user=self.user_coord,
+            organization=self.org,
+            role_level=RoleLevel.OPERATIONS_COORD,
+            is_active=True,
+            is_default_org=True,
+        )
+        self.quote = Quote.objects.create(
+            organization=self.org,
+            account=self.account,
+            title="Suministro de Transformadores 500kVA",
+            status=Quote.Status.APPROVED,
+            approved_by=self.user_coord,
+            approved_at=timezone.now(),
+        )
+        self.item1 = QuoteItem.objects.create(
+            organization=self.org,
+            quote=self.quote,
+            item_type=QuoteItem.ItemType.MATERIAL,
+            code="TRF-500KVA",
+            description="Transformador Trifásico Sumergido en Aceite",
+            quantity=Decimal('2.00'),
+            unit_price=Decimal('12000.00'),
+        )
+
+    def test_concurrent_quote_conversion_creates_single_work_order(self):
+        """
+        Dos hilos concurrentes ejecutando POST /operations/from-quote/<pk>/ a la vez:
+        - Exactamente 1 WorkOrder creada.
+        - Exactamente 1 ítem en el BOM de la WorkOrder.
+        - Exactamente 1 log FROM_QUOTE.
+        - Ambos hilos responden con código 302 y sin error 500.
+        """
+        if connection.vendor != 'postgresql':
+            self.skipTest("Esta prueba de concurrencia multi-hilo requiere PostgreSQL.")
+
+        url_convert = reverse('operations:convert_from_quote', kwargs={'quote_pk': self.quote.pk})
+        results = []
+        errors = []
+
+        def worker():
+            connection.close()
+            try:
+                client = Client()
+                client.force_login(self.user_coord)
+                session = client.session
+                session['active_org_id'] = str(self.org.id)
+                session.save()
+
+                resp = client.post(url_convert)
+                results.append({
+                    'status_code': resp.status_code,
+                    'location': resp.url if hasattr(resp, 'url') else resp.get('Location', ''),
+                })
+            except Exception as e:
+                errors.append(str(e))
+            finally:
+                connection.close()
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+
+        t1.start()
+        t2.start()
+
+        t1.join()
+        t2.join()
+
+        # 1. Cero excepciones no controladas
+        self.assertEqual(len(errors), 0, f"Errores concurrentes inesperados: {errors}")
+        self.assertEqual(len(results), 2, "Ambos hilos debieron recibir respuesta HTTP")
+
+        # 2. Ambos deben recibir redirección HTTP 302 (a la OT creada o existente)
+        for r in results:
+            self.assertEqual(r['status_code'], 302, f"Respuesta no controlada: {r}")
+
+        # 3. Exactamente una Orden de Trabajo en la base de datos
+        wos = list(WorkOrder.objects.filter(source_quote=self.quote))
+        self.assertEqual(len(wos), 1, f"Se crearon {len(wos)} órdenes de trabajo en lugar de 1")
+        wo = wos[0]
+
+        # 4. Ambos hilos deben haber redirigido a la misma OT
+        expected_url = reverse('operations:workorder_detail', kwargs={'pk': wo.pk})
+        for r in results:
+            self.assertEqual(r['location'], expected_url)
+
+        # 5. Exactamente una partida técnica copiada
+        self.assertEqual(wo.items.count(), 1)
+        self.assertEqual(wo.items.first().code, "TRF-500KVA")
+
+        # 6. Exactamente un registro de bitácora FROM_QUOTE
+        self.assertEqual(wo.timeline_logs.filter(event_type='FROM_QUOTE').count(), 1)

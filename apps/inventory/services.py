@@ -2,7 +2,7 @@ from decimal import Decimal
 from django.core.exceptions import ValidationError
 from django.db import transaction
 
-from apps.operations.models import WorkOrderTimelineLog
+from apps.operations.models import WorkOrder, WorkOrderItem, WorkOrderTimelineLog
 from apps.inventory.models import Warehouse, InventoryItem, StockBalance, StockMovement
 
 
@@ -147,14 +147,84 @@ def transfer_stock_between_warehouses(organization, source_warehouse, target_war
 def dispatch_stock_to_work_order(organization, warehouse, item, work_order, quantity, user, work_order_item=None) -> StockMovement:
     """
     Despacha materiales desde una bodega física o furgoneta móvil directamente a una OT activa.
-    Descuenta de Kardex y actualiza la partida técnica del BOM si coincide el SKU/código.
+    Descuenta de Kardex y actualiza la partida técnica del BOM de forma atómica y consistente.
+
+    Garantías de integridad:
+    - DEF-15: Aislamiento multiempresa estricto para bodega, material, OT y partida BOM.
+    - DEF-16: Vinculación inequívoca con partida técnica del BOM (rechazo de discrepancias y ambigüedades).
+    - DEF-17: Rechazo de despachos a OTs en fase COMPLETED o CANCELLED.
+    - DEF-18: Adquisición ordenada de bloqueos (StockBalance -> WorkOrderItem) con select_for_update.
     """
     qty = Decimal(str(quantity))
 
+    # 0. Validación de cantidad estrictamente positiva
     if qty <= Decimal('0.00'):
         raise ValidationError("La cantidad a despachar debe ser estrictamente mayor a 0.")
 
-    # 1. Bloquear y verificar saldo en bodega
+    # 1. DEF-15: Aislamiento multiempresa estricto previo a cualquier mutación de datos
+    if warehouse.organization_id != organization.id:
+        raise ValidationError(
+            f"Aislamiento multiempresa violado: La bodega '{warehouse.name}' ({warehouse.code}) "
+            f"no pertenece a la organización '{organization.name}'."
+        )
+    if item.organization_id != organization.id:
+        raise ValidationError(
+            f"Aislamiento multiempresa violado: El material '{item.name}' ({item.sku}) "
+            f"no pertenece a la organización '{organization.name}'."
+        )
+    if work_order.organization_id != organization.id:
+        raise ValidationError(
+            f"Aislamiento multiempresa violado: La orden de trabajo '{work_order.number}' "
+            f"no pertenece a la organización '{organization.name}'."
+        )
+    if work_order_item is not None and work_order_item.organization_id != organization.id:
+        raise ValidationError(
+            f"Aislamiento multiempresa violado: La partida del BOM '{work_order_item.description}' "
+            f"no pertenece a la organización '{organization.name}'."
+        )
+
+    # 2. DEF-17: Validación de fase activa de la OT
+    if work_order.phase in [WorkOrder.Phase.COMPLETED, WorkOrder.Phase.CANCELLED]:
+        raise ValidationError(
+            f"No es posible despachar materiales a la Orden de Trabajo {work_order.number} "
+            f"porque se encuentra en fase {work_order.get_phase_display()}."
+        )
+
+    # 3. DEF-16: Resolución estricta e inequívoca de la partida técnica del BOM
+    target_wo_item_id = None
+    if work_order_item is not None:
+        if work_order_item.work_order_id != work_order.id:
+            raise ValidationError(
+                f"La partida técnica '{work_order_item.description}' no pertenece a la "
+                f"Orden de Trabajo {work_order.number}."
+            )
+        if work_order_item.code != item.sku:
+            raise ValidationError(
+                f"Discrepancia de código: La partida técnica '{work_order_item.description}' "
+                f"({work_order_item.code or 'sin código'}) no corresponde al SKU del material a despachar ({item.sku})."
+            )
+        target_wo_item_id = work_order_item.id
+    else:
+        if not item.sku:
+            raise ValidationError(
+                f"El material '{item.name}' no tiene un SKU definido en el catálogo maestro. "
+                f"No es posible vincularlo de forma inequívoca al BOM de la OT."
+            )
+        matching_ids = list(work_order.items.filter(code=item.sku).values_list('id', flat=True))
+        if len(matching_ids) == 0:
+            raise ValidationError(
+                f"No se encontró ninguna partida técnica en la OT {work_order.number} que coincida con el SKU '{item.sku}'. "
+                f"Para despachar este material, ingeniería debe incorporar previamente la partida correspondiente en el BOM de la OT."
+            )
+        elif len(matching_ids) > 1:
+            raise ValidationError(
+                f"Existen múltiples partidas técnicas ({len(matching_ids)}) en la OT {work_order.number} con el código '{item.sku}'. "
+                f"Debe especificarse la partida técnica exacta para evitar imputaciones ambiguas."
+            )
+        target_wo_item_id = matching_ids[0]
+
+    # 4. DEF-18: Adquisición ordenada de bloqueos (StockBalance -> WorkOrderItem)
+    # 4a. Bloquear y verificar saldo en bodega
     balance = StockBalance.objects.select_for_update().filter(
         organization=organization,
         warehouse=warehouse,
@@ -168,23 +238,30 @@ def dispatch_stock_to_work_order(organization, warehouse, item, work_order, quan
             f"Disponible: {current_qty} {item.unit}, Solicitado: {qty} {item.unit}."
         )
 
-    # 2. Descontar existencia física
+    # 4b. Bloquear y revalidar la partida técnica del BOM
+    target_wo_item = WorkOrderItem.objects.select_for_update().filter(
+        id=target_wo_item_id,
+        work_order=work_order,
+        organization=organization,
+    ).first()
+
+    if not target_wo_item:
+        raise ValidationError(
+            f"La partida técnica del BOM seleccionada ya no está disponible en la OT {work_order.number}."
+        )
+
+    # 5. Descontar existencia física
     balance.quantity -= qty
     balance.save(update_fields=['quantity', 'updated_at'])
 
-    # 3. Vincular con partida técnica de la OT (BOM)
-    target_wo_item = work_order_item
-    if not target_wo_item:
-        target_wo_item = work_order.items.filter(code=item.sku).first()
+    # 6. Actualizar partida técnica del BOM
+    target_wo_item.executed_quantity += qty
+    if target_wo_item.executed_quantity >= target_wo_item.planned_quantity:
+        target_wo_item.is_completed = True
+    target_wo_item.completed_by = user
+    target_wo_item.save(update_fields=['executed_quantity', 'is_completed', 'completed_by', 'updated_at'])
 
-    if target_wo_item:
-        target_wo_item.executed_quantity += qty
-        if target_wo_item.executed_quantity >= target_wo_item.planned_quantity:
-            target_wo_item.is_completed = True
-        target_wo_item.completed_by = user
-        target_wo_item.save(update_fields=['executed_quantity', 'is_completed', 'completed_by', 'updated_at'])
-
-    # 4. Registrar en el libro mayor de Kardex inmutable
+    # 7. Registrar en el libro mayor de Kardex inmutable
     movement = StockMovement.objects.create(
         organization=organization,
         movement_type=StockMovement.MovementType.OUT_WORKORDER,
@@ -199,7 +276,7 @@ def dispatch_stock_to_work_order(organization, warehouse, item, work_order, quan
         performed_by=user,
     )
 
-    # 5. Registrar evento obligatorio en la bitácora inmutable de la OT
+    # 8. Registrar evento obligatorio en la bitácora inmutable de la OT
     WorkOrderTimelineLog.objects.create(
         organization=organization,
         work_order=work_order,
@@ -208,6 +285,7 @@ def dispatch_stock_to_work_order(organization, warehouse, item, work_order, quan
         details=(
             f"Folio de Kardex {movement.number}. "
             f"Material: {item.name}. "
+            f"Partida BOM: {target_wo_item.description} ({target_wo_item.executed_quantity}/{target_wo_item.planned_quantity} {target_wo_item.unit}). "
             f"Despachado por {user.full_name or user.email}."
         ),
         actor=user,

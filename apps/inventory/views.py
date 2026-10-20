@@ -245,6 +245,11 @@ class StockDispatchToOTView(ModuleAccessRequiredMixin, View):
             quantity = form.cleaned_data['quantity']
 
             work_order_item = form.cleaned_data.get('work_order_item')
+            idempotency_key = (
+                form.cleaned_data.get('idempotency_key')
+                or request.POST.get('idempotency_key')
+                or request.headers.get('Idempotency-Key')
+            )
 
             try:
                 mov = dispatch_stock_to_work_order(
@@ -255,6 +260,7 @@ class StockDispatchToOTView(ModuleAccessRequiredMixin, View):
                     quantity=quantity,
                     user=request.user,
                     work_order_item=work_order_item,
+                    idempotency_key=idempotency_key,
                 )
                 messages.success(
                     request,

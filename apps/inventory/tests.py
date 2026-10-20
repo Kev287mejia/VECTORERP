@@ -19,6 +19,7 @@ from apps.inventory.models import (
     InventoryItem,
     StockBalance,
     StockMovement,
+    StockDispatchIdempotencyRecord,
 )
 from apps.inventory.services import (
     record_stock_entry,
@@ -1116,7 +1117,544 @@ class StockDispatchIntegrityTestSuite(TestCase):
         self.assertIn(self.bom_cable_a.description, log.details)
 
 
+class StockDispatchIdempotencyTestSuite(TestCase):
+    """
+    Suite de Pruebas de Idempotencia Transaccional para Despacho de Materiales a OTs (DEF-05).
+    Verifica:
+    1. Primer despacho válido: saldo, BOM, Kardex y registro de idempotencia coherentes.
+    2. Repetición idéntica completada: mismo movimiento, saldo sin cambios adicionales y sin nuevo Kardex.
+    3. Misma clave con payload diferente: rechazo con ValidationError y ninguna mutación.
+    4. Claves diferentes: permiten dos despachos distintos cuando las reglas de negocio lo autorizan.
+    5. Fallo intermedio: rollback coherente y reintento válido con la misma clave.
+    6. Aislamiento multiempresa: claves idénticas no colisionan entre distintas organizaciones.
+    7. Reintento tras simular una respuesta perdida: retorna movimiento original de forma segura.
+    8. Compatibilidad con llamadores existentes cuando idempotency_key es None.
+    9. Integración en flujo Web / Formulario con detección de clave y prevención de duplicados.
+    10. Regresión de validaciones previas (BOM, Fases de OT, cantidades inválidas).
+    """
+
+    def setUp(self):
+        # 1. Configuración de País
+        self.country_ni, _ = CountryConfig.objects.get_or_create(
+            code='NI',
+            defaults={
+                'name': 'Nicaragua',
+                'flag_emoji': '🇳🇮',
+                'primary_currency_code': 'NIO',
+                'primary_currency_symbol': 'C$',
+                'default_tax_rate': Decimal('15.00'),
+                'is_active': True,
+            }
+        )
+
+        # 2. Organización Alpha (Org A)
+        self.org_a = Organization.objects.create(
+            name="Alpha Solar Corp S.A.",
+            legal_name="Alpha Solar Corp Nicaragua S.A.",
+            slug=f"alpha-solar-{uuid.uuid4().hex[:6]}",
+            country=self.country_ni,
+            enabled_modules=['inventory', 'operations', 'crm'],
+            is_active=True,
+        )
+
+        # 3. Organización Beta (Org B)
+        self.org_b = Organization.objects.create(
+            name="Beta Energetica S.A.",
+            legal_name="Beta Energetica Nicaragua S.A.",
+            slug=f"beta-energ-{uuid.uuid4().hex[:6]}",
+            country=self.country_ni,
+            enabled_modules=['inventory', 'operations', 'crm'],
+            is_active=True,
+        )
+
+        # 4. Usuarios Ingenieros
+        self.user_eng_a = User.objects.create_user(
+            email=f'eng_a_{uuid.uuid4().hex[:6]}@alphasolar.com.ni',
+            full_name='Ing. Fernando Alpha',
+            password='password123',
+        )
+        OrganizationMembership.objects.create(
+            user=self.user_eng_a,
+            organization=self.org_a,
+            role_level=RoleLevel.ENGINEER,
+            is_active=True,
+            is_default_org=True,
+        )
+
+        self.user_eng_b = User.objects.create_user(
+            email=f'eng_b_{uuid.uuid4().hex[:6]}@betaenerg.com.ni',
+            full_name='Ing. Maria Beta',
+            password='password123',
+        )
+        OrganizationMembership.objects.create(
+            user=self.user_eng_b,
+            organization=self.org_b,
+            role_level=RoleLevel.ENGINEER,
+            is_active=True,
+            is_default_org=True,
+        )
+
+        # 5. Bodegas y Materiales para Org A
+        self.wh_a = Warehouse.objects.create(
+            organization=self.org_a,
+            code="BOD-ALP-01",
+            name="Bodega Central Alpha",
+            warehouse_type=Warehouse.WarehouseType.CENTRAL,
+        )
+        self.item_a = InventoryItem.objects.create(
+            organization=self.org_a,
+            sku="INV-SOLAR-5K",
+            name="Inversor Híbrido 5kW",
+            unit="UND",
+            unit_cost=Decimal('1200.00'),
+        )
+        record_stock_entry(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            quantity=Decimal('50.00'),
+            unit_cost=Decimal('1200.00'),
+            reference_note="Stock Inicial Alpha",
+            user=self.user_eng_a,
+        )
+
+        self.account_a = Account.objects.create(
+            organization=self.org_a,
+            commercial_name="Cliente Solar Alpha",
+        )
+        self.wo_a = WorkOrder.objects.create(
+            organization=self.org_a,
+            number=f"OT-ALP-{uuid.uuid4().hex[:4]}",
+            title="Instalación Planta Solar Alpha",
+            account=self.account_a,
+            phase=WorkOrder.Phase.IN_PROGRESS,
+            assigned_engineer=self.user_eng_a,
+        )
+        self.bom_item_a = WorkOrderItem.objects.create(
+            organization=self.org_a,
+            work_order=self.wo_a,
+            item_type=WorkOrderItem.ItemType.MATERIAL,
+            code="INV-SOLAR-5K",
+            description="Inversor Híbrido 5kW",
+            unit="UND",
+            planned_quantity=Decimal('10.00'),
+            executed_quantity=Decimal('0.00'),
+        )
+
+        # 6. Bodegas y Materiales para Org B
+        self.wh_b = Warehouse.objects.create(
+            organization=self.org_b,
+            code="BOD-BET-01",
+            name="Bodega Central Beta",
+            warehouse_type=Warehouse.WarehouseType.CENTRAL,
+        )
+        self.item_b = InventoryItem.objects.create(
+            organization=self.org_b,
+            sku="INV-SOLAR-5K",
+            name="Inversor Híbrido 5kW",
+            unit="UND",
+            unit_cost=Decimal('1200.00'),
+        )
+        record_stock_entry(
+            organization=self.org_b,
+            warehouse=self.wh_b,
+            item=self.item_b,
+            quantity=Decimal('50.00'),
+            unit_cost=Decimal('1200.00'),
+            reference_note="Stock Inicial Beta",
+            user=self.user_eng_b,
+        )
+        self.account_b = Account.objects.create(
+            organization=self.org_b,
+            commercial_name="Cliente Eólico Beta",
+        )
+        self.wo_b = WorkOrder.objects.create(
+            organization=self.org_b,
+            number=f"OT-BET-{uuid.uuid4().hex[:4]}",
+            title="Instalación Parque Eólico Beta",
+            account=self.account_b,
+            phase=WorkOrder.Phase.IN_PROGRESS,
+            assigned_engineer=self.user_eng_b,
+        )
+        self.bom_item_b = WorkOrderItem.objects.create(
+            organization=self.org_b,
+            work_order=self.wo_b,
+            item_type=WorkOrderItem.ItemType.MATERIAL,
+            code="INV-SOLAR-5K",
+            description="Inversor Híbrido 5kW",
+            unit="UND",
+            planned_quantity=Decimal('10.00'),
+            executed_quantity=Decimal('0.00'),
+        )
+
+    def test_first_dispatch_creates_movement_and_idempotency_record(self):
+        """Primer despacho válido crea StockMovement y StockDispatchIdempotencyRecord atómicamente."""
+        idem_key = "IDEM-FIRST-001"
+        mov = dispatch_stock_to_work_order(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            work_order=self.wo_a,
+            quantity=Decimal('5.00'),
+            user=self.user_eng_a,
+            idempotency_key=idem_key,
+        )
+        self.assertIsNotNone(mov.pk)
+        self.assertTrue(mov.number.startswith('KDX-'))
+
+        # Verificación de saldo
+        bal = StockBalance.objects.get(organization=self.org_a, warehouse=self.wh_a, item=self.item_a)
+        self.assertEqual(bal.quantity, Decimal('45.00'))
+
+        # Verificación de BOM
+        self.bom_item_a.refresh_from_db()
+        self.assertEqual(self.bom_item_a.executed_quantity, Decimal('5.00'))
+
+        # Verificación de registro de idempotencia
+        record = StockDispatchIdempotencyRecord.objects.get(
+            organization=self.org_a,
+            idempotency_key=idem_key,
+        )
+        self.assertEqual(record.status, StockDispatchIdempotencyRecord.ProcessingStatus.SUCCESS)
+        self.assertEqual(record.stock_movement, mov)
+        self.assertEqual(record.work_order, self.wo_a)
+        self.assertEqual(len(record.request_hash), 64)
+        self.assertEqual(record.response_payload.get('movement_id'), str(mov.pk))
+        self.assertEqual(record.response_payload.get('movement_number'), mov.number)
+
+    def test_identical_replay_returns_original_movement_without_side_effects(self):
+        """Reintento idéntico devuelve el mismo movimiento sin duplicar Kardex ni descontar saldo adicional."""
+        idem_key = "IDEM-REPLAY-001"
+        mov1 = dispatch_stock_to_work_order(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            work_order=self.wo_a,
+            quantity=Decimal('5.00'),
+            user=self.user_eng_a,
+            idempotency_key=idem_key,
+        )
+
+        # Segundo llamado idéntico
+        mov2 = dispatch_stock_to_work_order(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            work_order=self.wo_a,
+            quantity=Decimal('5.00'),
+            user=self.user_eng_a,
+            idempotency_key=idem_key,
+        )
+
+        self.assertEqual(mov1.pk, mov2.pk)
+        self.assertEqual(mov1.number, mov2.number)
+
+        # Saldo descontado una sola vez
+        bal = StockBalance.objects.get(organization=self.org_a, warehouse=self.wh_a, item=self.item_a)
+        self.assertEqual(bal.quantity, Decimal('45.00'))
+
+        # BOM incrementado una sola vez
+        self.bom_item_a.refresh_from_db()
+        self.assertEqual(self.bom_item_a.executed_quantity, Decimal('5.00'))
+
+        # Exactamente un movimiento de Kardex
+        self.assertEqual(StockMovement.objects.filter(work_order=self.wo_a).count(), 1)
+        # Exactamente un registro de idempotencia
+        self.assertEqual(StockDispatchIdempotencyRecord.objects.filter(organization=self.org_a, idempotency_key=idem_key).count(), 1)
+
+    def test_same_key_with_different_payload_raises_validation_error_without_mutation(self):
+        """Reutilizar una clave con payload diferente es rechazado con ValidationError sin mutar datos."""
+        idem_key = "IDEM-DIFF-001"
+        dispatch_stock_to_work_order(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            work_order=self.wo_a,
+            quantity=Decimal('5.00'),
+            user=self.user_eng_a,
+            idempotency_key=idem_key,
+        )
+
+        # Intentar reutilizar la misma clave con cantidad diferente (10.00)
+        with self.assertRaises(ValidationError) as ctx:
+            dispatch_stock_to_work_order(
+                organization=self.org_a,
+                warehouse=self.wh_a,
+                item=self.item_a,
+                work_order=self.wo_a,
+                quantity=Decimal('10.00'),
+                user=self.user_eng_a,
+                idempotency_key=idem_key,
+            )
+        self.assertIn("ya fue utilizada con parámetros de solicitud diferentes", str(ctx.exception))
+
+        # Comprobar que no hubo mutación adicional
+        bal = StockBalance.objects.get(organization=self.org_a, warehouse=self.wh_a, item=self.item_a)
+        self.assertEqual(bal.quantity, Decimal('45.00'))
+        self.bom_item_a.refresh_from_db()
+        self.assertEqual(self.bom_item_a.executed_quantity, Decimal('5.00'))
+        self.assertEqual(StockMovement.objects.filter(work_order=self.wo_a).count(), 1)
+
+    def test_different_keys_allow_distinct_dispatches(self):
+        """Claves distintas permiten despachos independientes legítimos."""
+        mov1 = dispatch_stock_to_work_order(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            work_order=self.wo_a,
+            quantity=Decimal('3.00'),
+            user=self.user_eng_a,
+            idempotency_key="KEY-A-1",
+        )
+        mov2 = dispatch_stock_to_work_order(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            work_order=self.wo_a,
+            quantity=Decimal('2.00'),
+            user=self.user_eng_a,
+            idempotency_key="KEY-B-2",
+        )
+
+        self.assertNotEqual(mov1.pk, mov2.pk)
+        bal = StockBalance.objects.get(organization=self.org_a, warehouse=self.wh_a, item=self.item_a)
+        self.assertEqual(bal.quantity, Decimal('45.00'))
+        self.bom_item_a.refresh_from_db()
+        self.assertEqual(self.bom_item_a.executed_quantity, Decimal('5.00'))
+        self.assertEqual(StockMovement.objects.filter(work_order=self.wo_a).count(), 2)
+        self.assertEqual(StockDispatchIdempotencyRecord.objects.filter(organization=self.org_a).count(), 2)
+
+    def test_intermediate_failure_rolls_back_and_allows_subsequent_retry(self):
+        """Fallo por saldo insuficiente no deja registro de idempotencia y permite reintentar tras reabastecer."""
+        idem_key = "KEY-FAIL-AND-RETRY"
+
+        # Intento con saldo insuficiente (disponible 50.00, solicitado 100.00)
+        with self.assertRaises(ValidationError) as ctx:
+            dispatch_stock_to_work_order(
+                organization=self.org_a,
+                warehouse=self.wh_a,
+                item=self.item_a,
+                work_order=self.wo_a,
+                quantity=Decimal('100.00'),
+                user=self.user_eng_a,
+                idempotency_key=idem_key,
+            )
+        self.assertIn("Existencia insuficiente", str(ctx.exception))
+
+        # El registro de idempotencia no debió persistirse
+        self.assertFalse(
+            StockDispatchIdempotencyRecord.objects.filter(
+                organization=self.org_a, idempotency_key=idem_key
+            ).exists()
+        )
+
+        # Reabastecer bodega con 100.00 unidades adicionales
+        record_stock_entry(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            quantity=Decimal('100.00'),
+            unit_cost=Decimal('1200.00'),
+            reference_note="Reabastecimiento",
+            user=self.user_eng_a,
+        )
+
+        # Ajustar planned_quantity para que admita 100.00
+        self.bom_item_a.planned_quantity = Decimal('100.00')
+        self.bom_item_a.save()
+
+        # Reintentar con la MISMA clave de idempotencia
+        mov = dispatch_stock_to_work_order(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            work_order=self.wo_a,
+            quantity=Decimal('100.00'),
+            user=self.user_eng_a,
+            idempotency_key=idem_key,
+        )
+        self.assertIsNotNone(mov.pk)
+        bal = StockBalance.objects.get(organization=self.org_a, warehouse=self.wh_a, item=self.item_a)
+        self.assertEqual(bal.quantity, Decimal('50.00'))  # 150 - 100 = 50
+        self.assertTrue(
+            StockDispatchIdempotencyRecord.objects.filter(
+                organization=self.org_a, idempotency_key=idem_key
+            ).exists()
+        )
+
+    def test_multi_tenant_isolation_allows_same_key_in_different_organizations(self):
+        """Dos organizaciones distintas pueden usar la misma clave de idempotencia sin conflicto ni interferencia."""
+        shared_key = "SHARED-TENANT-KEY-001"
+
+        mov_a = dispatch_stock_to_work_order(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            work_order=self.wo_a,
+            quantity=Decimal('5.00'),
+            user=self.user_eng_a,
+            idempotency_key=shared_key,
+        )
+        mov_b = dispatch_stock_to_work_order(
+            organization=self.org_b,
+            warehouse=self.wh_b,
+            item=self.item_b,
+            work_order=self.wo_b,
+            quantity=Decimal('5.00'),
+            user=self.user_eng_b,
+            idempotency_key=shared_key,
+        )
+
+        self.assertNotEqual(mov_a.pk, mov_b.pk)
+        rec_a = StockDispatchIdempotencyRecord.objects.get(organization=self.org_a, idempotency_key=shared_key)
+        rec_b = StockDispatchIdempotencyRecord.objects.get(organization=self.org_b, idempotency_key=shared_key)
+        self.assertEqual(rec_a.work_order, self.wo_a)
+        self.assertEqual(rec_b.work_order, self.wo_b)
+
+    def test_retry_after_lost_response_simulation(self):
+        """Simula la pérdida de respuesta de red: el cliente reintenta y obtiene el movimiento original."""
+        idem_key = "LOST-NETWORK-RESPONSE-KEY"
+        mov = dispatch_stock_to_work_order(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            work_order=self.wo_a,
+            quantity=Decimal('4.00'),
+            user=self.user_eng_a,
+            idempotency_key=idem_key,
+        )
+
+        # Simular reintento de red idéntico
+        retried_mov = dispatch_stock_to_work_order(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            work_order=self.wo_a,
+            quantity=Decimal('4.00'),
+            user=self.user_eng_a,
+            idempotency_key=idem_key,
+        )
+
+        self.assertEqual(mov.pk, retried_mov.pk)
+        bal = StockBalance.objects.get(organization=self.org_a, warehouse=self.wh_a, item=self.item_a)
+        self.assertEqual(bal.quantity, Decimal('46.00'))
+
+    def test_backward_compatibility_when_idempotency_key_is_none(self):
+        """Llamadas sin clave de idempotencia operan con total compatibilidad hacia atrás."""
+        mov = dispatch_stock_to_work_order(
+            organization=self.org_a,
+            warehouse=self.wh_a,
+            item=self.item_a,
+            work_order=self.wo_a,
+            quantity=Decimal('2.00'),
+            user=self.user_eng_a,
+            idempotency_key=None,
+        )
+        self.assertIsNotNone(mov.pk)
+        bal = StockBalance.objects.get(organization=self.org_a, warehouse=self.wh_a, item=self.item_a)
+        self.assertEqual(bal.quantity, Decimal('48.00'))
+        self.assertEqual(StockDispatchIdempotencyRecord.objects.filter(organization=self.org_a).count(), 0)
+
+    def test_web_view_stock_dispatch_idempotency_replay(self):
+        """La vista web StockDispatchToOTView maneja reintentos con la misma clave sin duplicar despachos."""
+        client = Client()
+        client.force_login(self.user_eng_a)
+        session = client.session
+        session['active_org_id'] = str(self.org_a.id)
+        session.save()
+
+        url = reverse('inventory:movement_dispatch_ot')
+        idem_key = "WEB-DISPATCH-KEY-001"
+        post_data = {
+            'warehouse': str(self.wh_a.id),
+            'work_order': str(self.wo_a.id),
+            'item': str(self.item_a.id),
+            'quantity': '5.00',
+            'idempotency_key': idem_key,
+        }
+
+        # Primer POST
+        res1 = client.post(url, post_data)
+        self.assertEqual(res1.status_code, 302)
+        self.assertEqual(StockMovement.objects.filter(work_order=self.wo_a).count(), 1)
+
+        # Segundo POST idéntico (simulando doble clic o reenvío F5)
+        res2 = client.post(url, post_data)
+        self.assertEqual(res2.status_code, 302)
+        self.assertEqual(StockMovement.objects.filter(work_order=self.wo_a).count(), 1)
+
+        bal = StockBalance.objects.get(organization=self.org_a, warehouse=self.wh_a, item=self.item_a)
+        self.assertEqual(bal.quantity, Decimal('45.00'))
+
+    def test_web_view_stock_dispatch_different_payload_rejection(self):
+        """La vista web StockDispatchToOTView rechaza reenvíos con la misma clave y payload alterado."""
+        client = Client()
+        client.force_login(self.user_eng_a)
+        session = client.session
+        session['active_org_id'] = str(self.org_a.id)
+        session.save()
+
+        url = reverse('inventory:movement_dispatch_ot')
+        idem_key = "WEB-DISPATCH-KEY-002"
+        post_data_1 = {
+            'warehouse': str(self.wh_a.id),
+            'work_order': str(self.wo_a.id),
+            'item': str(self.item_a.id),
+            'quantity': '5.00',
+            'idempotency_key': idem_key,
+        }
+        res1 = client.post(url, post_data_1)
+        self.assertEqual(res1.status_code, 302)
+
+        post_data_2 = {
+            'warehouse': str(self.wh_a.id),
+            'work_order': str(self.wo_a.id),
+            'item': str(self.item_a.id),
+            'quantity': '8.00',  # Cantidad diferente
+            'idempotency_key': idem_key,
+        }
+        res2 = client.post(url, post_data_2)
+        self.assertEqual(res2.status_code, 302)
+
+        # Verificar que no se creó un segundo movimiento
+        self.assertEqual(StockMovement.objects.filter(work_order=self.wo_a).count(), 1)
+        bal = StockBalance.objects.get(organization=self.org_a, warehouse=self.wh_a, item=self.item_a)
+        self.assertEqual(bal.quantity, Decimal('45.00'))
+
+    def test_existing_validations_regression_with_idempotency(self):
+        """Regresión: validaciones previas continúan bloqueando y no dejan registros huérfanos."""
+        # 1. Cantidad inválida (0 o negativa)
+        with self.assertRaises(ValidationError):
+            dispatch_stock_to_work_order(
+                organization=self.org_a,
+                warehouse=self.wh_a,
+                item=self.item_a,
+                work_order=self.wo_a,
+                quantity=Decimal('0.00'),
+                user=self.user_eng_a,
+                idempotency_key="KEY-REG-0",
+            )
+        self.assertFalse(StockDispatchIdempotencyRecord.objects.filter(idempotency_key="KEY-REG-0").exists())
+
+        # 2. OT completada
+        self.wo_a.phase = WorkOrder.Phase.COMPLETED
+        self.wo_a.save()
+        with self.assertRaises(ValidationError) as ctx:
+            dispatch_stock_to_work_order(
+                organization=self.org_a,
+                warehouse=self.wh_a,
+                item=self.item_a,
+                work_order=self.wo_a,
+                quantity=Decimal('5.00'),
+                user=self.user_eng_a,
+                idempotency_key="KEY-REG-COMPLETED",
+            )
+        self.assertIn("se encuentra en fase", str(ctx.exception))
+        self.assertFalse(StockDispatchIdempotencyRecord.objects.filter(idempotency_key="KEY-REG-COMPLETED").exists())
+
+
 class StockDispatchConcurrencyTestSuite(TransactionTestCase):
+
     """
     Prueba de Concurrencia Multi-hilo (DEF-18) para despachos sobre la misma partida técnica.
     Requiere PostgreSQL real para verificar la serialización de bloqueos vía select_for_update.
@@ -1253,6 +1791,73 @@ class StockDispatchConcurrencyTestSuite(TransactionTestCase):
             organization=self.org, movement_type=StockMovement.MovementType.OUT_WORKORDER
         )
         self.assertEqual(movements.count(), 2)
+
+    def test_concurrent_dispatch_with_same_idempotency_key_produces_single_dispatch(self):
+        """
+        DEF-05: Dos hilos concurrentes intentando despachar con la misma clave de idempotencia
+        y el mismo payload:
+        - Bloqueos y restricciones de unicidad garantizan exactamente un único despacho efectivo.
+        - El saldo final disminuye exactamente en 5.00 (50.00 - 5.00 = 45.00 restantes, NO 40.00).
+        - executed_quantity final del BOM es exactamente 5.00 (NO 10.00).
+        - Se genera exactamente 1 movimiento de Kardex OUT_WORKORDER (NO 2).
+        - Se genera exactamente 1 registro StockDispatchIdempotencyRecord.
+        - Ambos hilos obtienen el mismo movimiento de inventario (mismo PK).
+        """
+        if connection.vendor != 'postgresql':
+            self.skipTest("Esta prueba de concurrencia multi-hilo requiere PostgreSQL.")
+
+        results = []
+        errors = []
+        idem_key = f"CONC-IDEM-{uuid.uuid4().hex[:8]}"
+
+        def worker():
+            try:
+                mov = dispatch_stock_to_work_order(
+                    organization=self.org,
+                    warehouse=self.wh,
+                    item=self.item,
+                    work_order=self.wo,
+                    quantity=Decimal('5.00'),
+                    user=self.user,
+                    idempotency_key=idem_key,
+                )
+                results.append(mov.pk)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                connections.close_all()
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+
+        t1.start()
+        t2.start()
+
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        self.assertFalse(t1.is_alive(), "El hilo 1 no finalizó dentro del tiempo límite.")
+        self.assertFalse(t2.is_alive(), "El hilo 2 no finalizó dentro del tiempo límite.")
+
+        self.assertEqual(errors, [], f"Errores en hilos concurrentes de idempotencia: {errors}")
+        self.assertEqual(len(results), 2, "Ambos hilos deben recibir una respuesta exitosa.")
+        self.assertEqual(results[0], results[1], "Ambos hilos deben recibir exactamente el mismo movimiento (mismo PK).")
+
+        bal = StockBalance.objects.get(organization=self.org, warehouse=self.wh, item=self.item)
+        self.assertEqual(bal.quantity, Decimal('45.00'), "El saldo solo debió descontarse una vez (45.00).")
+
+        self.bom_item.refresh_from_db()
+        self.assertEqual(self.bom_item.executed_quantity, Decimal('5.00'), "La partida del BOM solo debió incrementarse una vez (5.00).")
+
+        movements = StockMovement.objects.filter(
+            organization=self.org, movement_type=StockMovement.MovementType.OUT_WORKORDER, work_order=self.wo
+        )
+        self.assertEqual(movements.count(), 1, "Debe existir exactamente 1 movimiento de Kardex para este despacho.")
+
+        records = StockDispatchIdempotencyRecord.objects.filter(
+            organization=self.org, idempotency_key=idem_key
+        )
+        self.assertEqual(records.count(), 1, "Debe existir exactamente 1 registro de idempotencia.")
 
     def tearDown(self):
         connections.close_all()

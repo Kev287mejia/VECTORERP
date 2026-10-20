@@ -1,9 +1,17 @@
 from decimal import Decimal
+import hashlib
+import json
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import IntegrityError, transaction
 
 from apps.operations.models import WorkOrder, WorkOrderItem, WorkOrderTimelineLog
-from apps.inventory.models import Warehouse, InventoryItem, StockBalance, StockMovement
+from apps.inventory.models import (
+    Warehouse,
+    InventoryItem,
+    StockBalance,
+    StockMovement,
+    StockDispatchIdempotencyRecord,
+)
 
 
 @transaction.atomic
@@ -143,13 +151,23 @@ def transfer_stock_between_warehouses(organization, source_warehouse, target_war
     return mov_out, mov_in
 
 
-@transaction.atomic
-def dispatch_stock_to_work_order(organization, warehouse, item, work_order, quantity, user, work_order_item=None) -> StockMovement:
+def dispatch_stock_to_work_order(
+    organization,
+    warehouse,
+    item,
+    work_order,
+    quantity,
+    user,
+    work_order_item=None,
+    idempotency_key=None,
+) -> StockMovement:
     """
     Despacha materiales desde una bodega física o furgoneta móvil directamente a una OT activa.
     Descuenta de Kardex y actualiza la partida técnica del BOM de forma atómica y consistente.
 
     Garantías de integridad:
+    - DEF-05: Idempotencia transaccional estricta (StockDispatchIdempotencyRecord) contra dobles clics,
+              reintentos de red o reconexiones. Replay seguro idéntico y rechazo de payload alterado.
     - DEF-15: Aislamiento multiempresa estricto para bodega, material, OT y partida BOM.
     - DEF-16: Vinculación inequívoca con partida técnica del BOM (rechazo de discrepancias y ambigüedades).
     - DEF-17: Rechazo de despachos a OTs en fase COMPLETED o CANCELLED.
@@ -161,6 +179,72 @@ def dispatch_stock_to_work_order(organization, warehouse, item, work_order, quan
     if qty <= Decimal('0.00'):
         raise ValidationError("La cantidad a despachar debe ser estrictamente mayor a 0.")
 
+    clean_idempotency_key = (idempotency_key or '').strip() or None
+    req_hash = None
+
+    if clean_idempotency_key:
+        payload_data = {
+            'organization_id': str(organization.id),
+            'warehouse_id': str(warehouse.id),
+            'item_id': str(item.id),
+            'work_order_id': str(work_order.id),
+            'quantity': f"{qty:.2f}",
+            'work_order_item_id': str(work_order_item.id if work_order_item else ''),
+        }
+        req_hash = hashlib.sha256(json.dumps(payload_data, sort_keys=True).encode('utf-8')).hexdigest()
+
+        # 1. Chequeo preliminar de idempotencia (Fast path fuera de transacción)
+        existing_rec = StockDispatchIdempotencyRecord.objects.filter(
+            organization=organization,
+            idempotency_key=clean_idempotency_key,
+        ).select_related('stock_movement').first()
+
+        if existing_rec:
+            if existing_rec.request_hash == req_hash:
+                return existing_rec.stock_movement
+            else:
+                raise ValidationError("La clave de idempotencia especificada ya fue utilizada con parámetros de solicitud diferentes.")
+
+    # 2. Ejecución transaccional atómica protegida contra colisiones de concurrencia
+    try:
+        with transaction.atomic():
+            return _execute_dispatch_to_work_order_inner(
+                organization=organization,
+                warehouse=warehouse,
+                item=item,
+                work_order=work_order,
+                qty=qty,
+                user=user,
+                work_order_item=work_order_item,
+                clean_idempotency_key=clean_idempotency_key,
+                req_hash=req_hash,
+            )
+    except IntegrityError:
+        # Colisión concurrente en la clave única de idempotencia
+        if clean_idempotency_key:
+            existing_rec = StockDispatchIdempotencyRecord.objects.filter(
+                organization=organization,
+                idempotency_key=clean_idempotency_key,
+            ).select_related('stock_movement').first()
+            if existing_rec:
+                if existing_rec.request_hash == req_hash:
+                    return existing_rec.stock_movement
+                else:
+                    raise ValidationError("La clave de idempotencia especificada ya fue utilizada con parámetros de solicitud diferentes.")
+        raise
+
+
+def _execute_dispatch_to_work_order_inner(
+    organization,
+    warehouse,
+    item,
+    work_order,
+    qty,
+    user,
+    work_order_item,
+    clean_idempotency_key,
+    req_hash,
+) -> StockMovement:
     # 1. DEF-15: Aislamiento multiempresa estricto previo a cualquier mutación de datos
     if warehouse.organization_id != organization.id:
         raise ValidationError(
@@ -231,6 +315,18 @@ def dispatch_stock_to_work_order(organization, warehouse, item, work_order, quan
         item=item,
     ).first()
 
+    # Re-chequeo de idempotencia post-bloqueo para solicitudes serializadas por select_for_update
+    if clean_idempotency_key:
+        existing_rec = StockDispatchIdempotencyRecord.objects.filter(
+            organization=organization,
+            idempotency_key=clean_idempotency_key,
+        ).select_related('stock_movement').first()
+        if existing_rec:
+            if existing_rec.request_hash == req_hash:
+                return existing_rec.stock_movement
+            else:
+                raise ValidationError("La clave de idempotencia especificada ya fue utilizada con parámetros de solicitud diferentes.")
+
     current_qty = balance.quantity if balance else Decimal('0.00')
     if current_qty < qty:
         raise ValidationError(
@@ -291,4 +387,28 @@ def dispatch_stock_to_work_order(organization, warehouse, item, work_order, quan
         actor=user,
     )
 
+    # 9. DEF-05: Asentar Registro de Idempotencia de Solicitud en la misma transacción atómica
+    if clean_idempotency_key and req_hash:
+        StockDispatchIdempotencyRecord.objects.create(
+            organization=organization,
+            idempotency_key=clean_idempotency_key,
+            work_order=work_order,
+            stock_movement=movement,
+            request_hash=req_hash,
+            status=StockDispatchIdempotencyRecord.ProcessingStatus.SUCCESS,
+            response_payload={
+                'movement_id': str(movement.pk),
+                'movement_number': movement.number,
+                'quantity': str(movement.quantity),
+                'warehouse_id': str(warehouse.id),
+                'warehouse_code': warehouse.code,
+                'item_id': str(item.id),
+                'item_sku': item.sku,
+                'work_order_id': str(work_order.id),
+                'work_order_number': work_order.number,
+                'work_order_item_id': str(target_wo_item.id),
+            },
+        )
+
     return movement
+

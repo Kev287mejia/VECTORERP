@@ -244,6 +244,8 @@ class StockDispatchToOTView(ModuleAccessRequiredMixin, View):
             item = form.cleaned_data['item']
             quantity = form.cleaned_data['quantity']
 
+            work_order_item = form.cleaned_data.get('work_order_item')
+
             try:
                 mov = dispatch_stock_to_work_order(
                     organization=org,
@@ -252,6 +254,7 @@ class StockDispatchToOTView(ModuleAccessRequiredMixin, View):
                     work_order=work_order,
                     quantity=quantity,
                     user=request.user,
+                    work_order_item=work_order_item,
                 )
                 messages.success(
                     request,
@@ -259,7 +262,8 @@ class StockDispatchToOTView(ModuleAccessRequiredMixin, View):
                     f"{quantity} {item.unit} de {item.name} despachados a {work_order.number} desde {warehouse.name}."
                 )
             except ValidationError as e:
-                messages.error(request, f"Error en despacho a OT: {e.message if hasattr(e, 'message') else str(e)}")
+                err_text = e.message if hasattr(e, 'message') else (', '.join(e.messages) if hasattr(e, 'messages') else str(e))
+                messages.error(request, f"Error en despacho a OT: {err_text}")
         else:
             messages.error(request, "Error en datos del despacho. Verifique la bodega, OT y cantidad.")
 

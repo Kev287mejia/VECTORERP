@@ -1,7 +1,7 @@
 from decimal import Decimal
 from django import forms
 
-from apps.operations.models import Crew, WorkOrder
+from apps.operations.models import Crew, WorkOrder, WorkOrderItem
 from apps.inventory.models import Warehouse, InventoryItem
 
 INPUT_BASE_CLS = (
@@ -193,6 +193,12 @@ class StockDispatchForm(forms.Form):
         widget=forms.NumberInput(attrs={'class': INPUT_MONO_CLS, 'step': '0.01', 'min': '0.01'}),
         label="Cantidad Despachada"
     )
+    work_order_item = forms.ModelChoiceField(
+        queryset=WorkOrderItem.objects.none(),
+        required=False,
+        widget=forms.Select(attrs={'class': SELECT_BASE_CLS}),
+        label="Partida Técnica Específica (Opcional)"
+    )
 
     def __init__(self, *args, organization=None, initial_work_order=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -202,10 +208,12 @@ class StockDispatchForm(forms.Form):
                 phase__in=[WorkOrder.Phase.COMPLETED, WorkOrder.Phase.CANCELLED]
             )
             self.fields['item'].queryset = InventoryItem.objects.for_org(organization).filter(is_active=True)
+            self.fields['work_order_item'].queryset = WorkOrderItem.objects.for_org(organization)
 
         self.fields['warehouse'].empty_label = "— Seleccione Bodega de Salida —"
         self.fields['work_order'].empty_label = "— Seleccione Orden de Trabajo —"
         self.fields['item'].empty_label = "— Seleccione Material —"
+        self.fields['work_order_item'].empty_label = "— Auto-vincular por SKU/Código —"
 
         if initial_work_order:
             self.fields['work_order'].initial = initial_work_order

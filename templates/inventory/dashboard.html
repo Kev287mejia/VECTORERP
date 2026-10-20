@@ -600,8 +600,9 @@
                 </button>
             </div>
 
-            <form method="POST" action="{% url 'inventory:movement_dispatch_ot' %}" class="space-y-3">
+            <form method="POST" action="{% url 'inventory:movement_dispatch_ot' %}" class="space-y-3" x-data="{ submitting: false }" @submit="if(submitting){ $event.preventDefault(); } else { submitting = true; }">
                 {% csrf_token %}
+                {{ dispatch_form.idempotency_key }}
                 <div>
                     <label class="block text-xs font-medium text-slate-700 mb-1">Bodega / Furgoneta de Salida <span class="text-rose-500">*</span></label>
                     {{ dispatch_form.warehouse }}
@@ -619,11 +620,12 @@
                     {{ dispatch_form.quantity }}
                 </div>
                 <div class="pt-3 border-t border-slate-100 flex items-center justify-end space-x-2">
-                    <button type="button" @click="showDispatchModal = false" class="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded hover:bg-slate-50 transition">
+                    <button type="button" @click="showDispatchModal = false" :disabled="submitting" class="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded hover:bg-slate-50 transition disabled:opacity-50">
                         Cancelar
                     </button>
-                    <button type="submit" class="px-4 py-1.5 text-xs font-semibold text-white bg-slate-900 rounded hover:bg-slate-800 transition">
-                        Confirmar Despacho a OT
+                    <button type="submit" :disabled="submitting" class="px-4 py-1.5 text-xs font-semibold text-white bg-slate-900 rounded hover:bg-slate-800 transition disabled:opacity-50 disabled:cursor-not-allowed">
+                        <span x-show="!submitting">Confirmar Despacho a OT</span>
+                        <span x-show="submitting" x-cloak>Procesando despacho...</span>
                     </button>
                 </div>
             </form>

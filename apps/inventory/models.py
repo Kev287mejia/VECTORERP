@@ -532,3 +532,65 @@ class StockMovement(TenantScopedModel):
 
     def delete(self, *args, **kwargs):
         raise ValidationError("El registro de Kardex es inmutable. No se permite eliminar movimientos existentes.")
+
+
+class StockDispatchIdempotencyRecord(TenantScopedModel):
+    """
+    Registro de Idempotencia Transaccional para Despacho de Materiales a Órdenes de Trabajo (DEF-05).
+    Garantiza que peticiones repetidas (doble clic, reintentos de red, timeouts, reconexiones)
+    no dupliquen deducciones de existencias físicas, sobre-imputaciones al BOM ni movimientos de Kardex.
+    Distingue reintentos idénticos legítimos de despachos consecutivos adicionales.
+    """
+    class ProcessingStatus(models.TextChoices):
+        SUCCESS = 'SUCCESS', 'Completado con Éxito'
+        FAILED = 'FAILED', 'Fallido / Cancelado'
+
+    idempotency_key = models.CharField(
+        max_length=120,
+        db_index=True,
+        verbose_name="Clave de Idempotencia",
+        help_text="Token o UUID único asignado a la petición de despacho",
+    )
+    work_order = models.ForeignKey(
+        'operations.WorkOrder',
+        on_delete=models.CASCADE,
+        related_name='dispatch_idempotency_records',
+        verbose_name="Orden de Trabajo Destino",
+    )
+    stock_movement = models.ForeignKey(
+        StockMovement,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='idempotency_records',
+        verbose_name="Movimiento de Kardex Resultante",
+    )
+    request_hash = models.CharField(
+        max_length=64,
+        verbose_name="Firma Criptográfica SHA-256 de la Petición",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=ProcessingStatus.choices,
+        default=ProcessingStatus.SUCCESS,
+        verbose_name="Estado de Operación",
+    )
+    response_payload = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="Payload de Respuesta Guardado",
+    )
+
+    class Meta(TenantScopedModel.Meta):
+        verbose_name = "Registro de Idempotencia de Despacho"
+        verbose_name_plural = "Registros de Idempotencia de Despachos"
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'idempotency_key'],
+                name='unique_stock_dispatch_idempotency_key_per_tenant',
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.idempotency_key} · OT {self.work_order.number} ({self.status})"
+

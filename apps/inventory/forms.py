@@ -1,4 +1,5 @@
 from decimal import Decimal
+import uuid
 from django import forms
 
 from apps.operations.models import Crew, WorkOrder, WorkOrderItem
@@ -171,7 +172,12 @@ class StockTransferForm(forms.Form):
 
 
 class StockDispatchForm(forms.Form):
-    """Formulario de Despacho directo a Orden de Trabajo."""
+    """Formulario de Despacho directo a Orden de Trabajo con Idempotencia Transaccional."""
+    idempotency_key = forms.CharField(
+        widget=forms.HiddenInput(),
+        required=False,
+        max_length=120,
+    )
     warehouse = forms.ModelChoiceField(
         queryset=Warehouse.objects.none(),
         widget=forms.Select(attrs={'class': SELECT_BASE_CLS}),
@@ -202,6 +208,9 @@ class StockDispatchForm(forms.Form):
 
     def __init__(self, *args, organization=None, initial_work_order=None, **kwargs):
         super().__init__(*args, **kwargs)
+        if not self.is_bound and not self.initial.get('idempotency_key'):
+            self.fields['idempotency_key'].initial = str(uuid.uuid4())
+
         if organization:
             self.fields['warehouse'].queryset = Warehouse.objects.for_org(organization).filter(is_active=True)
             self.fields['work_order'].queryset = WorkOrder.objects.for_org(organization).exclude(
@@ -217,3 +226,4 @@ class StockDispatchForm(forms.Form):
 
         if initial_work_order:
             self.fields['work_order'].initial = initial_work_order
+

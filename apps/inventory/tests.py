@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.db import connection
+from django.db import connection, connections
 from django.test import TestCase, TransactionTestCase, Client
 from django.urls import reverse
 from django.utils import timezone
@@ -1226,6 +1226,8 @@ class StockDispatchConcurrencyTestSuite(TransactionTestCase):
                 )
             except Exception as e:
                 errors.append(e)
+            finally:
+                connections.close_all()
 
         t1 = threading.Thread(target=worker)
         t2 = threading.Thread(target=worker)
@@ -1235,6 +1237,9 @@ class StockDispatchConcurrencyTestSuite(TransactionTestCase):
 
         t1.join(timeout=10)
         t2.join(timeout=10)
+
+        self.assertFalse(t1.is_alive(), "El hilo 1 no finalizó dentro del tiempo límite.")
+        self.assertFalse(t2.is_alive(), "El hilo 2 no finalizó dentro del tiempo límite.")
 
         self.assertEqual(errors, [], f"Errores en hilos concurrentes: {errors}")
 
@@ -1248,4 +1253,9 @@ class StockDispatchConcurrencyTestSuite(TransactionTestCase):
             organization=self.org, movement_type=StockMovement.MovementType.OUT_WORKORDER
         )
         self.assertEqual(movements.count(), 2)
+
+    def tearDown(self):
+        connections.close_all()
+        super().tearDown()
+
 

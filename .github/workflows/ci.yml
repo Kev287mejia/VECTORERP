@@ -78,3 +78,7 @@ jobs:
       - name: Run D-05 Quote & Work Order Conversion & Concurrency Tests
         run: |
           python manage.py test -k "d05" apps.billing.tests --noinput
+
+      - name: Run Inventory Integrity Tests
+        run: |
+          python manage.py test apps.inventory --noinput

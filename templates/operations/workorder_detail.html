@@ -18,8 +18,8 @@
         <span>Imprimir PDF</span>
     </a>
 
-    <!-- Acciones de Cierre Definitivo -->
-    {% if can_close_ot and work_order.phase != 'COMPLETED' and work_order.phase != 'CANCELLED' %}
+    <!-- Acciones de Cierre Definitivo (Solo desde QUALITY_CHECK tras validación) -->
+    {% if can_close_ot and work_order.phase == 'QUALITY_CHECK' %}
     <form method="POST" action="{% url 'operations:workorder_phase_transition' pk=work_order.pk %}" class="inline-flex">
         {% csrf_token %}
         <input type="hidden" name="phase" value="COMPLETED">
@@ -103,8 +103,8 @@
             {% endfor %}
         </div>
 
-        <!-- Controles de Transición de Fase (Ingeniero 50+) -->
-        {% if can_manage_phases and work_order.phase != 'COMPLETED' and work_order.phase != 'CANCELLED' %}
+        <!-- Controles de Transición de Fase (Ingeniero 50+ / FSM DEF-19) -->
+        {% if can_manage_phases and allowed_next_phases and work_order.phase != 'COMPLETED' and work_order.phase != 'CANCELLED' %}
         <div class="pt-3 mt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3 text-xs">
             <span class="text-slate-500 font-mono text-[11px]">
                 Avanzar fase de ingeniería:
@@ -112,15 +112,36 @@
             <form method="POST" action="{% url 'operations:workorder_phase_transition' pk=work_order.pk %}" class="flex items-center gap-2">
                 {% csrf_token %}
                 <select name="phase" class="text-xs font-mono py-1 px-2 border border-slate-300 rounded bg-white text-slate-800 focus:outline-none focus:border-blue-700">
-                    {% for code, label in phases %}
-                    {% if code != 'COMPLETED' and code != work_order.phase %}
-                    <option value="{{ code }}">Transicionar a: {{ label }}</option>
-                    {% endif %}
+                    {% for code, label in allowed_next_phases %}
+                    <option value="{{ code }}">{{ label }}</option>
                     {% endfor %}
                 </select>
                 <input type="text" name="notes" placeholder="Motivo o referencia técnica..." class="text-xs px-2.5 py-1 border border-slate-300 rounded bg-slate-50 focus:bg-white focus:outline-none focus:border-blue-700">
                 <button type="submit" class="px-3 py-1 bg-slate-800 hover:bg-slate-900 text-white font-medium rounded text-xs transition-colors shadow-none">
                     Actualizar Fase
+                </button>
+            </form>
+        </div>
+        {% endif %}
+
+        <!-- Panel de Reapertura Excepcional (Owner/Admin Nivel 100 - DEF19-D01) -->
+        {% if can_reopen_ot %}
+        <div class="pt-3 mt-3 border-t border-amber-200 bg-amber-50/60 p-3 rounded flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div class="space-y-0.5">
+                <span class="text-amber-900 font-bold flex items-center gap-1.5 text-xs font-mono">
+                    <svg class="w-4 h-4 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+                    AUTORIZACIÓN ADMINISTRATIVA: REAPERTURA EXCEPCIONAL
+                </span>
+                <span class="text-amber-800 text-[11px] block">
+                    Esta Orden de Trabajo se encuentra en estado terminal ({{ work_order.get_phase_display }}). Como Owner/Admin puede autorizar el retorno a ejecución de campo con justificación obligatoria (mín. 15 caracteres).
+                </span>
+            </div>
+            <form method="POST" action="{% url 'operations:workorder_phase_transition' pk=work_order.pk %}" class="flex items-center gap-2">
+                {% csrf_token %}
+                <input type="hidden" name="phase" value="IN_PROGRESS">
+                <input type="text" name="notes" minlength="15" required placeholder="Justificación obligatoria (mínimo 15 caracteres)..." class="text-xs px-2.5 py-1.5 border border-amber-300 rounded bg-white focus:outline-none focus:border-amber-600 w-80">
+                <button type="submit" onclick="return confirm('¿Confirmar la reapertura excepcional de esta Orden de Trabajo hacia IN_PROGRESS?');" class="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-semibold rounded text-xs transition-colors shadow-none cursor-pointer">
+                    Autorizar Reapertura
                 </button>
             </form>
         </div>

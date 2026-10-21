@@ -82,3 +82,8 @@ jobs:
       - name: Run Inventory Integrity Tests
         run: |
           python manage.py test apps.inventory --noinput
+
+      - name: Run Operations Lifecycle & FSM Tests (DEF-19)
+        run: |
+          python manage.py test apps.operations --noinput
+

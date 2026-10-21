@@ -5,7 +5,7 @@ from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
 
-from apps.tenancy.models import TenantScopedModel
+from apps.tenancy.models import TenantScopedModel, RoleLevel
 
 
 class Crew(TenantScopedModel):
@@ -106,6 +106,17 @@ class WorkOrder(TenantScopedModel):
         QUALITY_CHECK = 'QUALITY_CHECK', '05 · Control de Calidad / Revisión'
         COMPLETED = 'COMPLETED', '06 · Entregada y Cerrada'
         CANCELLED = 'CANCELLED', 'Cancelada'
+
+    # Matriz cerrada de transiciones ordinarias de ciclo de vida (DEF-19 / DEF19-D04)
+    ALLOWED_ORDINARY_TRANSITIONS = {
+        Phase.DRAFT: {Phase.ENGINEERING, Phase.CANCELLED},
+        Phase.ENGINEERING: {Phase.SCHEDULED, Phase.CANCELLED},
+        Phase.SCHEDULED: {Phase.IN_PROGRESS, Phase.CANCELLED},
+        Phase.IN_PROGRESS: {Phase.QUALITY_CHECK},
+        Phase.QUALITY_CHECK: {Phase.COMPLETED, Phase.IN_PROGRESS},
+        Phase.COMPLETED: set(),
+        Phase.CANCELLED: set(),
+    }
 
     number = models.CharField(
         max_length=25,
@@ -288,6 +299,208 @@ class WorkOrder(TenantScopedModel):
         if self.is_high_risk and not self.sst_cleared:
             return False, "La labor está clasificada como de Alto Riesgo y requiere la Liberación formal de Seguridad (SST Nivel 70+) antes de iniciar en campo."
         return True, "Liberado para labores de campo."
+
+    def get_allowed_transitions(self, role_level: int = 0) -> list[tuple[str, str]]:
+        """
+        Calcula las transiciones permitidas según el estado actual y el role_level activo.
+        Utilizado para poblar dinámicamente las opciones de la interfaz.
+        """
+        if self.phase in [self.Phase.COMPLETED, self.Phase.CANCELLED]:
+            if role_level >= RoleLevel.OWNER_ADMIN:
+                return [(self.Phase.IN_PROGRESS, 'Reapertura Excepcional a En Ejecución de Campo')]
+            return []
+
+        allowed = []
+        candidates = self.ALLOWED_ORDINARY_TRANSITIONS.get(self.phase, set())
+
+        for cand in [self.Phase.ENGINEERING, self.Phase.SCHEDULED, self.Phase.IN_PROGRESS, self.Phase.QUALITY_CHECK, self.Phase.COMPLETED, self.Phase.CANCELLED]:
+            if cand not in candidates:
+                continue
+
+            if cand == self.Phase.COMPLETED:
+                if role_level >= RoleLevel.OPERATIONS_COORD:
+                    allowed.append((cand, f"Cierre Definitivo ({self.Phase.COMPLETED.label})"))
+            elif cand == self.Phase.CANCELLED:
+                if role_level >= RoleLevel.OPERATIONS_COORD:
+                    allowed.append((cand, "Cancelar Orden de Trabajo"))
+            elif self.phase == self.Phase.QUALITY_CHECK and cand == self.Phase.IN_PROGRESS:
+                if role_level >= RoleLevel.ENGINEER:
+                    allowed.append((cand, "Rechazo de Calidad (Devolver a Campo)"))
+            else:
+                if role_level >= RoleLevel.ENGINEER:
+                    allowed.append((cand, f"Avanzar a: {self.Phase(cand).label}"))
+
+        return allowed
+
+    def validate_phase_transition(self, target_phase: str, user=None, role_level: int = 0, notes: str = '') -> None:
+        """
+        Valida rigurosamente la legalidad de una transición de estado según DEF-19.
+        Lanza ValidationError ante cualquier violación de reglas de negocio, ciclo de vida o permisos.
+        """
+        if target_phase not in self.Phase.values:
+            raise ValidationError(f"Fase operativa '{target_phase}' no válida en el sistema.")
+
+        if self.phase == target_phase:
+            raise ValidationError(f"La Orden de Trabajo ya se encuentra en fase {self.get_phase_display()}.")
+
+        clean_notes = (notes or '').strip()
+
+        # 1. Estados Terminales: COMPLETED y CANCELLED (DEF19-D01 / DEF19-D03)
+        if self.phase in [self.Phase.COMPLETED, self.Phase.CANCELLED]:
+            if target_phase != self.Phase.IN_PROGRESS:
+                raise ValidationError(
+                    f"Una Orden de Trabajo en estado terminal ({self.get_phase_display()}) solo "
+                    f"puede ser reabierta excepcionalmente a 'En Ejecución de Campo' (IN_PROGRESS)."
+                )
+            if role_level < RoleLevel.OWNER_ADMIN:
+                raise ValidationError(
+                    "La reapertura excepcional de una Orden de Trabajo terminal exige nivel "
+                    "jerárquico de Owner / Administrador General (100)."
+                )
+            if len(clean_notes) < 15:
+                raise ValidationError(
+                    "La reapertura excepcional exige una justificación técnica o de auditoría "
+                    "obligatoria de al menos 15 caracteres."
+                )
+            return
+
+        # 2. Flujo Ordinario
+        allowed_targets = self.ALLOWED_ORDINARY_TRANSITIONS.get(self.phase, set())
+        if target_phase not in allowed_targets:
+            target_label = self.Phase(target_phase).label if target_phase in self.Phase.values else target_phase
+            raise ValidationError(
+                f"Transición de fase no permitida: no es posible pasar de '{self.get_phase_display()}' "
+                f"a '{target_label}'."
+            )
+
+        # 2a. Cancelación (DEF19-D05)
+        if target_phase == self.Phase.CANCELLED:
+            if self.phase not in [self.Phase.DRAFT, self.Phase.ENGINEERING, self.Phase.SCHEDULED]:
+                raise ValidationError(
+                    f"No es posible cancelar una Orden de Trabajo en fase {self.get_phase_display()}. "
+                    f"Solo se permite cancelar órdenes en DRAFT, ENGINEERING o SCHEDULED."
+                )
+            if role_level < RoleLevel.OPERATIONS_COORD:
+                raise ValidationError(
+                    "La cancelación de una Orden de Trabajo requiere nivel de Coordinador de Operaciones (80+)."
+                )
+            if not clean_notes:
+                raise ValidationError(
+                    "La cancelación de una Orden de Trabajo exige un motivo explicativo obligatorio."
+                )
+            return
+
+        # 2b. Cierre formal definitivo (DEF19-D04 / COMPLETED)
+        if target_phase == self.Phase.COMPLETED:
+            if self.phase != self.Phase.QUALITY_CHECK:
+                raise ValidationError(
+                    "El cierre definitivo (COMPLETED) solo puede ejecutarse tras la fase de "
+                    "Control de Calidad / Revisión."
+                )
+            if role_level < RoleLevel.OPERATIONS_COORD:
+                raise ValidationError(
+                    "El cierre definitivo (COMPLETED) de una Orden de Trabajo requiere nivel de "
+                    "Coordinador de Operaciones (80+)."
+                )
+            return
+
+        # 2c. Rechazo de Calidad (DEF19-D04 / QUALITY_CHECK -> IN_PROGRESS)
+        if self.phase == self.Phase.QUALITY_CHECK and target_phase == self.Phase.IN_PROGRESS:
+            if role_level < RoleLevel.ENGINEER:
+                raise ValidationError(
+                    "El rechazo de calidad requiere nivel de Ingeniero Residente / Supervisor (50+)."
+                )
+            if not clean_notes:
+                raise ValidationError(
+                    "El rechazo de calidad exige un motivo explicativo obligatorio detallando las no conformidades."
+                )
+            return
+
+        # 2d. Avance hacia IN_PROGRESS (SST check)
+        if target_phase == self.Phase.IN_PROGRESS:
+            if role_level < RoleLevel.ENGINEER:
+                raise ValidationError(
+                    "Iniciar la ejecución en campo requiere nivel de Ingeniero Residente / Supervisor (50+)."
+                )
+            can_start, sst_reason = self.can_start_field_execution()
+            if not can_start:
+                raise ValidationError(f"BLOQUEO SST: {sst_reason}")
+            return
+
+        # 2e. Avance hacia ENGINEERING o SCHEDULED
+        if target_phase in [self.Phase.ENGINEERING, self.Phase.SCHEDULED]:
+            if role_level < RoleLevel.ENGINEER:
+                raise ValidationError(
+                    "Avanzar las fases técnicas de ingeniería requiere nivel de Ingeniero Residente / Supervisor (50+)."
+                )
+            return
+
+        # 2f. Avance hacia QUALITY_CHECK
+        if target_phase == self.Phase.QUALITY_CHECK:
+            if role_level < RoleLevel.ENGINEER:
+                raise ValidationError(
+                    "Enviar la orden a Control de Calidad requiere nivel de Ingeniero Residente / Supervisor (50+)."
+                )
+            return
+
+    def apply_phase_transition(self, target_phase: str, user, role_level: int = 0, notes: str = '') -> tuple[str, str]:
+        """
+        Aplica la transición de fase validada, actualiza los campos correspondientes y asienta la bitácora inmutable.
+        Retorna (event_type, user_message).
+        """
+        self.validate_phase_transition(target_phase, user=user, role_level=role_level, notes=notes)
+
+        clean_notes = (notes or '').strip()
+        old_phase = self.phase
+        old_phase_display = self.get_phase_display()
+        is_exceptional_reopen = old_phase in [self.Phase.COMPLETED, self.Phase.CANCELLED]
+        is_quality_reject = (old_phase == self.Phase.QUALITY_CHECK and target_phase == self.Phase.IN_PROGRESS)
+        is_cancellation = (target_phase == self.Phase.CANCELLED)
+
+        # Mutaciones de estado y fechas
+        if is_exceptional_reopen and old_phase == self.Phase.COMPLETED:
+            self.completed_at = None
+        elif target_phase == self.Phase.COMPLETED:
+            self.completed_at = timezone.now()
+
+        self.phase = target_phase
+        self.save(update_fields=['phase', 'completed_at', 'updated_at'])
+
+        # Determinación de evento y textos para bitácora inmutable
+        actor_name = user.full_name or user.email if user else "Sistema"
+        role_label = RoleLevel(role_level).label if role_level in RoleLevel.values else f"Nivel {role_level}"
+
+        if is_exceptional_reopen:
+            event_type = 'EXCEPTIONAL_REOPEN'
+            summary = f"Reapertura excepcional autorizada: {old_phase_display} → {self.get_phase_display()}"
+            details = f"Motivo de reapertura: {clean_notes}. Autorizado por {actor_name} ({role_label})."
+            msg = f"Reapertura excepcional autorizada: Orden de Trabajo {self.number} devuelta a '{self.get_phase_display()}'."
+        elif is_quality_reject:
+            event_type = 'QUALITY_REJECT'
+            summary = f"Rechazo de Calidad: {old_phase_display} → {self.get_phase_display()}"
+            details = f"No conformidades: {clean_notes}. Dictaminado por {actor_name} ({role_label})."
+            msg = f"Control de Calidad rechazado. Orden de Trabajo {self.number} devuelta a '{self.get_phase_display()}' para subsanación."
+        elif is_cancellation:
+            event_type = 'CANCELLED'
+            summary = f"Orden de Trabajo cancelada: {old_phase_display} → Cancelada"
+            details = f"Motivo de cancelación: {clean_notes}. Autorizado por {actor_name} ({role_label})."
+            msg = f"Orden de Trabajo {self.number} cancelada exitosamente."
+        else:
+            event_type = 'PHASE_CHANGE'
+            summary = f"Fase actualizada: {old_phase_display} → {self.get_phase_display()}"
+            details = clean_notes or f"Transición autorizada por {actor_name} ({role_label})."
+            msg = f"Orden de Trabajo {self.number} movida a '{self.get_phase_display()}'."
+
+        WorkOrderTimelineLog.objects.create(
+            organization=self.organization,
+            work_order=self,
+            event_type=event_type,
+            summary=summary,
+            details=details,
+            actor=user,
+        )
+
+        return event_type, msg
 
     def record_client_signature(self, signer_name: str, signer_title: str, signer_id: str, signature_base64: str, actor=None) -> str:
         """

@@ -5,7 +5,7 @@ import uuid
 from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.db import connection, transaction, IntegrityError
+from django.db import connection, connections, transaction, IntegrityError
 from django.test import TestCase, Client, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
@@ -690,8 +690,14 @@ class OperationsModuleEndToEndTestCase(TestCase):
         resp_tech_trans = client_tech1.post(url_trans, data={'phase': WorkOrder.Phase.QUALITY_CHECK})
         self.assertEqual(resp_tech_trans.status_code, 403)
 
-        # 5. Ingeniero (Nivel 50) intenta Cierre Definitivo (COMPLETED) -> 403 Forbidden
+        # Ingeniero (Nivel 50) avanza la OT a QUALITY_CHECK según la FSM
         client_eng = self._get_client_for_user(self.user_engineer)
+        resp_eng_qc = client_eng.post(url_trans, data={'phase': WorkOrder.Phase.QUALITY_CHECK})
+        self.assertEqual(resp_eng_qc.status_code, 302)
+        ot_alpha.refresh_from_db()
+        self.assertEqual(ot_alpha.phase, WorkOrder.Phase.QUALITY_CHECK)
+
+        # 5. Ingeniero (Nivel 50) intenta Cierre Definitivo (COMPLETED) -> 403 Forbidden
         resp_eng_close = client_eng.post(url_trans, data={'phase': WorkOrder.Phase.COMPLETED})
         self.assertEqual(resp_eng_close.status_code, 403)
 
@@ -1204,3 +1210,616 @@ class OperationsQuoteToWorkOrderConcurrencyTestCase(TransactionTestCase):
 
         # 6. Exactamente un registro de bitácora FROM_QUOTE
         self.assertEqual(wo.timeline_logs.filter(event_type='FROM_QUOTE').count(), 1)
+
+
+# ==============================================================================
+# FASE 1C.32: SUITE DE MÁQUINA DE ESTADOS FINITOS Y CICLO DE VIDA (DEF-19)
+# ==============================================================================
+
+class WorkOrderLifecycleFSMTestCase(TestCase):
+    """
+    Suite de Pruebas de Integridad del Ciclo de Vida y Transiciones de OT (DEF-19).
+    """
+
+    def setUp(self):
+        # 1. Configuración de País
+        self.country_ni, _ = CountryConfig.objects.get_or_create(
+            code='NI',
+            defaults={
+                'name': 'Nicaragua',
+                'flag_emoji': '🇳🇮',
+                'primary_currency_code': 'NIO',
+                'primary_currency_symbol': 'C$',
+                'is_active': True,
+            }
+        )
+
+        # 2. Organización Principal Alpha
+        self.org_a = Organization.objects.create(
+            name="Energía y Maniobras Alpha S.A.",
+            legal_name="Energía y Maniobras Alpha Nicaragua S.A.",
+            slug=f"org-alpha-{uuid.uuid4().hex[:6]}",
+            country=self.country_ni,
+            enabled_modules=['crm', 'operations', 'inventory'],
+            is_active=True,
+        )
+
+        # 3. Organización Aislada Beta
+        self.org_b = Organization.objects.create(
+            name="Servicios Eléctricos Beta S.A.",
+            legal_name="Servicios Eléctricos Beta Nicaragua S.A.",
+            slug=f"org-beta-{uuid.uuid4().hex[:6]}",
+            country=self.country_ni,
+            enabled_modules=['crm', 'operations', 'inventory'],
+            is_active=True,
+        )
+
+        # 4. Usuarios por Nivel Jerárquico en Org A
+        self.user_tech = User.objects.create_user(
+            email=f'tech_{uuid.uuid4().hex[:6]}@alpha.com.ni',
+            full_name='Técnico Campo Alfa',
+            password='password123',
+        )
+        OrganizationMembership.objects.create(
+            user=self.user_tech,
+            organization=self.org_a,
+            role_level=RoleLevel.TECHNICIAN,
+            is_active=True,
+            is_default_org=True,
+        )
+
+        self.user_eng = User.objects.create_user(
+            email=f'eng_{uuid.uuid4().hex[:6]}@alpha.com.ni',
+            full_name='Ing. Supervisor Alfa',
+            password='password123',
+        )
+        OrganizationMembership.objects.create(
+            user=self.user_eng,
+            organization=self.org_a,
+            role_level=RoleLevel.ENGINEER,
+            is_active=True,
+            is_default_org=True,
+        )
+
+        self.user_sst = User.objects.create_user(
+            email=f'sst_{uuid.uuid4().hex[:6]}@alpha.com.ni',
+            full_name='Oficial SST Alfa',
+            password='password123',
+        )
+        OrganizationMembership.objects.create(
+            user=self.user_sst,
+            organization=self.org_a,
+            role_level=RoleLevel.SST_OFFICER,
+            is_active=True,
+            is_default_org=True,
+        )
+
+        self.user_coord = User.objects.create_user(
+            email=f'coord_{uuid.uuid4().hex[:6]}@alpha.com.ni',
+            full_name='Coordinador Operativo Alfa',
+            password='password123',
+        )
+        OrganizationMembership.objects.create(
+            user=self.user_coord,
+            organization=self.org_a,
+            role_level=RoleLevel.OPERATIONS_COORD,
+            is_active=True,
+            is_default_org=True,
+        )
+
+        self.user_owner = User.objects.create_user(
+            email=f'owner_{uuid.uuid4().hex[:6]}@alpha.com.ni',
+            full_name='Owner Administrador Alfa',
+            password='password123',
+        )
+        OrganizationMembership.objects.create(
+            user=self.user_owner,
+            organization=self.org_a,
+            role_level=RoleLevel.OWNER_ADMIN,
+            is_active=True,
+            is_default_org=True,
+        )
+
+        # 5. Usuario en Org B (para pruebas de aislamiento)
+        self.user_beta_coord = User.objects.create_user(
+            email=f'coord_{uuid.uuid4().hex[:6]}@beta.com.ni',
+            full_name='Coordinador Beta',
+            password='password123',
+        )
+        OrganizationMembership.objects.create(
+            user=self.user_beta_coord,
+            organization=self.org_b,
+            role_level=RoleLevel.OPERATIONS_COORD,
+            is_active=True,
+            is_default_org=True,
+        )
+
+        # 6. Cuenta y Cuadrilla
+        self.account_a = Account.objects.create(
+            organization=self.org_a,
+            commercial_name="Cliente Industrial Managua S.A.",
+        )
+        self.crew_a = Crew.objects.create(
+            organization=self.org_a,
+            name="Cuadrilla Alfa Especializada",
+            leader=self.user_eng,
+        )
+        self.crew_a.members.add(self.user_tech)
+
+    def _get_client(self, user, org=None):
+        client = Client()
+        client.force_login(user)
+        session = client.session
+        target_org = org or self.org_a
+        session['active_org_id'] = str(target_org.id)
+        session.save()
+        return client
+
+    def _create_work_order(self, phase=WorkOrder.Phase.DRAFT, is_high_risk=False, sst_cleared=False):
+        return WorkOrder.objects.create(
+            organization=self.org_a,
+            number=f"OT-FSM-{uuid.uuid4().hex[:6].upper()}",
+            title="Mantenimiento Subestación 138kV",
+            account=self.account_a,
+            assigned_engineer=self.user_eng,
+            assigned_crew=self.crew_a,
+            phase=phase,
+            is_high_risk=is_high_risk,
+            sst_cleared=sst_cleared,
+            created_by=self.user_coord,
+        )
+
+    # --------------------------------------------------------------------------
+    # 1. FLUJO SECUENCIAL COMPLETO VÁLIDO (DEF19-D04)
+    # --------------------------------------------------------------------------
+    def test_ordinary_sequential_flow_happy_path(self):
+        """
+        Recorre exitosamente todo el ciclo de vida ordinario:
+        DRAFT -> ENGINEERING -> SCHEDULED -> IN_PROGRESS -> QUALITY_CHECK -> COMPLETED.
+        """
+        wo = self._create_work_order(phase=WorkOrder.Phase.DRAFT)
+        client_eng = self._get_client(self.user_eng)
+        client_coord = self._get_client(self.user_coord)
+        url_trans = reverse('operations:workorder_phase_transition', kwargs={'pk': wo.pk})
+
+        # 1. DRAFT -> ENGINEERING (Ingeniero 50)
+        resp = client_eng.post(url_trans, {'phase': WorkOrder.Phase.ENGINEERING})
+        self.assertEqual(resp.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.ENGINEERING)
+        self.assertTrue(wo.timeline_logs.filter(event_type='PHASE_CHANGE').exists())
+
+        # 2. ENGINEERING -> SCHEDULED (Ingeniero 50)
+        resp = client_eng.post(url_trans, {'phase': WorkOrder.Phase.SCHEDULED})
+        self.assertEqual(resp.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.SCHEDULED)
+
+        # 3. SCHEDULED -> IN_PROGRESS (Ingeniero 50, bajo riesgo)
+        resp = client_eng.post(url_trans, {'phase': WorkOrder.Phase.IN_PROGRESS})
+        self.assertEqual(resp.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.IN_PROGRESS)
+
+        # 4. IN_PROGRESS -> QUALITY_CHECK (Ingeniero 50)
+        resp = client_eng.post(url_trans, {'phase': WorkOrder.Phase.QUALITY_CHECK})
+        self.assertEqual(resp.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.QUALITY_CHECK)
+
+        # 5. QUALITY_CHECK -> COMPLETED (Coordinador 80)
+        resp = client_coord.post(url_trans, {
+            'phase': WorkOrder.Phase.COMPLETED,
+            'notes': 'Recepción a satisfacción total de la obra.',
+        })
+        self.assertEqual(resp.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.COMPLETED)
+        self.assertIsNotNone(wo.completed_at)
+
+    # --------------------------------------------------------------------------
+    # 2. SALTOS DE FASE Y RETROCESOS NO PERMITIDOS
+    # --------------------------------------------------------------------------
+    def test_arbitrary_phase_jumps_rejected(self):
+        """Saltos arbitrarios son rechazados en el servidor sin modificar estado ni bitácora."""
+        wo = self._create_work_order(phase=WorkOrder.Phase.DRAFT)
+        client_eng = self._get_client(self.user_eng)
+        client_coord = self._get_client(self.user_coord)
+        url_trans = reverse('operations:workorder_phase_transition', kwargs={'pk': wo.pk})
+
+        initial_logs_count = wo.timeline_logs.count()
+
+        # DRAFT -> QUALITY_CHECK
+        resp = client_eng.post(url_trans, {'phase': WorkOrder.Phase.QUALITY_CHECK})
+        self.assertEqual(resp.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.DRAFT)
+        self.assertEqual(wo.timeline_logs.count(), initial_logs_count)
+
+        # DRAFT -> COMPLETED (incluso por Coordinador)
+        resp = client_coord.post(url_trans, {'phase': WorkOrder.Phase.COMPLETED})
+        self.assertEqual(resp.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.DRAFT)
+
+        # SCHEDULED -> QUALITY_CHECK
+        wo_sched = self._create_work_order(phase=WorkOrder.Phase.SCHEDULED)
+        url_sched = reverse('operations:workorder_phase_transition', kwargs={'pk': wo_sched.pk})
+        resp = client_eng.post(url_sched, {'phase': WorkOrder.Phase.QUALITY_CHECK})
+        self.assertEqual(resp.status_code, 302)
+        wo_sched.refresh_from_db()
+        self.assertEqual(wo_sched.phase, WorkOrder.Phase.SCHEDULED)
+
+    def test_unapproved_rollbacks_rejected(self):
+        """Retrocesos ordinarios no aprobados son rechazados (DEF19-D04)."""
+        client_eng = self._get_client(self.user_eng)
+
+        # ENGINEERING -> DRAFT
+        wo_eng = self._create_work_order(phase=WorkOrder.Phase.ENGINEERING)
+        url = reverse('operations:workorder_phase_transition', kwargs={'pk': wo_eng.pk})
+        resp = client_eng.post(url, {'phase': WorkOrder.Phase.DRAFT})
+        self.assertEqual(resp.status_code, 302)
+        wo_eng.refresh_from_db()
+        self.assertEqual(wo_eng.phase, WorkOrder.Phase.ENGINEERING)
+
+        # SCHEDULED -> ENGINEERING
+        wo_sched = self._create_work_order(phase=WorkOrder.Phase.SCHEDULED)
+        url_sched = reverse('operations:workorder_phase_transition', kwargs={'pk': wo_sched.pk})
+        resp = client_eng.post(url_sched, {'phase': WorkOrder.Phase.ENGINEERING})
+        self.assertEqual(resp.status_code, 302)
+        wo_sched.refresh_from_db()
+        self.assertEqual(wo_sched.phase, WorkOrder.Phase.SCHEDULED)
+
+    # --------------------------------------------------------------------------
+    # 3. REGLAS DE CANCELACIÓN (DEF19-D05)
+    # --------------------------------------------------------------------------
+    def test_cancellation_by_coordinator_authorized_from_early_phases(self):
+        """Coordinador (80+) cancela exitosamente desde DRAFT, ENGINEERING y SCHEDULED con motivo."""
+        client_coord = self._get_client(self.user_coord)
+
+        # Desde DRAFT
+        wo1 = self._create_work_order(phase=WorkOrder.Phase.DRAFT)
+        url1 = reverse('operations:workorder_phase_transition', kwargs={'pk': wo1.pk})
+        resp1 = client_coord.post(url1, {'phase': WorkOrder.Phase.CANCELLED, 'notes': 'Proyecto desistido por el cliente'})
+        self.assertEqual(resp1.status_code, 302)
+        wo1.refresh_from_db()
+        self.assertEqual(wo1.phase, WorkOrder.Phase.CANCELLED)
+        self.assertTrue(wo1.timeline_logs.filter(event_type='CANCELLED').exists())
+
+        # Desde ENGINEERING
+        wo2 = self._create_work_order(phase=WorkOrder.Phase.ENGINEERING)
+        url2 = reverse('operations:workorder_phase_transition', kwargs={'pk': wo2.pk})
+        resp2 = client_coord.post(url2, {'phase': WorkOrder.Phase.CANCELLED, 'notes': 'Inviabilidad técnica estructural'})
+        self.assertEqual(resp2.status_code, 302)
+        wo2.refresh_from_db()
+        self.assertEqual(wo2.phase, WorkOrder.Phase.CANCELLED)
+
+        # Desde SCHEDULED
+        wo3 = self._create_work_order(phase=WorkOrder.Phase.SCHEDULED)
+        url3 = reverse('operations:workorder_phase_transition', kwargs={'pk': wo3.pk})
+        resp3 = client_coord.post(url3, {'phase': WorkOrder.Phase.CANCELLED, 'notes': 'Cancelada antes de movilización de cuadrilla'})
+        self.assertEqual(resp3.status_code, 302)
+        wo3.refresh_from_db()
+        self.assertEqual(wo3.phase, WorkOrder.Phase.CANCELLED)
+
+    def test_cancellation_rejected_without_reason_or_by_engineer(self):
+        """Cancelación sin motivo o por rol inferior a 80 es rechazada."""
+        client_coord = self._get_client(self.user_coord)
+        client_eng = self._get_client(self.user_eng)
+        wo = self._create_work_order(phase=WorkOrder.Phase.DRAFT)
+        url = reverse('operations:workorder_phase_transition', kwargs={'pk': wo.pk})
+
+        # Sin motivo (notas vacías) por Coordinador
+        resp = client_coord.post(url, {'phase': WorkOrder.Phase.CANCELLED, 'notes': '   '})
+        self.assertEqual(resp.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.DRAFT)
+
+        # Por Ingeniero (Rol 50)
+        resp_eng = client_eng.post(url, {'phase': WorkOrder.Phase.CANCELLED, 'notes': 'Intento de cancelación por supervisor'})
+        self.assertEqual(resp_eng.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.DRAFT)
+
+    def test_cancellation_rejected_from_active_or_terminal_phases(self):
+        """No se permite cancelar desde IN_PROGRESS, QUALITY_CHECK, COMPLETED ni CANCELLED."""
+        client_coord = self._get_client(self.user_coord)
+
+        for blocked_phase in [WorkOrder.Phase.IN_PROGRESS, WorkOrder.Phase.QUALITY_CHECK, WorkOrder.Phase.COMPLETED, WorkOrder.Phase.CANCELLED]:
+            wo = self._create_work_order(phase=blocked_phase)
+            url = reverse('operations:workorder_phase_transition', kwargs={'pk': wo.pk})
+            resp = client_coord.post(url, {'phase': WorkOrder.Phase.CANCELLED, 'notes': 'Cancelación no permitida en esta fase'})
+            self.assertEqual(resp.status_code, 302)
+            wo.refresh_from_db()
+            self.assertEqual(wo.phase, blocked_phase, f"Fase {blocked_phase} no debió permitir cancelación.")
+
+    # --------------------------------------------------------------------------
+    # 4. RECHAZO DE CALIDAD Y PRESERVACIÓN DE FIRMA (DEF19-D02 / DEF19-D04)
+    # --------------------------------------------------------------------------
+    def test_quality_rejection_requires_reason_and_returns_to_in_progress(self):
+        """Rechazo desde QUALITY_CHECK exige motivo y retorna la OT a IN_PROGRESS."""
+        client_eng = self._get_client(self.user_eng)
+        wo = self._create_work_order(phase=WorkOrder.Phase.QUALITY_CHECK)
+        url = reverse('operations:workorder_phase_transition', kwargs={'pk': wo.pk})
+
+        # Sin motivo -> Rechazado
+        resp_empty = client_eng.post(url, {'phase': WorkOrder.Phase.IN_PROGRESS, 'notes': ''})
+        self.assertEqual(resp_empty.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.QUALITY_CHECK)
+
+        # Con motivo válido -> Exitoso
+        resp_ok = client_eng.post(url, {
+            'phase': WorkOrder.Phase.IN_PROGRESS,
+            'notes': 'No conformidad: Se detectó fuga de aceite dieléctrico en borne secundario.',
+        })
+        self.assertEqual(resp_ok.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.IN_PROGRESS)
+        log = wo.timeline_logs.filter(event_type='QUALITY_REJECT').first()
+        self.assertIsNotNone(log)
+        self.assertIn("Rechazo de Calidad", log.summary)
+
+    def test_quality_rejection_preserves_original_signature_in_db(self):
+        """El rechazo de calidad preserva íntegramente los campos de la firma original del cliente."""
+        wo = self._create_work_order(phase=WorkOrder.Phase.IN_PROGRESS)
+        dummy_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+
+        orig_hash = wo.record_client_signature(
+            signer_name="Don Roberto Cliente",
+            signer_title="Gerente de Planta",
+            signer_id="001-201085-0001A",
+            signature_base64=dummy_png,
+            actor=self.user_tech,
+        )
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.QUALITY_CHECK)
+        self.assertEqual(wo.signature_hash, orig_hash)
+
+        # Ejecutar rechazo de calidad
+        client_eng = self._get_client(self.user_eng)
+        url = reverse('operations:workorder_phase_transition', kwargs={'pk': wo.pk})
+        resp = client_eng.post(url, {
+            'phase': WorkOrder.Phase.IN_PROGRESS,
+            'notes': 'Rechazado en auditoría por falta de pruebas de termografía.',
+        })
+        self.assertEqual(resp.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.IN_PROGRESS)
+
+        # Confirmación byte por byte de preservación de firma
+        self.assertEqual(wo.signature_hash, orig_hash)
+        self.assertEqual(wo.client_signature_data, dummy_png)
+        self.assertEqual(wo.client_signer_name, "Don Roberto Cliente")
+        self.assertEqual(wo.client_signer_id, "001-201085-0001A")
+
+    # --------------------------------------------------------------------------
+    # 5. REAPERTURA EXCEPCIONAL (DEF19-D01)
+    # --------------------------------------------------------------------------
+    def test_exceptional_reopen_by_owner_admin_success(self):
+        """Owner/Admin (100) reabre OT COMPLETED hacia IN_PROGRESS con motivo >= 15 chars."""
+        wo = self._create_work_order(phase=WorkOrder.Phase.COMPLETED)
+        wo.completed_at = timezone.now()
+        wo.save(update_fields=['completed_at'])
+
+        client_owner = self._get_client(self.user_owner)
+        url = reverse('operations:workorder_phase_transition', kwargs={'pk': wo.pk})
+
+        resp = client_owner.post(url, {
+            'phase': WorkOrder.Phase.IN_PROGRESS,
+            'notes': 'Reapertura excepcional autorizada por dirección general para subsanar garantía.',
+        })
+        self.assertEqual(resp.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.IN_PROGRESS)
+        self.assertIsNone(wo.completed_at, "completed_at debe ser limpiado al reabrir una OT completada.")
+
+        log = wo.timeline_logs.filter(event_type='EXCEPTIONAL_REOPEN').first()
+        self.assertIsNotNone(log)
+        self.assertIn("Reapertura excepcional", log.summary)
+        self.assertEqual(log.actor, self.user_owner)
+
+        # También verificar reapertura excepcional desde CANCELLED
+        wo_canc = self._create_work_order(phase=WorkOrder.Phase.CANCELLED)
+        url_canc = reverse('operations:workorder_phase_transition', kwargs={'pk': wo_canc.pk})
+        resp_canc = client_owner.post(url_canc, {
+            'phase': WorkOrder.Phase.IN_PROGRESS,
+            'notes': 'Reapertura excepcional: Reactivación de contrato y financiamiento bancario.',
+        })
+        self.assertEqual(resp_canc.status_code, 302)
+        wo_canc.refresh_from_db()
+        self.assertEqual(wo_canc.phase, WorkOrder.Phase.IN_PROGRESS)
+        self.assertIsNone(wo_canc.completed_at)
+
+    def test_exceptional_reopen_rejected_for_inferior_roles(self):
+        """Coordinador (80) e Ingeniero (50) no pueden reabrir órdenes terminales."""
+        wo = self._create_work_order(phase=WorkOrder.Phase.COMPLETED)
+        url = reverse('operations:workorder_phase_transition', kwargs={'pk': wo.pk})
+
+        # Coordinador (80)
+        client_coord = self._get_client(self.user_coord)
+        resp_coord = client_coord.post(url, {
+            'phase': WorkOrder.Phase.IN_PROGRESS,
+            'notes': 'Intento de reapertura por coordinación sin aval de gerencia.',
+        })
+        self.assertEqual(resp_coord.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.COMPLETED)
+
+        # Ingeniero (50)
+        client_eng = self._get_client(self.user_eng)
+        resp_eng = client_eng.post(url, {
+            'phase': WorkOrder.Phase.IN_PROGRESS,
+            'notes': 'Intento de reapertura por ingeniero residente en campo.',
+        })
+        self.assertEqual(resp_eng.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.COMPLETED)
+
+    def test_exceptional_reopen_rejected_with_short_reason(self):
+        """Motivo de reapertura con menos de 15 caracteres es rechazado."""
+        wo = self._create_work_order(phase=WorkOrder.Phase.COMPLETED)
+        url = reverse('operations:workorder_phase_transition', kwargs={'pk': wo.pk})
+        client_owner = self._get_client(self.user_owner)
+
+        resp = client_owner.post(url, {
+            'phase': WorkOrder.Phase.IN_PROGRESS,
+            'notes': 'Reabrir OT      ',  # 10 chars tras strip()
+        })
+        self.assertEqual(resp.status_code, 302)
+        wo.refresh_from_db()
+        self.assertEqual(wo.phase, WorkOrder.Phase.COMPLETED)
+
+    def test_exceptional_reopen_invalid_destination_rejected(self):
+        """Reapertura excepcional hacia destinos distintos de IN_PROGRESS es rechazada."""
+        wo = self._create_work_order(phase=WorkOrder.Phase.COMPLETED)
+        url = reverse('operations:workorder_phase_transition', kwargs={'pk': wo.pk})
+        client_owner = self._get_client(self.user_owner)
+
+        for invalid_target in [WorkOrder.Phase.QUALITY_CHECK, WorkOrder.Phase.DRAFT, WorkOrder.Phase.ENGINEERING]:
+            resp = client_owner.post(url, {
+                'phase': invalid_target,
+                'notes': 'Motivo suficientemente largo para la prueba pero con destino inválido.',
+            })
+            self.assertEqual(resp.status_code, 302)
+            wo.refresh_from_db()
+            self.assertEqual(wo.phase, WorkOrder.Phase.COMPLETED)
+
+    # --------------------------------------------------------------------------
+    # 6. AISLAMIENTO MULTI-TENANT Y SEGURIDAD SST
+    # --------------------------------------------------------------------------
+    def test_multitenant_isolation_rejects_cross_tenant_transition(self):
+        """Un usuario de otra organización no puede modificar una OT ajena."""
+        wo_a = self._create_work_order(phase=WorkOrder.Phase.DRAFT)
+        client_beta = self._get_client(self.user_beta_coord, org=self.org_b)
+        url = reverse('operations:workorder_phase_transition', kwargs={'pk': wo_a.pk})
+
+        resp = client_beta.post(url, {'phase': WorkOrder.Phase.ENGINEERING})
+        self.assertEqual(resp.status_code, 302)
+        wo_a.refresh_from_db()
+        self.assertEqual(wo_a.phase, WorkOrder.Phase.DRAFT)
+
+    def test_sst_lock_enforced_in_fsm_for_high_risk(self):
+        """FSM bloquea la transición a IN_PROGRESS si la OT es de alto riesgo y no ha sido liberada por SST."""
+        wo_risk = self._create_work_order(
+            phase=WorkOrder.Phase.SCHEDULED,
+            is_high_risk=True,
+            sst_cleared=False,
+        )
+        client_eng = self._get_client(self.user_eng)
+        url = reverse('operations:workorder_phase_transition', kwargs={'pk': wo_risk.pk})
+
+        resp = client_eng.post(url, {'phase': WorkOrder.Phase.IN_PROGRESS})
+        self.assertEqual(resp.status_code, 302)
+        wo_risk.refresh_from_db()
+        self.assertEqual(wo_risk.phase, WorkOrder.Phase.SCHEDULED, "Debe permanecer bloqueada por SST.")
+
+
+class WorkOrderLifecycleConcurrencyTestCase(TransactionTestCase):
+    """
+    Prueba de Concurrencia Real Multi-Hilo para Transiciones de Fase de OT (DEF-19).
+    Ejecutada sobre PostgreSQL con select_for_update():
+    Dos hilos concurrentes intentan transicionar simultáneamente la misma OT.
+    """
+
+    def setUp(self):
+        if connection.vendor != 'postgresql':
+            return
+
+        self.country_ni, _ = CountryConfig.objects.get_or_create(
+            code='NI',
+            defaults={
+                'name': 'Nicaragua',
+                'flag_emoji': '🇳🇮',
+                'primary_currency_code': 'NIO',
+                'primary_currency_symbol': 'C$',
+                'is_active': True,
+            }
+        )
+        self.org = Organization.objects.create(
+            name="Vector Concurrency FSM S.A.",
+            legal_name="Vector Concurrency FSM S.A.",
+            slug=f"vector-fsm-conc-{uuid.uuid4().hex[:8]}",
+            country=self.country_ni,
+            enabled_modules=['crm', 'operations', 'inventory'],
+            is_active=True,
+        )
+        self.account = Account.objects.create(
+            organization=self.org,
+            commercial_name="Cliente Concurrencia FSM",
+        )
+        self.user_coord = User.objects.create_user(
+            email=f'coord_fsm_{uuid.uuid4().hex[:6]}@vector.com.ni',
+            full_name='Coord FSM',
+            password='password123',
+        )
+        OrganizationMembership.objects.create(
+            user=self.user_coord,
+            organization=self.org,
+            role_level=RoleLevel.OPERATIONS_COORD,
+            is_active=True,
+            is_default_org=True,
+        )
+        self.wo = WorkOrder.objects.create(
+            organization=self.org,
+            number=f"OT-CONC-{uuid.uuid4().hex[:6].upper()}",
+            title="OT Concurrente FSM",
+            account=self.account,
+            phase=WorkOrder.Phase.DRAFT,
+            created_by=self.user_coord,
+        )
+
+    def test_concurrent_phase_transitions_serialized_with_select_for_update(self):
+        """
+        Dos hilos intentan transicionar la misma OT en DRAFT:
+        - Hilo 1 intenta avanzar a ENGINEERING.
+        - Hilo 2 intenta cancelar a CANCELLED con motivo.
+        select_for_update() garantiza que solo una transición ocurra primero y la segunda
+        sea evaluada bajo el nuevo estado resultante, sin corrupciones ni errores 500.
+        """
+        if connection.vendor != 'postgresql':
+            self.skipTest("Esta prueba de concurrencia multi-hilo requiere PostgreSQL.")
+
+        url_trans = reverse('operations:workorder_phase_transition', kwargs={'pk': self.wo.pk})
+        results = []
+        errors = []
+
+        def worker(target_phase, notes):
+            try:
+                client = Client()
+                client.force_login(self.user_coord)
+                session = client.session
+                session['active_org_id'] = str(self.org.id)
+                session.save()
+
+                resp = client.post(url_trans, {'phase': target_phase, 'notes': notes})
+                results.append(resp.status_code)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                connections.close_all()
+
+        t1 = threading.Thread(target=worker, args=(WorkOrder.Phase.ENGINEERING, 'Avanzar a ingeniería'))
+        t2 = threading.Thread(target=worker, args=(WorkOrder.Phase.CANCELLED, 'Cancelar por imprevisto'))
+
+        t1.start()
+        t2.start()
+
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        self.assertFalse(t1.is_alive(), "El hilo 1 no finalizó dentro del tiempo límite.")
+        self.assertFalse(t2.is_alive(), "El hilo 2 no finalizó dentro del tiempo límite.")
+        self.assertEqual(errors, [], f"Errores en hilos concurrentes: {errors}")
+        self.assertEqual(len(results), 2, "Ambos hilos debieron recibir respuesta HTTP.")
+        for status in results:
+            self.assertEqual(status, 302, "Ambos hilos deben recibir redirección controlada.")
+
+        self.wo.refresh_from_db()
+        # Debe haber finalizado en una de las dos fases legales (ENGINEERING o CANCELLED)
+        self.assertIn(self.wo.phase, [WorkOrder.Phase.ENGINEERING, WorkOrder.Phase.CANCELLED])
+
+    def tearDown(self):
+        connections.close_all()
+        super().tearDown()
+

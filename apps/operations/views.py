@@ -363,9 +363,11 @@ class WorkOrderDetailView(ModuleAccessRequiredMixin, DetailView):
             'evidence_form': WorkOrderEvidenceForm(),
             'checklist_form': SafetyChecklistForm(organization=self.request.organization, initial_work_order=wo),
             'can_manage_phases': role_level >= RoleLevel.ENGINEER,
-            'can_close_ot': role_level >= RoleLevel.OPERATIONS_COORD,
+            'can_close_ot': role_level >= RoleLevel.OPERATIONS_COORD and wo.phase == WorkOrder.Phase.QUALITY_CHECK,
+            'can_reopen_ot': wo.phase in [WorkOrder.Phase.COMPLETED, WorkOrder.Phase.CANCELLED] and role_level >= RoleLevel.OWNER_ADMIN,
             'can_manage_sst': role_level >= RoleLevel.SST_OFFICER,
             'can_execute_items': role_level >= RoleLevel.TECHNICIAN and role_level != RoleLevel.SST_OFFICER,
+            'allowed_next_phases': wo.get_allowed_transitions(role_level=role_level),
             'phases': WorkOrder.Phase.choices,
         })
         return context
@@ -373,24 +375,32 @@ class WorkOrderDetailView(ModuleAccessRequiredMixin, DetailView):
 
 class WorkOrderPhaseTransitionView(ModuleAccessRequiredMixin, View):
     """
-    Transición de Fase de Ingeniería / Operaciones.
-    - Ingenieros (50+): pueden avanzar fases hasta QUALITY_CHECK.
-    - Coordinador (80+): exclusivo para autorizar el Cierre Definitivo (COMPLETED).
-    - Regla SST en Alto Riesgo: impide pasar a IN_PROGRESS si is_high_risk=True y sst_cleared=False.
+    Transición de Fase de Ingeniería / Operaciones (FSM DEF-19).
+    Aplica máquina de estados finitos estricta, bloqueos pesimistas select_for_update
+    y segregación jerárquica de permisos basada en la membresía del tenant.
     """
     required_module = 'operations'
     min_role_level = RoleLevel.ENGINEER
 
     @transaction.atomic
     def post(self, request, pk):
-        wo = get_object_or_404(WorkOrder.objects.for_org(request.organization), pk=pk)
+        # 1. Adquisición ordenada de bloqueo pesimista en PostgreSQL
+        wo = WorkOrder.objects.select_for_update().filter(
+            id=pk,
+            organization=request.organization,
+        ).first()
+
+        if not wo:
+            messages.error(request, "Orden de Trabajo no encontrada o no pertenece a su organización.")
+            return redirect('operations:workorder_list')
+
         target_phase = request.POST.get('phase')
         notes = request.POST.get('notes', '').strip()
-        role_level = getattr(request, 'role_level', 0)
 
-        if target_phase not in WorkOrder.Phase.values:
-            messages.error(request, "Fase operativa no válida.")
-            return redirect('operations:workorder_detail', pk=wo.pk)
+        # 2. Derivar role_level estricto desde la membresía activa del tenant
+        role_level = getattr(request, 'role_level', 0)
+        if hasattr(request, 'membership') and request.membership:
+            role_level = request.membership.role_level
 
         # Regla RBAC: Cierre definitivo (COMPLETED) exige Nivel 80+
         if target_phase == WorkOrder.Phase.COMPLETED and role_level < RoleLevel.OPERATIONS_COORD:
@@ -401,32 +411,19 @@ class WorkOrderPhaseTransitionView(ModuleAccessRequiredMixin, View):
                 reason="El cierre definitivo (COMPLETED) de una Orden de Trabajo requiere nivel de Coordinador de Operaciones (80+)."
             )
 
-        # Regla SST: Inicio en campo (IN_PROGRESS) en Alto Riesgo
-        if target_phase == WorkOrder.Phase.IN_PROGRESS:
-            can_start, reason = wo.can_start_field_execution()
-            if not can_start:
-                messages.error(request, f"BLOQUEO SST: {reason}")
-                return redirect('operations:workorder_detail', pk=wo.pk)
+        # 3. Delegar validación y mutación atómica a la lógica de dominio FSM
+        try:
+            event_type, msg = wo.apply_phase_transition(
+                target_phase=target_phase,
+                user=request.user,
+                role_level=role_level,
+                notes=notes,
+            )
+            messages.success(request, msg)
+        except ValidationError as e:
+            err_text = e.message if hasattr(e, 'message') else (', '.join(e.messages) if hasattr(e, 'messages') else str(e))
+            messages.error(request, f"Error en transición operativa: {err_text}")
 
-        old_phase_display = wo.get_phase_display()
-        wo.phase = target_phase
-
-        if target_phase == WorkOrder.Phase.COMPLETED:
-            wo.completed_at = timezone.now()
-
-        wo.save(update_fields=['phase', 'completed_at', 'updated_at'])
-
-        # Registro obligatorio en bitácora inmutable
-        WorkOrderTimelineLog.objects.create(
-            organization=request.organization,
-            work_order=wo,
-            event_type='PHASE_CHANGE',
-            summary=f"Fase actualizada: {old_phase_display} &rarr; {wo.get_phase_display()}",
-            details=notes or f"Transición autorizada por {request.user.full_name} ({RoleLevel(role_level).label if role_level in RoleLevel.values else ''}).",
-            actor=request.user,
-        )
-
-        messages.success(request, f"Orden de Trabajo {wo.number} movida a '{wo.get_phase_display()}'.")
         return redirect('operations:workorder_detail', pk=wo.pk)
 
 
